@@ -1,0 +1,50 @@
+# Maintainer: Yukia See
+# Build with: scripts/build_arch_package.sh [--install]
+pkgname=prompt-condenser
+pkgver=0.1.0
+pkgrel=1
+url="https://github.com/Yukia-see/Prompt-Condenser"
+pkgdesc="ComfyUI prompt condenser, framing-conflict scanner and Danbooru tagger (Slint UI, Ollama AI)"
+arch=('x86_64')
+license=('LicenseRef-custom')
+depends=(
+  # runtime libraries the binary links or loads (Slint: Wayland/X11 + EGL)
+  'glibc' 'gcc-libs' 'fontconfig' 'freetype2' 'libpng' 'zlib' 'bzip2' 'brotli' 'expat'
+  'wayland' 'libxkbcommon' 'libxkbcommon-x11' 'libglvnd' 'libx11' 'libxcursor' 'libxi'
+  # AI: Ollama with Vulkan GPU support; vulkan-tools for the boot-time GPU wait
+  'ollama' 'ollama-vulkan' 'vulkan-tools'
+  # native file picker for "From Image…"
+  'xdg-desktop-portal'
+)
+makedepends=('rust')
+optdepends=('xdg-desktop-portal-gtk: file picker on desktops without their own portal backend')
+install=prompt-condenser.install
+options=('!lto' '!debug')
+source=("$pkgname-$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+prepare() {
+  cd "$pkgname-$pkgver"
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "$pkgname-$pkgver"
+  export CARGO_TARGET_DIR=target
+  # not --frozen: the ort crate downloads its ONNX Runtime build during the build
+  cargo build --release --locked
+}
+
+check() {
+  cd "$pkgname-$pkgver"
+  cargo test --release --locked
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+  install -Dm755 target/release/prompt-condenser "$pkgdir/usr/bin/prompt-condenser"
+  install -Dm644 packaging/prompt-condenser.desktop "$pkgdir/usr/share/applications/prompt-condenser.desktop"
+  install -Dm644 packaging/prompt-condenser.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/prompt-condenser.svg"
+  install -Dm644 packaging/ollama-wait-for-gpu.conf \
+    "$pkgdir/usr/lib/systemd/system/ollama.service.d/wait-for-gpu.conf"
+}

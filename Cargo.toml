@@ -1,0 +1,32 @@
+[package]
+name = "prompt-condenser"
+version = "0.1.0"
+edition = "2021"
+description = "ComfyUI Prompt Condenser, Organizer & Framing Conflict Scanner with Cross-Vendor AI"
+
+[dependencies]
+slint = "1.9"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+arboard = "3.4"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }
+anyhow = "1.0"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+ort = "2.0.0-rc.15"
+rfd = "0.15"
+
+[build-dependencies]
+slint-build = "1.9"
+
+# Unoptimized Slint rendering is very slow, which makes
+# `cargo run` feel laggy. Optimize all dependencies even in dev builds;
+# our own crate stays quick to recompile at opt-level 1.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

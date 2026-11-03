@@ -1,0 +1,8 @@
+# build output
+/target/
+/dist/
+# makepkg work dirs and artifacts (the package is attached to GitHub releases instead)
+/packaging/arch/src/
+/packaging/arch/pkg/
+/packaging/arch/*.pkg.tar.zst
+/packaging/arch/*.tar.gz

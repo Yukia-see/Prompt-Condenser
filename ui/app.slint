@@ -1,0 +1,1092 @@
+import { Button, ComboBox, CheckBox, LineEdit, TextEdit, Slider, ScrollView } from "std-widgets.slint";
+
+// Google Material 3 dark color tokens
+export global M3 {
+    out property <color> surface: #141218;
+    out property <color> surface-container-low: #1D1B20;
+    out property <color> surface-container: #211F26;
+    out property <color> surface-container-high: #2B2930;
+    out property <color> on-surface: #E6E0E9;
+    out property <color> on-surface-variant: #CAC4D0;
+    out property <color> outline: #938F99;
+    out property <color> outline-variant: #49454F;
+    out property <color> primary: #D0BCFF;
+    out property <color> on-primary: #381E72;
+    out property <color> secondary-container: #4A4458;
+    out property <color> on-secondary-container: #E8DEF8;
+    out property <color> tertiary: #EFB8C8;
+    out property <color> error: #F2B8B5;
+    out property <color> error-container: #8C1D18;
+    out property <color> success: #8CD9A8;
+    out property <color> success-container: #1E4D33;
+    out property <color> warning: #F5C77E;
+    out property <color> warning-container: #5C4100;
+    out property <color> info: #A8C7FA;
+    out property <color> info-container: #0B3D7A;
+    out property <length> card-radius: 16px;
+    out property <length> pill-radius: 20px;
+}
+
+export struct ChangeCardItem {
+    id: int,
+    badge: string,
+    badge_kind: int, // 0 = swap/conflict (amber), 1 = emphasized (green), 2 = bloat/weight (blue), 3 = AI (purple)
+    original: string,
+    reason: string,
+    suggested_alternative: string,
+    framing_alternative: string,
+    has_framing_alt: bool,
+    mode: int, // 0 = Primary Suggestion, 1 = Framing Alternative, 2 = Restore Original
+}
+
+component SectionLabel inherits Text {
+    font-size: 11px;
+    font-weight: 700;
+    color: M3.on-surface-variant;
+    letter-spacing: 0.5px;
+}
+
+// Compact 32px pill button that lines up with the host field.
+component PillButton inherits Rectangle {
+    in property <string> text;
+    in property <bool> primary;
+    in property <bool> enabled: true;
+    callback clicked();
+    height: 32px;
+    min-width: label.preferred-width + 32px;
+    border-radius: 16px;
+    background: !root.enabled ? M3.surface-container-high
+        : root.primary ? (ta.has-hover ? #E0D2FF : M3.primary)
+        : (ta.has-hover ? M3.secondary-container : M3.surface-container-high);
+    label := Text {
+        text: root.text;
+        font-size: 13px;
+        font-weight: 600;
+        color: !root.enabled ? M3.outline : root.primary ? M3.on-primary : M3.on-surface;
+    }
+    ta := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? MouseCursor.pointer : MouseCursor.default;
+        clicked => { root.clicked(); }
+    }
+}
+
+component M3Card inherits Rectangle {
+    clip: true;
+    background: M3.surface-container-low;
+    border-radius: M3.card-radius;
+    border-width: 1px;
+    border-color: M3.outline-variant;
+}
+
+component Chip inherits Rectangle {
+    in property <string> text;
+    in property <color> fg;
+    in property <color> bg;
+    background: bg;
+    border-radius: 8px;
+    HorizontalLayout {
+        padding-left: 8px;
+        padding-right: 8px;
+        padding-top: 3px;
+        padding-bottom: 3px;
+        Text {
+            text: root.text;
+            font-size: 10px;
+            font-weight: 700;
+            color: root.fg;
+        }
+    }
+}
+
+
+// Drag handle between two panels. `horizontal-bar` = a bar you drag up/down.
+component Splitter inherits Rectangle {
+    in property <bool> horizontal-bar: true;
+    callback dragged(length);
+    border-radius: 4px;
+    background: ta.has-hover || ta.pressed ? M3.surface-container-high : transparent;
+    Rectangle {
+        width: root.horizontal-bar ? 48px : 4px;
+        height: root.horizontal-bar ? 4px : 48px;
+        border-radius: 2px;
+        background: ta.pressed ? M3.primary : (ta.has-hover ? M3.outline : M3.outline-variant);
+    }
+    ta := TouchArea {
+        mouse-cursor: root.horizontal-bar ? MouseCursor.row-resize : MouseCursor.col-resize;
+        moved => {
+            if (self.pressed) {
+                root.dragged(root.horizontal-bar ? self.mouse-y - self.pressed-y : self.mouse-x - self.pressed-x);
+            }
+        }
+    }
+}
+
+component SceneCard inherits Rectangle {
+    in property <string> summary;
+    in property <string> details;
+    in property <string> issues;
+    in property <bool> show-ai-button;
+    callback show-ai();
+    background: M3.surface-container-high;
+    border-radius: 12px;
+    border-width: 1px;
+    border-color: M3.primary;
+    VerticalLayout {
+        padding: 12px;
+        spacing: 6px;
+        alignment: start;
+        HorizontalLayout {
+            Chip { text: "AI SCENE ANALYSIS"; fg: M3.on-primary; bg: M3.primary; }
+            Rectangle { horizontal-stretch: 1; }
+        }
+        Text { text: root.summary; font-size: 13px; font-weight: 600; color: M3.on-surface; wrap: word-wrap; }
+        if root.details != "" : Text { text: root.details; font-size: 11px; color: M3.on-surface-variant; wrap: word-wrap; }
+        if root.issues != "" : Text {
+            text: "What's holding it back:\n" + root.issues;
+            font-size: 11px;
+            color: M3.tertiary;
+            wrap: word-wrap;
+        }
+        if root.show-ai-button : Button {
+            text: "See the AI Improved prompt";
+            primary: true;
+            clicked => { root.show-ai(); }
+        }
+    }
+}
+
+component ChangeCard inherits Rectangle {
+    in property <ChangeCardItem> card;
+    callback mode-changed(int, int);
+    background: M3.surface-container-high;
+    border-radius: 12px;
+    border-width: 1px;
+    border-color: card.badge_kind == 3 ? M3.primary : card.badge_kind == 0 ? M3.warning : (card.badge_kind == 1 ? M3.success : M3.info);
+
+    VerticalLayout {
+        padding: 12px;
+        spacing: 6px;
+        alignment: start;
+
+        HorizontalLayout {
+            spacing: 8px;
+            Chip {
+                text: card.badge;
+                fg: card.badge_kind == 3 ? M3.on-primary : card.badge_kind == 0 ? M3.warning : (card.badge_kind == 1 ? M3.success : M3.info);
+                bg: card.badge_kind == 3 ? M3.primary : card.badge_kind == 0 ? M3.warning-container : (card.badge_kind == 1 ? M3.success-container : M3.info-container);
+            }
+            Text {
+                text: card.original == "" ? "New detail" : "Original: \"" + card.original + "\"";
+                font-size: 12px;
+                font-weight: 700;
+                color: M3.tertiary;
+                overflow: elide;
+                horizontal-stretch: 1;
+            }
+        }
+
+        if card.suggested_alternative != "" : Text {
+            text: "Suggested: " + card.suggested_alternative;
+            font-size: 12px;
+            font-weight: 600;
+            color: M3.success;
+            wrap: word-wrap;
+        }
+
+        if card.has_framing_alt : Text {
+            text: "Or change framing to: " + card.framing_alternative;
+            font-size: 11px;
+            color: M3.info;
+            wrap: word-wrap;
+        }
+
+        HorizontalLayout {
+            spacing: 6px;
+            alignment: start;
+            Button {
+                text: card.mode == 0 ? "✓ Applied" : (card.original == "" ? "Add It" : (card.suggested_alternative == "" ? "Remove Tag" : "Use Suggestion"));
+                primary: card.mode == 0;
+                clicked => { root.mode-changed(card.id, 0); }
+            }
+            if card.has_framing_alt : Button {
+                text: card.mode == 1 ? "✓ Framing Swapped" : "Keep & Swap Framing";
+                primary: card.mode == 1;
+                clicked => { root.mode-changed(card.id, 1); }
+            }
+            Button {
+                text: card.original == "" ? (card.mode == 2 ? "✓ Skipped" : "Skip") : (card.mode == 2 ? "✓ Kept Original" : "Keep Original");
+                primary: card.mode == 2;
+                clicked => { root.mode-changed(card.id, 2); }
+            }
+        }
+
+        Text {
+            text: card.reason;
+            font-size: 11px;
+            color: M3.on-surface-variant;
+            wrap: word-wrap;
+        }
+    }
+}
+
+// Live, rule-based description of the scene the prompt describes.
+component LiveSceneCard inherits Rectangle {
+    in property <string> headline;
+    in property <string> details;
+    in property <string> missing;
+    background: M3.surface-container-high;
+    border-radius: 12px;
+    border-width: 1px;
+    border-color: M3.info;
+    VerticalLayout {
+        padding: 12px;
+        spacing: 6px;
+        alignment: start;
+        HorizontalLayout {
+            Chip { text: "THE SCENE (LIVE)"; fg: M3.info; bg: M3.info-container; }
+            Rectangle { horizontal-stretch: 1; }
+        }
+        Text { text: root.headline; font-size: 13px; font-weight: 600; color: M3.on-surface; wrap: word-wrap; }
+        if root.details != "" : Text { text: root.details; font-size: 11px; color: M3.on-surface-variant; wrap: word-wrap; }
+        if root.missing != "" : Text {
+            text: "Not specified: " + root.missing;
+            font-size: 11px;
+            color: M3.warning;
+            wrap: word-wrap;
+        }
+    }
+}
+
+// The scene card, AI analysis and suggestion cards in one horizontally scrolling strip.
+component CardsPanel inherits M3Card {
+    in property <[ChangeCardItem]> cards;
+    in property <string> live-headline;
+    in property <string> live-details;
+    in property <string> live-missing;
+    in property <string> scene-summary;
+    in property <string> scene-details;
+    in property <string> scene-issues;
+    in property <bool> show-ai-button;
+    callback mode-changed(int, int);
+    callback show-ai();
+    border-color: M3.outline-variant;
+
+    VerticalLayout {
+        padding: 10px;
+        spacing: 8px;
+
+        HorizontalLayout {
+            spacing: 8px;
+            Text {
+                text: "SCENE & SUGGESTIONS" + (root.cards.length > 0 ? " (" + root.cards.length + ")" : "");
+                font-size: 12px;
+                font-weight: 700;
+                color: M3.warning;
+                vertical-alignment: center;
+            }
+            Rectangle { horizontal-stretch: 1; }
+            if root.cards.length > 1 : Text {
+                text: "scroll sideways (Shift + wheel) →";
+                font-size: 11px;
+                color: M3.on-surface-variant;
+                vertical-alignment: center;
+            }
+        }
+
+        if root.live-headline == "" && root.cards.length == 0 : Text {
+            vertical-stretch: 1;
+            text: "Paste a prompt below (or use From Image…) to see what scene it describes, plus conflicts and fixes.";
+            font-size: 12px;
+            color: M3.on-surface-variant;
+            wrap: word-wrap;
+            vertical-alignment: center;
+            horizontal-alignment: center;
+        }
+
+        if root.live-headline != "" || root.cards.length > 0 : row := ScrollView {
+            vertical-stretch: 1;
+            HorizontalLayout {
+                height: row.visible-height;
+                spacing: 8px;
+                alignment: start;
+                if root.live-headline != "" : live-scroll := ScrollView {
+                    width: 380px;
+                    VerticalLayout {
+                        width: live-scroll.visible-width;
+                        alignment: start;
+                        LiveSceneCard {
+                            headline: root.live-headline;
+                            details: root.live-details;
+                            missing: root.live-missing;
+                        }
+                    }
+                }
+                if root.scene-summary != "" : scene-scroll := ScrollView {
+                    width: 380px;
+                    VerticalLayout {
+                        width: scene-scroll.visible-width;
+                        alignment: start;
+                        SceneCard {
+                            summary: root.scene-summary;
+                            details: root.scene-details;
+                            issues: root.scene-issues;
+                            show-ai-button: root.show-ai-button;
+                            show-ai => { root.show-ai(); }
+                        }
+                    }
+                }
+                for card in root.cards : card-scroll := ScrollView {
+                    width: 320px;
+                    VerticalLayout {
+                        width: card-scroll.visible-width;
+                        alignment: start;
+                        ChangeCard {
+                            card: card;
+                            mode-changed(id, mode) => { root.mode-changed(id, mode); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Before / Structure on top, After / Recommended Negative below.
+// One vertical divider resizes the right column; one horizontal divider moves the top/bottom split.
+component PromptColumn inherits HorizontalLayout {
+    in-out property <string> raw-prompt;
+    in property <string> before-stats;
+    in property <string> after-stats;
+    in property <string> condensed-plain;
+    in property <int> after-view;
+    in property <bool> ai-improved-available;
+    in property <string> ai-dropped;
+    in property <string> substituted-list;
+    in property <string> added-list;
+    in property <string> category-breakdown;
+    /// Share of the height the top row (Before / Structure) gets.
+    in-out property <float> before-ratio;
+    /// Width of the right column (Structure / Recommended Negative).
+    in-out property <length> side-width;
+    in property <string> negative-plain;
+    in property <string> negative-note;
+    in property <bool> negative-available;
+    callback edited();
+    callback after-view-changed(int);
+    callback copy();
+    callback copy-negative();
+
+    spacing: 0px;
+
+    // ---- left column
+    VerticalLayout {
+        horizontal-stretch: 1;
+        min-width: 220px;
+        spacing: 0px;
+
+        before-box := M3Card {
+            vertical-stretch: root.before-ratio;
+            min-height: 80px;
+            border-color: M3.error-container;
+            VerticalLayout {
+                padding: 12px;
+                spacing: 6px;
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text { text: "BEFORE — RAW COMFYUI PROMPT"; font-size: 12px; font-weight: 700; color: M3.error; }
+                    Rectangle { horizontal-stretch: 1; }
+                    Text { text: root.before-stats; font-size: 12px; color: M3.on-surface-variant; }
+                }
+                TextEdit {
+                    text <=> root.raw-prompt;
+                    wrap: word-wrap;
+                    font-size: 14px;
+                    edited => { root.edited(); }
+                }
+            }
+        }
+
+        Splitter {
+            height: 12px;
+            dragged(d) => {
+                root.before-ratio = max(0.15, min(0.8, root.before-ratio + d / max(1px, before-box.height + after-box.height)));
+            }
+        }
+
+        after-box := M3Card {
+            vertical-stretch: 1 - root.before-ratio;
+            min-height: 90px;
+            border-color: M3.success-container;
+            VerticalLayout {
+                padding: 12px;
+                spacing: 6px;
+                HorizontalLayout {
+                    spacing: 10px;
+                    Text {
+                        text: root.after-view == 1 ? "AFTER — AI IMPROVED" : "AFTER — CONDENSED & CONFLICT-FREE";
+                        font-size: 12px;
+                        font-weight: 700;
+                        color: M3.success;
+                        vertical-alignment: center;
+                    }
+                    if root.ai-improved-available : HorizontalLayout {
+                        spacing: 4px;
+                        Button {
+                            text: "Rule-based";
+                            primary: root.after-view == 0;
+                            clicked => { root.after-view-changed(0); }
+                        }
+                        Button {
+                            text: "AI Improved";
+                            primary: root.after-view == 1;
+                            clicked => { root.after-view-changed(1); }
+                        }
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                    Text { text: root.after-stats; font-size: 12px; color: M3.success; vertical-alignment: center; }
+                    Button {
+                        text: "Copy";
+                        primary: true;
+                        clicked => { root.copy(); }
+                    }
+                }
+                after-scroll := ScrollView {
+                    vertical-stretch: 1;
+                    VerticalLayout {
+                        width: after-scroll.visible-width;
+                        padding: 4px;
+                        TextInput {
+                            text: root.condensed-plain;
+                            read-only: true;
+                            single-line: false;
+                            wrap: word-wrap;
+                            font-size: 14px;
+                            color: M3.on-surface;
+                            selection-background-color: #D0BCFF99;
+                        }
+                    }
+                }
+                if root.after-view == 1 && root.ai-dropped != "" : Text {
+                    text: "Dropped from your prompt: " + root.ai-dropped + " — copy them back if you want them.";
+                    font-size: 11px;
+                    color: M3.tertiary;
+                    wrap: word-wrap;
+                }
+                if root.substituted-list != "" : Text {
+                    text: "Substituted: " + root.substituted-list;
+                    font-size: 11px;
+                    color: M3.warning;
+                    wrap: word-wrap;
+                }
+                if root.added-list != "" : Text {
+                    text: "Added: " + root.added-list;
+                    font-size: 11px;
+                    color: M3.success;
+                    wrap: word-wrap;
+                }
+            }
+        }
+    }
+
+    Splitter {
+        horizontal-bar: false;
+        width: 12px;
+        dragged(d) => {
+            root.side-width = max(180px, min(root.side-width - d, root.width - 320px));
+        }
+    }
+
+    // ---- right column (rows line up with the left: same stretch and minimums)
+    VerticalLayout {
+        preferred-width: root.side-width;
+        min-width: 160px;
+        horizontal-stretch: 0;
+        spacing: 0px;
+
+        // How the prompt breaks down by category
+        M3Card {
+            vertical-stretch: root.before-ratio;
+            min-height: 80px;
+            border-color: M3.info-container;
+            VerticalLayout {
+                padding: 12px;
+                spacing: 6px;
+                Text {
+                    text: "ORGANIZED STRUCTURE";
+                    font-size: 12px;
+                    font-weight: 700;
+                    color: M3.info;
+                }
+                structure-scroll := ScrollView {
+                    vertical-stretch: 1;
+                    VerticalLayout {
+                        width: structure-scroll.visible-width;
+                        padding: 2px;
+                        TextInput {
+                            text: root.category-breakdown;
+                            read-only: true;
+                            single-line: false;
+                            wrap: word-wrap;
+                            font-size: 12px;
+                            color: M3.on-surface;
+                            selection-background-color: #D0BCFF99;
+                        }
+                    }
+                }
+            }
+        }
+
+        Rectangle { height: 12px; }
+
+        // Recommended negative prompt, matched to whichever After view is showing
+        M3Card {
+            vertical-stretch: 1 - root.before-ratio;
+            min-height: 90px;
+            border-color: M3.error-container;
+            VerticalLayout {
+                padding: 12px;
+                spacing: 6px;
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text {
+                        text: "RECOMMENDED NEGATIVE";
+                        font-size: 12px;
+                        font-weight: 700;
+                        color: M3.error;
+                        vertical-alignment: center;
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                    if root.negative-available : Button {
+                        text: "Copy";
+                        clicked => { root.copy-negative(); }
+                    }
+                }
+                neg-scroll := ScrollView {
+                    vertical-stretch: 1;
+                    VerticalLayout {
+                        width: neg-scroll.visible-width;
+                        padding: 4px;
+                        TextInput {
+                            text: root.negative-plain;
+                            read-only: true;
+                            single-line: false;
+                            wrap: word-wrap;
+                            font-size: 13px;
+                            color: M3.on-surface-variant;
+                            selection-background-color: #D0BCFF99;
+                        }
+                    }
+                }
+                Text {
+                    text: root.negative-note;
+                    font-size: 11px;
+                    color: M3.on-surface-variant;
+                    wrap: word-wrap;
+                }
+            }
+        }
+    }
+}
+
+export component AppWindow inherits Window {
+    title: "ComfyUI Prompt Condenser & Framing Conflict Scanner";
+    preferred-width: 1380px;
+    preferred-height: 900px;
+    min-width: 800px;
+    min-height: 560px;
+    background: M3.surface;
+
+    // Dropdowns
+    in-out property <int> checkpoint_index: 0;
+    in-out property <int> target_view_index: 0;
+    in-out property <int> ai_mode_index: 0;   // 0 = GPU, 1 = CPU only, 2 = AI off
+    in-out property <[string]> model_labels: [];
+    in-out property <int> model_index: 0;
+    in-out property <bool> model_needs_download: false;
+
+    // Image -> prompt
+    in-out property <bool> image_loaded: false;
+    in-out property <image> image_thumb;
+    in-out property <string> image_status: "Extract Danbooru tags from any image (WD EVA02)";
+    in-out property <bool> tagger_installed: false;
+    in-out property <bool> tagger_busy: false;
+    in-out property <float> tag_threshold: 0.35;
+    in-out property <bool> image_can_undo: false;
+
+    // Ollama (local or another PC)
+    in-out property <string> ollama_host: "localhost:11434";
+    in-out property <bool> ollama_connected: false;
+    in-out property <bool> ollama_busy: false;
+    in-out property <string> ollama_status: "Connecting to Ollama...";
+
+    // Feature toggles
+    in-out property <bool> cleanup_enabled: true;
+    in-out property <bool> resolve_conflicts_enabled: true;
+    in-out property <bool> clamp_weights_enabled: true;
+
+    // Prompt & emphasis
+    in-out property <string> raw_prompt: "";
+    in-out property <string> pinned_emphasis: "";
+    in-out property <float> emphasis_weight: 1.25;
+    in-out property <string> condensed_prompt: "";       // plain text, used for copy
+    in-out property <string> substituted_list: "";   // tags put in place of yours
+    in-out property <string> added_list: "";         // tags that weren't in your prompt
+
+    // Deep scan results
+    in-out property <bool> ai_improved_available: false;
+    in-out property <int> after_view: 0;   // 0 = rule-based, 1 = AI improved
+    in-out property <string> scene_summary: "";
+    in-out property <string> scene_details: "";
+    in-out property <string> scene_issues: "";
+    in-out property <string> ai_dropped: "";   // user tags the AI rewrite left out
+
+    // Layout (saved between sessions)
+    in-out property <float> before_ratio: 0.4;
+    in-out property <length> side_width: 320px;
+    in-out property <length> cards_strip_height: 250px;
+
+    // Live scene description (rule-based)
+    in-out property <string> live_headline: "";
+    in-out property <string> live_details: "";
+    in-out property <string> live_missing: "";
+    in-out property <float> ui_zoom: 0.75;
+    in-out property <int> ui_zoom_percent: 100;
+
+    // Recommended negative prompt
+    in-out property <string> negative_text: "";
+    in-out property <string> negative_note: "";
+    in-out property <string> category_breakdown: "";
+
+    // Stats & status
+    in-out property <string> before_stats: "0 tokens / 0 chunks";
+    in-out property <string> after_stats: "0 tokens / 0 chunks";
+    in-out property <string> hardware_badge: "Detecting GPU / VRAM...";
+    in-out property <string> status_message: "Ready — paste a ComfyUI prompt.";
+    in-out property <bool> ai_busy: false;
+    in-out property <string> run_badge: "";
+
+    in-out property <[ChangeCardItem]> change_cards: [];
+
+    callback analyze_requested();
+    callback ai_settings_changed();
+    callback run_ai_scan_requested();
+    callback download_model_requested();
+    callback connect_ollama_requested();
+    callback load_image_requested();
+    callback remove_image_requested();
+    callback undo_image_prompt_requested();
+    callback download_tagger_requested();
+    callback tag_threshold_changed();
+    callback copy_output_requested();
+    callback card_mode_changed(int, int); // (card_id, new_mode)
+    callback after_view_changed(int);
+    callback copy_recommended_negative_requested();
+    callback zoom_in_requested();
+    callback zoom_out_requested();
+
+    VerticalLayout {
+        padding: 14px;
+        spacing: 10px;
+
+        // ==================== TOP CONTROL CARD ====================
+        M3Card {
+            VerticalLayout {
+                padding: 14px;
+                spacing: 10px;
+
+                HorizontalLayout {
+                    spacing: 12px;
+
+                    VerticalLayout {
+                        spacing: 4px;
+                        horizontal-stretch: 1;
+                        SectionLabel { text: "CHECKPOINT PROFILE"; }
+                        ComboBox {
+                            model: [
+                                "Anima (Hybrid Tags + Natural Language)",
+                                "Pony Diffusion V6 XL",
+                                "Illustrious / NoobAI XL",
+                                "SDXL (Base / Finetunes)",
+                                "SD 1.5",
+                                "Flux (Natural Language)"
+                            ];
+                            current-index <=> root.checkpoint_index;
+                            selected => { root.analyze_requested(); }
+                        }
+                    }
+
+                    VerticalLayout {
+                        spacing: 4px;
+                        horizontal-stretch: 1;
+                        SectionLabel { text: "TARGET POSITIONING / VIEW"; }
+                        ComboBox {
+                            model: [
+                                "None (Auto-Detect Framing in Prompt)",
+                                "360 View / Character Turnaround",
+                                "Upper Body / Cowboy Shot",
+                                "Close-Up / Portrait",
+                                "Front View",
+                                "From Behind / Back View",
+                                "Side Profile",
+                                "Full Body"
+                            ];
+                            current-index <=> root.target_view_index;
+                            selected => { root.analyze_requested(); }
+                        }
+                    }
+
+                    VerticalLayout {
+                        spacing: 4px;
+                        horizontal-stretch: 1;
+                        SectionLabel { text: "AI MODE"; }
+                        ComboBox {
+                            model: [
+                                "GPU (Vulkan via Ollama, auto CPU fallback)",
+                                "CPU only (keep VRAM free for ComfyUI)",
+                                "AI off (rules only)"
+                            ];
+                            current-index <=> root.ai_mode_index;
+                            selected => { root.ai_settings_changed(); }
+                        }
+                    }
+
+                    VerticalLayout {
+                        spacing: 4px;
+                        horizontal-stretch: 1;
+                        SectionLabel { text: "AI MODEL (OLLAMA)"; }
+                        ComboBox {
+                            model: root.model_labels;
+                            current-index <=> root.model_index;
+                            enabled: root.ai_mode_index != 2;
+                            selected => { root.ai_settings_changed(); }
+                        }
+                    }
+                }
+
+                // Second row: host field, refresh and Deep Scan on one line; options right after
+                HorizontalLayout {
+                    spacing: 24px;
+
+                    VerticalLayout {
+                        spacing: 4px;
+                        alignment: start;
+                        SectionLabel { text: "OLLAMA HOST (THIS PC OR ANOTHER ON YOUR LAN)"; }
+                        HorizontalLayout {
+                            spacing: 8px;
+                            alignment: start;
+                            // compact single-line field (Material LineEdit is 56px tall)
+                            Rectangle {
+                                width: 200px;
+                                height: 32px;
+                                border-radius: 8px;
+                                border-width: 1px;
+                                border-color: host-input.has-focus ? M3.primary : M3.outline;
+                                background: M3.surface-container;
+                                host-input := TextInput {
+                                    x: 10px;
+                                    width: parent.width - 20px;
+                                    height: parent.height;
+                                    vertical-alignment: center;
+                                    single-line: true;
+                                    font-size: 13px;
+                                    color: M3.on-surface;
+                                    text <=> root.ollama_host;
+                                    accepted => { root.connect_ollama_requested(); }
+                                }
+                            }
+                            // reconnect / refresh the model list
+                            Rectangle {
+                                width: 32px;
+                                height: 32px;
+                                border-radius: 16px;
+                                background: refresh-ta.has-hover ? M3.secondary-container : M3.surface-container-high;
+                                Text {
+                                    text: root.ollama_busy ? "…" : "↻";
+                                    font-size: 18px;
+                                    color: M3.on-surface;
+                                }
+                                refresh-ta := TouchArea {
+                                    enabled: !root.ollama_busy;
+                                    clicked => { root.connect_ollama_requested(); }
+                                }
+                            }
+                            PillButton {
+                                text: root.ai_busy ? "Working…" : "Run Deep AI Scan";
+                                primary: true;
+                                enabled: !root.ai_busy && root.ai_mode_index != 2 && root.ollama_connected && !root.model_needs_download;
+                                clicked => { root.run_ai_scan_requested(); }
+                            }
+                            if root.model_needs_download && root.ai_mode_index != 2 : PillButton {
+                                text: "Download Model";
+                                enabled: !root.ai_busy && root.ollama_connected;
+                                clicked => { root.download_model_requested(); }
+                            }
+                        }
+                        Text {
+                            text: root.ollama_status;
+                            font-size: 11px;
+                            color: root.ollama_connected ? M3.success : M3.warning;
+                            wrap: word-wrap;
+                        }
+                    }
+
+                    VerticalLayout {
+                        spacing: 4px;
+                        alignment: start;
+                        SectionLabel { text: "OPTIONS"; }
+                        CheckBox {
+                            text: "Condense & clean up bloat";
+                            checked <=> root.cleanup_enabled;
+                            toggled => { root.analyze_requested(); }
+                        }
+                        CheckBox {
+                            text: "Resolve framing & body-part conflicts";
+                            checked <=> root.resolve_conflicts_enabled;
+                            toggled => { root.analyze_requested(); }
+                        }
+                        CheckBox {
+                            text: "Clamp runaway weights";
+                            checked <=> root.clamp_weights_enabled;
+                            toggled => { root.analyze_requested(); }
+                        }
+                    }
+
+                    // Image -> Danbooru tags, right after the options
+                    HorizontalLayout {
+                        spacing: 10px;
+                        alignment: start;
+                        // thumbnail with the tag threshold slider under it
+                        if root.image_loaded : VerticalLayout {
+                            spacing: 2px;
+                            alignment: start;
+                            // click the thumbnail to remove the image
+                            Rectangle {
+                                width: 110px;
+                                height: 62px;
+                                border-radius: 8px;
+                                clip: true;
+                                background: M3.surface-container-high;
+                                Image {
+                                    source: root.image_thumb;
+                                    width: parent.width;
+                                    height: parent.height;
+                                    image-fit: cover;
+                                }
+                                if thumb-ta.has-hover : Rectangle {
+                                    background: #000000a0;
+                                    Text { text: "✕ Remove"; font-size: 12px; font-weight: 700; color: #ffffff; }
+                                }
+                                thumb-ta := TouchArea {
+                                    mouse-cursor: MouseCursor.pointer;
+                                    clicked => { root.remove_image_requested(); }
+                                }
+                            }
+                            if root.tagger_installed : Slider {
+                                width: 110px;
+                                minimum: 0.2;
+                                maximum: 0.7;
+                                value <=> root.tag_threshold;
+                                changed => { root.tag_threshold_changed(); }
+                            }
+                        }
+                        VerticalLayout {
+                            spacing: 4px;
+                            alignment: start;
+                            SectionLabel { text: "IMAGE → DANBOORU TAGS"; color: M3.primary; }
+                            Text {
+                                text: root.image_status;
+                                font-size: 11px;
+                                color: M3.on-surface-variant;
+                                wrap: word-wrap;
+                                max-height: 30px;
+                                overflow: elide;
+                            }
+                            HorizontalLayout {
+                                spacing: 6px;
+                                alignment: start;
+                                PillButton {
+                                    text: root.tagger_busy ? "Working…" : "From Image…";
+                                    enabled: !root.tagger_busy;
+                                    clicked => { root.load_image_requested(); }
+                                }
+                                if root.image_loaded && root.tagger_installed : Text {
+                                    text: "Lower = more tags";
+                                    font-size: 11px;
+                                    color: M3.on-surface-variant;
+                                    vertical-alignment: center;
+                                }
+                                if !root.tagger_installed : PillButton {
+                                    text: "Download Tagger (1.2 GB)";
+                                    enabled: !root.tagger_busy;
+                                    clicked => { root.download_tagger_requested(); }
+                                }
+                                if root.image_can_undo : PillButton {
+                                    text: "Undo";
+                                    clicked => { root.undo_image_prompt_requested(); }
+                                }
+                            }
+                        }
+                    }
+
+                    Rectangle { horizontal-stretch: 1; }
+                }
+            }
+        }
+
+        // ==================== KEEP & EMPHASIZE ====================
+        M3Card {
+            HorizontalLayout {
+                padding: 10px;
+                padding-left: 14px;
+                padding-right: 14px;
+                spacing: 14px;
+
+                VerticalLayout {
+                    spacing: 4px;
+                    horizontal-stretch: 3;
+                    alignment: start;
+                    SectionLabel {
+                        text: "KEEP & EMPHASIZE BODY PARTS / DETAILS (COMMA SEPARATED)";
+                        color: M3.success;
+                    }
+                    LineEdit {
+                        font-size: 12px;
+                        height: 38px;
+                        placeholder-text: "Tags already in your prompt to boost, e.g. ass, toned back";
+                        text <=> root.pinned_emphasis;
+                        edited => { root.analyze_requested(); }
+                    }
+                }
+
+                VerticalLayout {
+                    spacing: 4px;
+                    width: 200px;
+                    alignment: start;
+                    SectionLabel {
+                        text: "EMPHASIS WEIGHT: " + Math.round(root.emphasis_weight * 100) / 100 + "x";
+                        color: M3.success;
+                    }
+                    Slider {
+                        minimum: 1.0;
+                        maximum: 1.5;
+                        value <=> root.emphasis_weight;
+                        changed => { root.analyze_requested(); }
+                    }
+                }
+            }
+        }
+
+        // ==================== WORKSPACE ====================
+        // Scene + suggestion cards on top (drag the bar to resize), prompts below.
+        top := VerticalLayout {
+            vertical-stretch: 1;
+            spacing: 0px;
+            CardsPanel {
+                // preferred, not fixed: the layout shrinks it when the window is short
+                preferred-height: root.cards_strip_height;
+                min-height: 120px;
+                vertical-stretch: 0;
+                cards: root.change_cards;
+                live-headline: root.live_headline;
+                live-details: root.live_details;
+                live-missing: root.live_missing;
+                scene-summary: root.scene_summary;
+                scene-details: root.scene_details;
+                scene-issues: root.scene_issues;
+                show-ai-button: root.ai_improved_available && root.after_view == 0;
+                mode-changed(id, mode) => { root.card_mode_changed(id, mode); }
+                show-ai => { root.after_view_changed(1); }
+            }
+            Splitter {
+                height: 12px;
+                dragged(d) => {
+                    root.cards_strip_height = max(140px, min(root.cards_strip_height + d, top.height - 330px));
+                }
+            }
+            PromptColumn {
+                vertical-stretch: 1;
+                raw-prompt <=> root.raw_prompt;
+                before-stats: root.before_stats;
+                after-stats: root.after_stats;
+                condensed-plain: root.condensed_prompt;
+                after-view: root.after_view;
+                ai-improved-available: root.ai_improved_available;
+                ai-dropped: root.ai_dropped;
+                substituted-list: root.substituted_list;
+                added-list: root.added_list;
+                category-breakdown: root.category_breakdown;
+                before-ratio <=> root.before_ratio;
+                side-width <=> root.side_width;
+                negative-plain: root.negative_text;
+                negative-note: root.negative_note;
+                negative-available: root.negative_text != "";
+                edited => { root.analyze_requested(); }
+                after-view-changed(v) => { root.after_view_changed(v); }
+                copy => { root.copy_output_requested(); }
+                copy-negative => { root.copy_recommended_negative_requested(); }
+            }
+        }
+
+        // ==================== STATUS BAR ====================
+        Rectangle {
+            background: M3.surface-container;
+            border-radius: 12px;
+            HorizontalLayout {
+                padding-left: 14px;
+                padding-right: 14px;
+                padding-top: 6px;
+                padding-bottom: 6px;
+                spacing: 16px;
+                Text {
+                    text: root.status_message;
+                    font-size: 12px;
+                    color: M3.on-surface;
+                    overflow: elide;
+                    horizontal-stretch: 1;
+                }
+                if root.run_badge != "" : Text {
+                    text: root.run_badge;
+                    font-size: 12px;
+                    font-weight: 700;
+                    color: M3.success;
+                }
+                Text {
+                    text: root.hardware_badge;
+                    font-size: 12px;
+                    font-weight: 700;
+                    color: M3.primary;
+                }
+                // UI size: small custom buttons (Material buttons are too tall for the status bar)
+                HorizontalLayout {
+                    spacing: 6px;
+                    Text { text: "UI size"; font-size: 12px; color: M3.on-surface-variant; vertical-alignment: center; }
+                    zoom-out := Rectangle {
+                        width: 22px;
+                        height: 22px;
+                        border-radius: 11px;
+                        background: zo-ta.has-hover ? M3.secondary-container : M3.surface-container-high;
+                        Text { text: "−"; font-size: 14px; color: M3.on-surface; }
+                        zo-ta := TouchArea { clicked => { root.zoom_out_requested(); } }
+                    }
+                    Text {
+                        text: root.ui_zoom_percent + "%";
+                        font-size: 12px;
+                        color: M3.on-surface;
+                        vertical-alignment: center;
+                        min-width: 34px;
+                        horizontal-alignment: center;
+                    }
+                    Rectangle {
+                        width: 22px;
+                        height: 22px;
+                        border-radius: 11px;
+                        background: zi-ta.has-hover ? M3.secondary-container : M3.surface-container-high;
+                        Text { text: "+"; font-size: 14px; color: M3.on-surface; }
+                        zi-ta := TouchArea { clicked => { root.zoom_in_requested(); } }
+                    }
+                }
+            }
+        }
+    }
+}

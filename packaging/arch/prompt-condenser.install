@@ -1,0 +1,21 @@
+post_install() {
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  cat <<'MSG'
+==> Prompt Condenser installed. Launch it from your app menu or run: prompt-condenser
+==> The AI features need the Ollama service:
+      sudo systemctl enable --now ollama
+==> Models download from inside the app:
+      - Deep AI Scan: pick "Best — 7B" in the AI model list and click Download Model
+      - Danbooru tags: click From Image… then Download Tagger (1.2 GB, once)
+MSG
+}
+
+post_upgrade() {
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl try-restart ollama >/dev/null 2>&1 || true
+}
+
+post_remove() {
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  echo "==> Downloaded models stay in ~/.local/share/prompt-condenser and in Ollama (ollama rm prompt-condenser-best ...)."
+}

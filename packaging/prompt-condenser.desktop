@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Prompt Condenser
+GenericName=ComfyUI Prompt Condenser
+Comment=Condense ComfyUI prompts, fix framing conflicts and pull Danbooru tags from images
+Exec=prompt-condenser
+Icon=prompt-condenser
+Terminal=false
+Categories=Graphics;Utility;
+Keywords=ComfyUI;Stable Diffusion;prompt;Danbooru;Ollama;
