@@ -958,8 +958,8 @@ mod tests {
     #[test]
     fn enriched_tags_are_not_reported_as_dropped() {
         let dropped = crate::condenser::dropped_tags(
-            "1girl, kimono, brown hair, smile, cherry blossoms",
-            "1girl, red silk kimono with gold embroidery, chestnut brown hair, gentle smile",
+            "1girl, kimono, brown hair, smile, cherry blossoms, red cape, long white hair",
+            "1girl, red silk kimono with gold embroidery, chestnut brown hair, gentle smile, flowing red velvet cape, long flowing white hair",
             CheckpointProfile::Anima,
         );
         assert_eq!(dropped, vec!["cherry blossoms"]);
