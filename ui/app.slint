@@ -653,6 +653,8 @@ export component AppWindow inherits Window {
     in-out property <[string]> pose_labels: [];
     in-out property <int> pose_index: 0;       // index into profiles::POSES
     in-out property <bool> dynamic_enabled: false;
+    in-out property <bool> arranged_enabled: false;   // After as grouped lines
+    in-out property <bool> natural_enabled: false;    // natural-language sentences (NL checkpoints only)
     in-out property <int> detail_index: 1;     // 0 Faithful, 1 Balanced, 2 Rich (profiles::DetailLevel)
     in-out property <string> dynamic_note: "";
     in-out property <[string]> model_labels: [];
@@ -954,6 +956,17 @@ export component AppWindow inherits Window {
                         CheckBox {
                             text: "Dynamic prompts {a|b|c}";
                             checked <=> root.dynamic_enabled;
+                            toggled => { root.analyze_requested(); }
+                        }
+                        CheckBox {
+                            text: "Arranged layout";
+                            checked <=> root.arranged_enabled;
+                            toggled => { root.analyze_requested(); }
+                        }
+                        CheckBox {
+                            text: root.translate_nl ? "Natural-language bits" : "Natural-language bits (Anima / SDXL / Flux)";
+                            enabled: root.translate_nl;
+                            checked <=> root.natural_enabled;
                             toggled => { root.analyze_requested(); }
                         }
                     }

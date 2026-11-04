@@ -97,48 +97,142 @@ fn has_word(text: &str, words: &[&str]) -> bool {
     })
 }
 
-fn classify(parts: &mut Parts, t: &PromptToken) {
+/// Where a tag belongs. Declaration order is the arranged-layout order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Slot {
+    Quality,
+    Lora,
+    Subject,
+    Other,
+    Traits,
+    Hair,
+    Eyes,
+    Body,
+    Outfit,
+    Expression,
+    Pose,
+    Camera,
+    Setting,
+    Light,
+    Style,
+    Clause,
+}
+
+fn slot(t: &PromptToken) -> Slot {
     let n = t.normalized.as_str();
-    let text = t.text.trim().to_string();
     match t.category {
-        TokenCategory::QualityMeta => return,
-        TokenCategory::LoraOrSpecial => {
-            if n.starts_with("<lora") {
-                parts.loras += 1;
-            }
-            return;
-        }
+        TokenCategory::QualityMeta => return Slot::Quality,
+        TokenCategory::LoraOrSpecial => return Slot::Lora,
         _ => {}
     }
     if SUBJECT.contains(&n) {
-        parts.subject.push(text);
+        Slot::Subject
     } else if n.contains("hair") || has_word(n, &["ponytail", "twintails", "bangs", "braid", "bun", "ahoge", "sidelocks"]) {
-        parts.hair.push(text);
+        Slot::Hair
     } else if n.contains("eyes") && !has_word(n, &["closed eyes", "one eye closed"]) || n.contains("pupils") || n.contains("heterochromia") {
-        parts.eyes.push(text);
+        Slot::Eyes
     } else if has(n, EXPRESSION) {
-        parts.expression.push(text);
+        Slot::Expression
     } else if has(n, CAMERA) {
-        parts.camera.push(text);
+        Slot::Camera
     } else if has(n, POSE) {
-        parts.pose.push(text);
+        Slot::Pose
     } else if has(n, OUTFIT) {
-        parts.outfit.push(text);
+        Slot::Outfit
     } else if has(n, TRAITS) {
-        parts.traits.push(text);
+        Slot::Traits
     } else if has_word(n, LIGHT) {
-        parts.light.push(text);
+        Slot::Light
     } else if has(n, SETTING) {
-        parts.setting.push(text);
+        Slot::Setting
     } else if has(n, STYLE) {
-        parts.style.push(text);
+        Slot::Style
     } else if matches!(t.category, TokenCategory::CharacterBody | TokenCategory::PinnedEmphasis) {
-        parts.body.push(text);
+        Slot::Body
     } else if t.category == TokenCategory::NaturalLanguageClause {
-        parts.other.push(text);
+        Slot::Clause
     } else {
-        parts.other.push(text);
+        Slot::Other
     }
+}
+
+fn classify(parts: &mut Parts, t: &PromptToken) {
+    let text = t.text.trim().to_string();
+    match slot(t) {
+        Slot::Quality => {}
+        Slot::Lora => {
+            if t.normalized.starts_with("<lora") {
+                parts.loras += 1;
+            }
+        }
+        Slot::Subject => parts.subject.push(text),
+        Slot::Hair => parts.hair.push(text),
+        Slot::Eyes => parts.eyes.push(text),
+        Slot::Expression => parts.expression.push(text),
+        Slot::Camera => parts.camera.push(text),
+        Slot::Pose => parts.pose.push(text),
+        Slot::Outfit => parts.outfit.push(text),
+        Slot::Traits => parts.traits.push(text),
+        Slot::Light => parts.light.push(text),
+        Slot::Setting => parts.setting.push(text),
+        Slot::Style => parts.style.push(text),
+        Slot::Body => parts.body.push(text),
+        Slot::Clause | Slot::Other => parts.other.push(text),
+    }
+}
+
+/// The arranged layout: one line per group, most important first (quality, LoRA,
+/// who, looks, outfit, expression and pose, camera, setting and light, style,
+/// sentences). Line breaks are plain whitespace to ComfyUI; only commas separate tags.
+pub fn arrange(tokens: &[PromptToken], lora_block: &str, sentence: Option<&str>) -> String {
+    let groups: [&[Slot]; 10] = [
+        &[Slot::Quality],
+        &[Slot::Lora],
+        &[Slot::Subject, Slot::Other],
+        &[Slot::Traits, Slot::Hair, Slot::Eyes, Slot::Body],
+        &[Slot::Outfit],
+        &[Slot::Expression, Slot::Pose],
+        &[Slot::Camera],
+        &[Slot::Setting, Slot::Light],
+        &[Slot::Style],
+        &[Slot::Clause],
+    ];
+    let slots: Vec<Slot> = tokens.iter().map(slot).collect();
+    let mut lines: Vec<String> = Vec::new();
+    for (i, group) in groups.iter().enumerate() {
+        let mut items: Vec<String> = Vec::new();
+        if i == 1 && !lora_block.trim().is_empty() {
+            items.push(lora_block.trim().trim_matches(',').trim().to_string());
+        }
+        // within a group, keep the group's slot order, then the prompt's order
+        for s in group.iter() {
+            items.extend(tokens.iter().zip(&slots).filter(|(_, ts)| *ts == s).map(|(t, _)| t.raw.trim().to_string()));
+        }
+        if i == 9 {
+            if let Some(sen) = sentence.map(str::trim).filter(|s| !s.is_empty()) {
+                items.push(sen.to_string());
+            }
+        }
+        if !items.is_empty() {
+            lines.push(items.join(", "));
+        }
+    }
+    lines.join(",\n")
+}
+
+/// A plain-English sentence about the prompt for natural-language checkpoints
+/// (the rule-based stand-in when no Deep Scan has written one).
+pub fn prompt_sentence(tokens: &[PromptToken]) -> String {
+    let d = describe(tokens);
+    // "(+2 more)" belongs in the scene card, not in a prompt
+    let mut s = d.headline;
+    while let (Some(a), Some(b)) = (s.find(" (+"), s.find(" more)")) {
+        if b < a {
+            break;
+        }
+        s.replace_range(a..b + " more)".len(), "");
+    }
+    s
 }
 
 fn subject_phrase(subject: &[String]) -> String {
@@ -293,6 +387,23 @@ pub fn describe(tokens: &[PromptToken]) -> SceneDescription {
 mod tests {
     use super::*;
     use crate::parser::parse_prompt;
+
+    #[test]
+    fn arranges_tags_into_lines() {
+        let t = parse_prompt(
+            "moonlight, 1girl, (red eyes:1.2), masterpiece, kimono, smile, upper body, shrine, long white hair, solo, best quality, sitting, night",
+        );
+        let out = arrange(&t, "<lora:fox:0.8>, foxgirl", Some("A fox girl resting at a shrine."));
+        assert_eq!(
+            out,
+            "masterpiece, best quality,\n<lora:fox:0.8>, foxgirl,\n1girl, solo,\nlong white hair, (red eyes:1.2),\nkimono,\n\
+             smile, sitting,\nupper body,\nshrine, moonlight, night,\nA fox girl resting at a shrine."
+        );
+        // the layout is still the same prompt to the parser
+        assert_eq!(parse_prompt(&out).len(), t.len() + 3);
+        let s = prompt_sentence(&t);
+        assert!(s.starts_with("A lone girl with") && !s.contains("more)"), "{s}");
+    }
 
     #[test]
     fn describes_a_character_scene() {

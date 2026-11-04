@@ -74,6 +74,9 @@ pub struct AiJsonOutput {
     /// improved_prompt with {a|b|c} variation groups (only when dynamic prompts are on).
     #[serde(default)]
     pub dynamic_prompt: String,
+    /// 1-2 sentences for what tags get across badly (natural-language checkpoints, when on).
+    #[serde(default)]
+    pub natural_sentence: String,
     /// The model's reasoning when thinking was on (not part of the JSON reply).
     #[serde(skip)]
     pub thinking: String,
@@ -434,6 +437,15 @@ pub fn build_ai_system_and_user_prompt_for(raw_prompt: &str, config: &ScanConfig
         ),
         improved_prompt_step(config),
     ];
+    if wants_sentence(config) {
+        steps.push(
+            "natural_sentence: 1-2 short natural-language sentences, added after the tags, that get across what tags \
+             can't: who does what to whom, how characters interact, which character has which features when there are \
+             several, the composition and the mood. Don't just list the tags again, don't add anything new to the \
+             scene, and leave quality words (masterpiece, high quality...) to the tags."
+                .to_string(),
+        );
+    }
     if config.dynamic {
         steps.push(
             "dynamic_prompt: improved_prompt again, but with 3-5 Dynamic Prompts variation groups written as \
@@ -478,6 +490,11 @@ pub fn build_ai_system_and_user_prompt_for(raw_prompt: &str, config: &ScanConfig
     let numbered = |v: &[String]| v.iter().enumerate().map(|(i, l)| format!("{}. {l}", i + 1)).collect::<Vec<_>>().join("\n");
     let system_prompt = match family {
         ModelFamily::Gemma => {
+            let natural_example = if wants_sentence(config) {
+                ",\n  \"natural_sentence\": \"A lone astronaut gazes up at a sky he will never reach, dwarfed by endless dunes.\""
+            } else {
+                ""
+            };
             let dynamic_example = if config.dynamic {
                 ",\n  \"dynamic_prompt\": \"masterpiece, best quality, 1boy, solo, astronaut, white spacesuit, {standing|kneeling|walking}, full body, {from below|from side}, red desert, sand dunes, {dusk|night|dawn}, rim lighting\""
             } else {
@@ -491,7 +508,7 @@ pub fn build_ai_system_and_user_prompt_for(raw_prompt: &str, config: &ScanConfig
                  \"full body, from below\", \"setting\": \"red desert dunes\", \"lighting\": \"dusk, rim lighting\", \"mood\": \
                  \"lonely, epic\"}},\n  \"issues\": [\"no time of day\"],\n  \"improved_prompt\": \"masterpiece, best quality, \
                  1boy, solo, astronaut, white spacesuit, standing, full body, from below, red desert, sand dunes, dusk, rim \
-                 lighting\"{dynamic_example},\n  \"recommended_negative\": \"worst quality, low quality, crowd, daytime\",\n  \
+                 lighting\"{natural_example}{dynamic_example},\n  \"recommended_negative\": \"worst quality, low quality, crowd, daytime\",\n  \
                  \"changes\": [{{\"original\": \"\", \"action\": \"add\", \"reason\": \"adds time of day\", \
                  \"suggested_alternative\": \"dusk, rim lighting\", \"framing_alternative\": \"\"}}]\n}}\n```",
                 bullets(&context),
@@ -517,6 +534,12 @@ pub fn build_ai_system_and_user_prompt_for(raw_prompt: &str, config: &ScanConfig
         _ => format!("Analyze and improve this ComfyUI prompt:\n\"\"\"\n{}\n\"\"\"", raw_prompt.trim()),
     };
     (system_prompt, user_prompt)
+}
+
+/// The Deep Scan writes a natural_sentence only when the toggle is on and the
+/// checkpoint understands natural language.
+fn wants_sentence(config: &ScanConfig) -> bool {
+    config.natural && config.checkpoint.supports_natural_language()
 }
 
 /// The improved_prompt task, worded for the chosen detail level.
@@ -1338,11 +1361,19 @@ pub struct AiScanRequest {
     pub think: bool,
 }
 
-fn changes_schema(needs_negative: bool, dynamic: bool) -> serde_json::Value {
+fn changes_schema(needs_negative: bool, dynamic: bool, natural: bool) -> serde_json::Value {
     let text = json!({ "type": "string" });
     let negative = if needs_negative { json!({ "type": "string", "minLength": 40 }) } else { text.clone() };
+    let mut required = vec!["scene_summary", "scene_breakdown", "issues", "improved_prompt"];
+    if natural {
+        required.push("natural_sentence");
+    }
+    if dynamic {
+        required.push("dynamic_prompt");
+    }
+    required.extend(["recommended_negative", "changes"]);
     // Property order matters: the model writes the analysis before the rewrite.
-    json!({
+    let mut schema = json!({
         "type": "object",
         "properties": {
             "scene_summary": text,
@@ -1356,6 +1387,7 @@ fn changes_schema(needs_negative: bool, dynamic: bool) -> serde_json::Value {
             },
             "issues": { "type": "array", "maxItems": 8, "items": text },
             "improved_prompt": text,
+            "natural_sentence": text,
             "dynamic_prompt": text,
             "recommended_negative": negative,
             "changes": {
@@ -1374,12 +1406,13 @@ fn changes_schema(needs_negative: bool, dynamic: bool) -> serde_json::Value {
                 }
             }
         },
-        "required": if dynamic {
-            json!(["scene_summary", "scene_breakdown", "issues", "improved_prompt", "dynamic_prompt", "recommended_negative", "changes"])
-        } else {
-            json!(["scene_summary", "scene_breakdown", "issues", "improved_prompt", "recommended_negative", "changes"])
-        }
-    })
+        "required": required
+    });
+    if !natural {
+        // only asked for where it's wanted, so the model doesn't spend time on it
+        schema["properties"].as_object_mut().expect("object").remove("natural_sentence");
+    }
+    schema
 }
 
 fn generate_body<'a>(req: &'a AiScanRequest, system: &'a str, prompt: &'a str) -> GenerateRequest<'a> {
@@ -1387,7 +1420,11 @@ fn generate_body<'a>(req: &'a AiScanRequest, system: &'a str, prompt: &'a str) -
         model: &req.model,
         system,
         prompt,
-        format: changes_schema(!req.config.checkpoint.default_negative().is_empty(), req.config.dynamic),
+        format: changes_schema(
+            !req.config.checkpoint.default_negative().is_empty(),
+            req.config.dynamic,
+            wants_sentence(&req.config),
+        ),
         stream: false,
         keep_alive: &req.keep_alive,
         think: Some(req.think),
@@ -1555,6 +1592,7 @@ fn merge_scan(best: &mut AiJsonOutput, next: AiJsonOutput, req: &AiScanRequest) 
         best.improved_prompt = next.improved_prompt.clone();
         best.changes = next.changes.clone();
         best.dynamic_prompt = next.dynamic_prompt.clone();
+        best.natural_sentence = next.natural_sentence.clone();
         best.thinking = next.thinking.clone();
     } else if !dynamic_ok(best, req) && dynamic_ok(&next, req) {
         best.dynamic_prompt = next.dynamic_prompt.clone();
@@ -1712,7 +1750,7 @@ mod tests {
 
                 dynamic: false,
 
-                lora_tags_raw: String::new(),
+                lora_tags_raw: String::new(), arranged: false, natural: false,
 
                 detail: crate::profiles::DetailLevel::Balanced,
             },
@@ -1823,7 +1861,7 @@ mod tests {
 
                 dynamic: false,
 
-                lora_tags_raw: String::new(),
+                lora_tags_raw: String::new(), arranged: false, natural: false,
 
                 detail: crate::profiles::DetailLevel::Balanced,
             },
@@ -1882,7 +1920,7 @@ mod tests {
 
                 dynamic: false,
 
-                lora_tags_raw: String::new(),
+                lora_tags_raw: String::new(), arranged: false, natural: false,
 
                 detail: crate::profiles::DetailLevel::Balanced,
             },
@@ -1933,7 +1971,7 @@ mod tests {
             config: ScanConfig {
                 checkpoint: crate::profiles::CheckpointProfile::PonyV6, target_view: crate::profiles::TargetView::None, pinned_emphasis_raw: String::new(),
                 emphasis_weight: 1.25, cleanup_enabled: true, resolve_conflicts_enabled: true, clamp_weights_enabled: true,
-                camera_angle: 0, pose: 0, dynamic: false, lora_tags_raw: String::new(),
+                camera_angle: 0, pose: 0, dynamic: false, lora_tags_raw: String::new(), arranged: false, natural: false,
                 detail: crate::profiles::DetailLevel::Balanced,
             },
             mode: AiMode::Gpu, host: String::new(), model: String::new(), keep_alive: "30m".into(), think: false,
@@ -1992,7 +2030,7 @@ mod tests {
             let config = ScanConfig {
                 checkpoint: crate::profiles::CheckpointProfile::PonyV6, target_view: crate::profiles::TargetView::None, pinned_emphasis_raw: String::new(),
                 emphasis_weight: 1.25, cleanup_enabled: true, resolve_conflicts_enabled: true, clamp_weights_enabled: true,
-                camera_angle: 0, pose: 0, dynamic: false, lora_tags_raw: String::new(), detail: crate::profiles::DetailLevel::Balanced,
+                camera_angle: 0, pose: 0, dynamic: false, lora_tags_raw: String::new(), arranged: false, natural: false, detail: crate::profiles::DetailLevel::Balanced,
             };
             let req = ImageAiRequest {
                 host: "localhost:11434".into(), model: "prompt-condenser-gemma4-12b".into(), mode: AiMode::Gpu,
@@ -2075,7 +2113,7 @@ mod tests {
                         camera_angle: std::env::var("COMPARE_ANGLE").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
                         pose: 0,
                         dynamic: std::env::var("COMPARE_DYNAMIC").is_ok(),
-                        lora_tags_raw: std::env::var("COMPARE_LORA").unwrap_or_default(),
+                        lora_tags_raw: std::env::var("COMPARE_LORA").unwrap_or_default(), arranged: false, natural: std::env::var("COMPARE_NATURAL").is_ok(),
                         detail: match std::env::var("COMPARE_DETAIL").as_deref() { Ok("rich") => crate::profiles::DetailLevel::Rich, Ok("faithful") => crate::profiles::DetailLevel::Faithful, _ => crate::profiles::DetailLevel::Balanced },
                     },
                     mode: AiMode::Gpu,
@@ -2110,10 +2148,10 @@ mod tests {
                             }
                         );
                         full.push_str(&format!(
-                            "\n===== {name} | {model} | {secs:.1}s | {place} | thinking {} chars\nSUMMARY: {}\nISSUES: {}\nIMPROVED: {}\nDROPPED: {}\nNEGATIVE: {}\nCARDS: {}\nDYNAMIC: {}\n",
+                            "\n===== {name} | {model} | {secs:.1}s | {place} | thinking {} chars\nSUMMARY: {}\nISSUES: {}\nIMPROVED: {}\nDROPPED: {}\nNEGATIVE: {}\nCARDS: {}\nDYNAMIC: {}\nNATURAL: {}\n",
                             out.thinking.len(), out.scene_summary, out.issues.join(" | "), improved, dropped.join(", "), out.recommended_negative,
                             out.changes.iter().map(|c| format!("[{}] '{}' -> '{}'", c.action, c.original, c.suggested_alternative)).collect::<Vec<_>>().join(" ; "),
-                            out.dynamic_prompt
+                            out.dynamic_prompt, out.natural_sentence
                         ));
                     }
                     Err(e) => {
@@ -2136,7 +2174,7 @@ mod tests {
  camera_angle: 0,
  pose: 0,
  dynamic: false,
- lora_tags_raw: String::new(),
+ lora_tags_raw: String::new(), arranged: false, natural: false,
  detail: crate::profiles::DetailLevel::Balanced,
         };
         let joined = |p: &str, v| prompt_guidance(p, &cfg(v)).join("\n");
@@ -2174,7 +2212,7 @@ mod tests {
         let mut cfg = ScanConfig {
             checkpoint: CheckpointProfile::Anima, target_view: TargetView::None, pinned_emphasis_raw: String::new(),
             emphasis_weight: 1.25, cleanup_enabled: true, resolve_conflicts_enabled: true, clamp_weights_enabled: true,
-            camera_angle: 6, pose: 0, dynamic: true, lora_tags_raw: String::new(), detail: crate::profiles::DetailLevel::Rich,
+            camera_angle: 6, pose: 0, dynamic: true, lora_tags_raw: String::new(), arranged: false, natural: false, detail: crate::profiles::DetailLevel::Rich,
         };
         let p = "1girl, solo, smile, kimono, shrine, night";
         let (g, gu) = build_ai_system_and_user_prompt_for(p, &cfg, ModelFamily::Gemma);

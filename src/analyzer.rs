@@ -65,6 +65,10 @@ pub struct ScanConfig {
     pub dynamic: bool,
     /// The LoRA box: tags put into the output word for word.
     pub lora_tags_raw: String,
+    /// Show After as grouped lines in the best order (not for Flux prose).
+    pub arranged: bool,
+    /// Add natural-language sentences (only where the checkpoint understands them).
+    pub natural: bool,
     /// How much the deep scan may enrich the prompt.
     pub detail: crate::profiles::DetailLevel,
 }
@@ -753,16 +757,42 @@ pub fn insert_lora_block(text: &str, config: &ScanConfig, strip_conflicts: bool)
     if block.is_empty() {
         return text.to_string();
     }
-    let loras = crate::parser::parse_prompt(block);
-    let parts: Vec<_> = crate::parser::parse_prompt(text)
-        .into_iter()
-        .filter(|t| !loras.iter().any(|l| l.normalized == t.normalized))
-        .filter(|t| !strip_conflicts || !loras.iter().any(|l| tags_conflict(&l.normalized, &t.normalized)))
-        .collect();
+    let parts = without_lora_tags(text, config, strip_conflicts);
     let at = parts.iter().take_while(|t| t.category == TokenCategory::QualityMeta).count();
     let mut out: Vec<String> = parts.iter().map(|t| t.raw.trim().to_string()).collect();
     out.insert(at, block.to_string());
     out.join(", ")
+}
+
+/// The prompt's tags minus copies of the LoRA box's tags (and, with `strip_conflicts`,
+/// minus tags that contradict them).
+pub fn without_lora_tags(text: &str, config: &ScanConfig, strip_conflicts: bool) -> Vec<PromptToken> {
+    let loras = crate::parser::parse_prompt(&config.lora_tags_raw);
+    crate::parser::parse_prompt(text)
+        .into_iter()
+        .filter(|t| !loras.iter().any(|l| l.normalized == t.normalized))
+        .filter(|t| !strip_conflicts || !loras.iter().any(|l| tags_conflict(&l.normalized, &t.normalized)))
+        .collect()
+}
+
+/// Final touches for any After view: the LoRA box, the natural-language sentence
+/// (only when on and the checkpoint understands it) and the arranged layout.
+pub fn finish_prompt(text: &str, config: &ScanConfig, strip_conflicts: bool, sentence: Option<&str>) -> String {
+    let sentence = sentence
+        .map(str::trim)
+        .filter(|s| config.natural && config.checkpoint.supports_natural_language() && !s.is_empty());
+    if config.arranged && config.checkpoint != crate::profiles::CheckpointProfile::Flux {
+        let tokens = without_lora_tags(text, config, strip_conflicts);
+        return crate::scene::arrange(&tokens, &config.lora_tags_raw, sentence);
+    }
+    let t = insert_lora_block(text, config, strip_conflicts);
+    match sentence {
+        Some(s) if !t.contains(s) => {
+            let t = t.trim().trim_end_matches(',').trim();
+            if t.is_empty() { s.to_string() } else { format!("{t}, {s}") }
+        }
+        _ => t,
+    }
 }
 
 #[cfg(test)]
@@ -787,7 +817,7 @@ mod tests {
 
             dynamic: false,
 
-            lora_tags_raw: String::new(),
+            lora_tags_raw: String::new(), arranged: false, natural: false,
 
             detail: crate::profiles::DetailLevel::Balanced,
         }
@@ -889,6 +919,20 @@ mod tests {
         assert!(tags_conflict("flat chest", "huge breasts"));
         assert!(!tags_conflict("large breasts", "breasts out"));
         assert!(!tags_conflict("long hair", "silver hair"));
+    }
+
+    #[test]
+    fn finishing_respects_the_checkpoint() {
+        let mut config = cfg(TargetView::None);
+        config.natural = true;
+        let s = Some("Two friends share an umbrella.");
+        // Anima understands sentences
+        assert_eq!(finish_prompt("1girl, rain", &config, false, s), "1girl, rain, Two friends share an umbrella.");
+        // Pony doesn't: no sentence even with the toggle on
+        config.checkpoint = CheckpointProfile::PonyV6;
+        assert_eq!(finish_prompt("1girl, rain", &config, false, s), "1girl, rain");
+        config.arranged = true;
+        assert_eq!(finish_prompt("rain, 1girl", &config, false, s), "1girl,\nrain");
     }
 
     #[test]

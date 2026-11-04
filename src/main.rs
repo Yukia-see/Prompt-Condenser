@@ -66,6 +66,8 @@ struct SceneResult {
     recommended_negative: String,
     /// improved_prompt with {a|b|c} variation groups (when dynamic prompts were on).
     dynamic_prompt: String,
+    /// The AI's natural-language sentence (when the toggle was on).
+    natural_sentence: String,
 }
 
 impl SceneResult {
@@ -98,6 +100,7 @@ impl SceneResult {
             improved_prompt: condenser::tidy_ai_prompt(&out.improved_prompt, checkpoint),
             recommended_negative: condenser::tidy_ai_prompt(&out.recommended_negative, checkpoint),
             dynamic_prompt: condenser::tidy_ai_prompt(&out.dynamic_prompt, checkpoint),
+            natural_sentence: out.natural_sentence.trim().replace('\n', " "),
         };
         (!result.summary.is_empty() || !result.improved_prompt.is_empty()).then_some(result)
     }
@@ -135,7 +138,7 @@ fn scan_config(ui: &AppWindow) -> ScanConfig {
         camera_angle: ui.get_angle_index().max(0) as usize,
         pose: ui.get_pose_index().max(0) as usize,
         dynamic: ui.get_dynamic_enabled(),
-        lora_tags_raw: ui.get_lora_tags().to_string(),
+        lora_tags_raw: ui.get_lora_tags().to_string(), arranged: ui.get_arranged_enabled(), natural: ui.get_natural_enabled(),
         detail: crate::profiles::DetailLevel::from_index(ui.get_detail_index()),
     }
 }
@@ -184,11 +187,20 @@ fn render(ui: &AppWindow, state: &State) {
     let st = state.borrow();
     let all_changes: Vec<PromptChange> = st.changes.iter().chain(&st.ai_changes).cloned().collect();
     let mut out = condenser::build_condensed_output(&raw, &st.base_tokens, &all_changes, &config);
-    // the LoRA box goes in word for word, in every view
+    // Every view gets the LoRA box word for word, the natural-language sentence (the
+    // Deep Scan's, else a rule-based one) and the arranged layout, when those are on.
+    let ai_sentence = st.ai_scene.as_ref().map(|sc| sc.natural_sentence.clone()).filter(|s| !s.is_empty());
+    let finish = |t: &str, strip: bool| {
+        let sentence = ai_sentence.clone().or_else(|| {
+            (config.natural && config.checkpoint.supports_natural_language())
+                .then(|| scene::prompt_sentence(&parser::parse_prompt(t)))
+        });
+        analyzer::finish_prompt(t, &config, strip, sentence.as_deref())
+    };
     let rule_prompt = out.final_prompt.clone();
-    out.final_prompt = analyzer::insert_lora_block(&out.final_prompt, &config, false);
+    out.final_prompt = finish(&out.final_prompt, false);
     (out.after_tokens, out.after_chunks) = parser::estimate_clip_tokens(&out.final_prompt);
-    let with_loras = |t: String| analyzer::insert_lora_block(&t, &config, true);
+    let with_loras = |t: String| finish(&t, true);
 
     // Scene analysis card + optional AI Improved view
     let improved = st.ai_scene.as_ref().map(|sc| sc.improved_prompt.clone()).filter(|p| !p.is_empty()).map(with_loras);
@@ -221,7 +233,7 @@ fn render(ui: &AppWindow, state: &State) {
             None => {
                 // vary the rule output, never the LoRA tags
                 let (p, kinds) = dynamic::make_dynamic(&rule_prompt);
-                let p = analyzer::insert_lora_block(&p, &config, false);
+                let p = finish(&p, false);
                 let note = if kinds.is_empty() {
                     "Nothing to vary yet: add a pose, angle, expression or lighting tag (or run a Deep AI Scan).".to_string()
                 } else {
@@ -656,6 +668,8 @@ struct Settings {
     raw_prompt: String,
     pinned_emphasis: String,
     lora_tags: String,
+    arranged: bool,
+    natural: bool,
 }
 
 impl Default for Settings {
@@ -670,6 +684,8 @@ impl Default for Settings {
             raw_prompt: String::new(),
             pinned_emphasis: String::new(),
             lora_tags: String::new(),
+            arranged: false,
+            natural: false,
             ollama_host: "localhost:11434".into(),
         }
     }
@@ -696,6 +712,8 @@ fn load_settings(ui: &AppWindow) {
     ui.set_raw_prompt(st.raw_prompt.into());
     ui.set_pinned_emphasis(st.pinned_emphasis.into());
     ui.set_lora_tags(st.lora_tags.into());
+    ui.set_arranged_enabled(st.arranged);
+    ui.set_natural_enabled(st.natural);
     if !st.ollama_host.trim().is_empty() {
         ui.set_ollama_host(st.ollama_host.into());
     }
@@ -712,6 +730,8 @@ fn save_settings(ui: &AppWindow) {
         raw_prompt: ui.get_raw_prompt().to_string(),
         pinned_emphasis: ui.get_pinned_emphasis().to_string(),
         lora_tags: ui.get_lora_tags().to_string(),
+        arranged: ui.get_arranged_enabled(),
+        natural: ui.get_natural_enabled(),
         ollama_host: ui.get_ollama_host().to_string(),
     };
     if let Some(path) = settings_path() {
