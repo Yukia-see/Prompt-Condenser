@@ -287,7 +287,7 @@ component CardsPanel inherits M3Card {
             }
             Rectangle { horizontal-stretch: 1; }
             if root.cards.length > 1 : Text {
-                text: "scroll sideways (Shift + wheel) →";
+                text: "wheel: up/down · Shift + wheel: sideways →";
                 font-size: 11px;
                 color: M3.on-surface-variant;
                 vertical-alignment: center;
@@ -304,47 +304,41 @@ component CardsPanel inherits M3Card {
             horizontal-alignment: center;
         }
 
+        // One scroll area for the whole strip, both directions: wheel scrolls tall cards
+        // up/down, Shift + wheel scrolls sideways. (Per-card scroll areas used to grab
+        // the wheel and block sideways scrolling.)
         if root.live-headline != "" || root.cards.length > 0 : row := ScrollView {
             vertical-stretch: 1;
             HorizontalLayout {
-                height: row.visible-height;
+                min-height: row.visible-height;
                 spacing: 8px;
                 alignment: start;
-                if root.live-headline != "" : live-scroll := ScrollView {
+                if root.live-headline != "" : VerticalLayout {
                     width: 380px;
-                    VerticalLayout {
-                        width: live-scroll.visible-width;
-                        alignment: start;
-                        LiveSceneCard {
-                            headline: root.live-headline;
-                            details: root.live-details;
-                            missing: root.live-missing;
-                        }
+                    alignment: start;
+                    LiveSceneCard {
+                        headline: root.live-headline;
+                        details: root.live-details;
+                        missing: root.live-missing;
                     }
                 }
-                if root.scene-summary != "" : scene-scroll := ScrollView {
+                if root.scene-summary != "" : VerticalLayout {
                     width: 380px;
-                    VerticalLayout {
-                        width: scene-scroll.visible-width;
-                        alignment: start;
-                        SceneCard {
-                            summary: root.scene-summary;
-                            details: root.scene-details;
-                            issues: root.scene-issues;
-                            show-ai-button: root.show-ai-button;
-                            show-ai => { root.show-ai(); }
-                        }
+                    alignment: start;
+                    SceneCard {
+                        summary: root.scene-summary;
+                        details: root.scene-details;
+                        issues: root.scene-issues;
+                        show-ai-button: root.show-ai-button;
+                        show-ai => { root.show-ai(); }
                     }
                 }
-                for card in root.cards : card-scroll := ScrollView {
+                for card in root.cards : VerticalLayout {
                     width: 320px;
-                    VerticalLayout {
-                        width: card-scroll.visible-width;
-                        alignment: start;
-                        ChangeCard {
-                            card: card;
-                            mode-changed(id, mode) => { root.mode-changed(id, mode); }
-                        }
+                    alignment: start;
+                    ChangeCard {
+                        card: card;
+                        mode-changed(id, mode) => { root.mode-changed(id, mode); }
                     }
                 }
             }
