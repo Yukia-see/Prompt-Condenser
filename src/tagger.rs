@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 use std::sync::Mutex;
 
-const REPO: &str = "https://huggingface.co/SmilingWolf/wd-eva02-large-tagger-v3/resolve/main";
+pub const REPO: &str = "https://huggingface.co/SmilingWolf/wd-eva02-large-tagger-v3/resolve/main";
 const INPUT_SIZE: u32 = 448;
 /// Character tags need much more confidence than general ones (model card defaults).
 const CHARACTER_THRESHOLD: f32 = 0.85;

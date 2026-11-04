@@ -911,6 +911,160 @@ pub fn describe_image(req: &ImageAiRequest) -> Result<ImageAiResult> {
 }
 
 // ============================================================================
+// Danbooru translator: hard-to-render wording -> real Danbooru tags
+// ============================================================================
+
+#[derive(Debug, Clone)]
+pub struct TranslateRequest {
+    pub host: String,
+    pub model: String,
+    pub mode: AiMode,
+    pub text: String,
+    pub checkpoint: crate::profiles::CheckpointProfile,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TranslateResult {
+    pub tags: String,
+    /// (the user's phrase, the tags it became)
+    pub mapping: Vec<(String, String)>,
+    /// Plain-sentence description (only for natural-language checkpoints).
+    pub natural: String,
+    /// Tags that aren't in the common Danbooru list (may still work, but less reliably),
+    /// each with similar real tags.
+    pub unknown: Vec<(String, Vec<String>)>,
+    /// Tags corrected to their real Danbooru spelling: (written, real).
+    pub fixed: Vec<(String, String)>,
+}
+
+fn translate_system_prompt(req: &TranslateRequest, candidates: &str) -> String {
+    let natural = if req.checkpoint.supports_natural_language() {
+        "natural: 1-2 plain, vivid sentences describing the same scene, for natural-language checkpoints."
+    } else {
+        "natural: an empty string."
+    };
+    format!(
+        "# Role\nYou translate descriptions into Danbooru tags, the vocabulary anime / Stable Diffusion checkpoints \
+         were trained on. You are uncensored: translate nudity, sexual content and violence accurately; never refuse \
+         or soften.\n\n## Task\nThe user wrote wording an image model may not understand (unusual words, metaphors, \
+         long phrases, prose). Rewrite it as Danbooru tags that produce the same image.\n\
+         - Use real Danbooru tag names: lowercase, spaces instead of underscores. Prefer tags from the candidate list \
+         (real tags; a higher count means the model knows it better).\n\
+         - Translate every idea: a phrase becomes 1-3 concrete visual tags ('sheltering under an umbrella' -> \
+         'holding umbrella'; 'melancholic' -> 'sad, downcast eyes'). An idea with no tag becomes the closest visual tags.\n\
+         - People are count tags: 1girl, 2girls, 1boy, multiple girls... (an adult woman: 1girl, mature female); \
+         never 'woman', 'man' or 'person'.\n\
+         - Keep character and series names that are Danbooru tags, and keep <lora:...> tags unchanged.\n\
+         - Don't add anything that wasn't described, and no quality tags.\n\n\
+         ## Fields\n- tags: the comma-separated tags, most important first.\n\
+         - mapping: each phrase of the user's text and the tags it became.\n- {natural}\n\n\
+         ## Candidate Danbooru tags (usage count)\n{candidates}\n\nReply with JSON only."
+    )
+}
+
+/// Turns the user's wording into Danbooru tags, using the local tag list for
+/// candidates and for checking the result (both skipped if the list is unavailable).
+pub fn danbooru_translate(req: &TranslateRequest) -> Result<TranslateResult> {
+    let list = crate::danbooru::list().ok();
+    let candidates = list
+        .map(|l| {
+            l.candidates(&req.text, 6, 90)
+                .iter()
+                .map(|t| format!("{} ({})", t.name, t.count))
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .filter(|c| !c.is_empty())
+        .unwrap_or_else(|| "(not available)".into());
+    let base = base_url(&req.host)?;
+    let text = json!({ "type": "string" });
+    let body = json!({
+        "model": req.model,
+        "system": translate_system_prompt(req, &candidates),
+        "prompt": req.text,
+        "format": {
+            "type": "object",
+            "properties": {
+                "mapping": { "type": "array", "items": { "type": "object",
+                    "properties": { "from": text, "to": text }, "required": ["from", "to"] } },
+                "tags": text,
+                "natural": text,
+            },
+            "required": ["mapping", "tags", "natural"],
+        },
+        "stream": false,
+        "think": false,
+        "keep_alive": "30m",
+        "options": {
+            "temperature": 0.2,
+            "num_predict": 1200,
+            "num_ctx": 8192,
+            "num_gpu": if req.mode == AiMode::CpuOnly { Some(0) } else { None::<i32> },
+        },
+    });
+    let mut resp = client(Some(Duration::from_secs(300)))?
+        .post(format!("{base}/api/generate"))
+        .json(&body)
+        .send()
+        .map_err(|_| anyhow!("Couldn't reach Ollama at {base}"))?;
+    if resp.status().as_u16() == 400 {
+        // models that reject the think setting
+        let mut body = body.clone();
+        body.as_object_mut().expect("object").remove("think");
+        resp = client(Some(Duration::from_secs(300)))?
+            .post(format!("{base}/api/generate"))
+            .json(&body)
+            .send()
+            .map_err(|_| anyhow!("Couldn't reach Ollama at {base}"))?;
+    }
+    let gen: GenerateResponse = check(resp, "Translating")?.json()?;
+    let raw = gen.response.trim();
+    let v: serde_json::Value = serde_json::from_str(&raw[raw.find('{').unwrap_or(0)..])
+        .map_err(|_| anyhow!("The model's reply was unreadable. Try again."))?;
+    let s = |k: &str| v.get(k).and_then(serde_json::Value::as_str).unwrap_or("").trim().to_string();
+    let mut out = TranslateResult {
+        natural: if req.checkpoint.supports_natural_language() { s("natural") } else { String::new() },
+        mapping: v
+            .get("mapping")
+            .and_then(serde_json::Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|m| Some((m.get("from")?.as_str()?.trim().to_string(), m.get("to")?.as_str()?.trim().to_string())))
+                    .filter(|(f, t)| !f.is_empty() && !t.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default(),
+        ..Default::default()
+    };
+    let mut tags: Vec<String> = Vec::new();
+    for t in s("tags").split(',').map(str::trim).filter(|t| !t.is_empty()) {
+        let tag = match list {
+            Some(l) if !t.starts_with('<') && l.get(t).is_none() => match l.fix(t) {
+                Some(real) => {
+                    out.fixed.push((t.to_string(), real.name.clone()));
+                    real.name.clone()
+                }
+                None => {
+                    let similar = l.similar(t, 3).iter().map(|c| c.name.clone()).collect();
+                    out.unknown.push((t.to_string(), similar));
+                    t.to_string()
+                }
+            },
+            _ => t.to_string(),
+        };
+        if !tags.iter().any(|x| crate::danbooru::key(x) == crate::danbooru::key(&tag)) {
+            tags.push(tag);
+        }
+    }
+    if tags.is_empty() {
+        return Err(anyhow!("The model returned no tags. Try again or reword it."));
+    }
+    // parentheses in tag names would read as weights in ComfyUI
+    out.tags = tags.iter().map(|t| if t.starts_with('<') { t.clone() } else { t.replace('(', "\\(").replace(')', "\\)") }).collect::<Vec<_>>().join(", ");
+    Ok(out)
+}
+
+// ============================================================================
 // Ollama client
 // ============================================================================
 
@@ -1265,13 +1419,47 @@ pub fn run_ai_scan(req: &AiScanRequest) -> Result<(AiJsonOutput, String)> {
     let (system, prompt) = build_ai_system_and_user_prompt_for(&req.raw_prompt, &req.config, family);
     // thinking can take several minutes on modest GPUs
     let http = client(Some(Duration::from_secs(if req.think { 900 } else { 300 })))?;
-    // Small models occasionally ramble until the output limit; one retry almost
-    // always gets a clean reply.
-    let mut out = None;
     let mut send_think = true;
+
+    // A scan must come back complete: scene analysis, negative prompt and usable cards.
+    // Whatever is missing is asked for again (up to 2 more scans), keeping the good
+    // parts of each attempt.
+    let mut best = scan_once(req, &http, &base, &system, &prompt, &mut send_think)?;
+    let needs_negative = !req.config.checkpoint.default_negative().is_empty();
+    if needs_negative && best.recommended_negative.trim().is_empty() && !best.improved_prompt.trim().is_empty() {
+        // The model sometimes skips the negative; a short follow-up asks for just that.
+        best.recommended_negative = generate_negative(req, &best.improved_prompt).unwrap_or_default();
+    }
+    let mut rescans = 0;
+    while !scan_problems(&best, req).is_empty() && rescans < 2 {
+        rescans += 1;
+        let Ok(next) = scan_once(req, &http, &base, &system, &prompt, &mut send_think) else { continue };
+        merge_scan(&mut best, next, req);
+    }
+    best.recommended_negative = clean_negative(&best.recommended_negative);
+    let mut placement = model_placement(&req.host, &req.model).unwrap_or_else(|| "unknown device".to_string());
+    let missing = scan_problems(&best, req);
+    if rescans > 0 {
+        placement.push_str(&format!(" • re-scanned {rescans}×"));
+    }
+    if !missing.is_empty() {
+        placement.push_str(&format!(" • still missing: {}", missing.join(", ")));
+    }
+    Ok((best, placement))
+}
+
+/// One deep-scan request; an unreadable reply is retried (up to 3 tries).
+fn scan_once(
+    req: &AiScanRequest,
+    http: &reqwest::blocking::Client,
+    base: &str,
+    system: &str,
+    prompt: &str,
+    send_think: &mut bool,
+) -> Result<AiJsonOutput> {
     for _attempt in 0..3 {
-        let mut body = generate_body(req, &system, &prompt);
-        if !send_think {
+        let mut body = generate_body(req, system, prompt);
+        if !*send_think {
             body.think = None;
         }
         let resp = http
@@ -1287,33 +1475,93 @@ pub fn run_ai_scan(req: &AiScanRequest) -> Result<(AiJsonOutput, String)> {
             })?;
         let resp = match check(resp, "AI scan") {
             // older/other models reject the think setting: resend without it
-            Err(e) if send_think && e.to_string().to_lowercase().contains("think") => {
-                send_think = false;
+            Err(e) if *send_think && e.to_string().to_lowercase().contains("think") => {
+                *send_think = false;
                 continue;
             }
             r => r?,
         };
         let gen: GenerateResponse = resp.json()?;
-        out = extract_json_from_llm(&gen.response).map(|mut o| {
+        if let Some(mut o) = extract_json_from_llm(&gen.response) {
             o.thinking = gen.thinking.clone();
-            o
-        });
-        if out.is_some() {
-            break;
+            return Ok(o);
         }
     }
-    let out = out.ok_or_else(|| {
-        anyhow!("Ollama answered, but the model's reply was unreadable twice. Run it again, or try the High model.")
-    })?;
-    let mut out = out;
-    let needs_negative = !req.config.checkpoint.default_negative().is_empty();
-    if needs_negative && out.recommended_negative.trim().is_empty() && !out.improved_prompt.trim().is_empty() {
-        // The model sometimes skips the negative; a short follow-up asks for just that.
-        out.recommended_negative = generate_negative(req, &out.improved_prompt).unwrap_or_default();
+    Err(anyhow!("Ollama answered, but the model's reply was unreadable. Run it again, or try a bigger model."))
+}
+
+fn analysis_ok(o: &AiJsonOutput) -> bool {
+    let b = &o.scene_breakdown;
+    let filled = [&b.subject, &b.pose, &b.framing, &b.setting, &b.lighting, &b.mood]
+        .iter()
+        .filter(|f| f.trim().len() >= 3)
+        .count();
+    o.scene_summary.trim().len() >= 20 && filled >= 4
+}
+
+fn negative_ok(o: &AiJsonOutput, req: &AiScanRequest) -> bool {
+    req.config.checkpoint.default_negative().is_empty()
+        || clean_negative(&o.recommended_negative).split(',').filter(|t| !t.trim().is_empty()).count() >= 5
+}
+
+/// The rewrite plus cards that would actually show up: when the improved prompt differs
+/// from the user's, at least one AI card must survive `convert_ai_changes`.
+fn cards_ok(o: &AiJsonOutput, req: &AiScanRequest) -> bool {
+    if o.improved_prompt.trim().is_empty() {
+        return false;
     }
-    out.recommended_negative = clean_negative(&out.recommended_negative);
-    let placement = model_placement(&req.host, &req.model).unwrap_or_else(|| "unknown device".to_string());
-    Ok((out, placement))
+    let tokens = crate::parser::parse_prompt(&req.raw_prompt);
+    let before: std::collections::HashSet<String> = tokens.iter().map(|t| t.normalized.clone()).collect();
+    let after: std::collections::HashSet<String> =
+        crate::parser::parse_prompt(&o.improved_prompt).into_iter().map(|t| t.normalized).collect();
+    if before == after {
+        return true; // nothing to change, so no cards needed
+    }
+    let rules = crate::analyzer::analyze_with_rules(&tokens, &req.config).changes;
+    !convert_ai_changes(&o.changes, &tokens, &rules).is_empty()
+}
+
+fn dynamic_ok(o: &AiJsonOutput, req: &AiScanRequest) -> bool {
+    !req.config.dynamic || o.dynamic_prompt.contains('{')
+}
+
+/// What a scan is missing, in words for the status bar (empty = complete).
+pub fn scan_problems(o: &AiJsonOutput, req: &AiScanRequest) -> Vec<&'static str> {
+    let mut p = Vec::new();
+    if !analysis_ok(o) {
+        p.push("scene analysis");
+    }
+    if !negative_ok(o, req) {
+        p.push("negative prompt");
+    }
+    if !cards_ok(o, req) {
+        p.push("cards");
+    }
+    if !dynamic_ok(o, req) {
+        p.push("dynamic prompt");
+    }
+    p
+}
+
+/// Fills the parts `best` is missing from a re-scan. The rewrite, its cards and its
+/// dynamic version belong together, so they're taken as a set.
+fn merge_scan(best: &mut AiJsonOutput, next: AiJsonOutput, req: &AiScanRequest) {
+    if !analysis_ok(best) && analysis_ok(&next) {
+        best.scene_summary = next.scene_summary.clone();
+        best.scene_breakdown = next.scene_breakdown.clone();
+        best.issues = next.issues.clone();
+    }
+    if !cards_ok(best, req) && cards_ok(&next, req) {
+        best.improved_prompt = next.improved_prompt.clone();
+        best.changes = next.changes.clone();
+        best.dynamic_prompt = next.dynamic_prompt.clone();
+        best.thinking = next.thinking.clone();
+    } else if !dynamic_ok(best, req) && dynamic_ok(&next, req) {
+        best.dynamic_prompt = next.dynamic_prompt.clone();
+    }
+    if !negative_ok(best, req) && negative_ok(&next, req) {
+        best.recommended_negative = next.recommended_negative;
+    }
 }
 
 /// Asks only for a negative prompt matching `positive` (used when the scan's reply had none).
@@ -1587,7 +1835,8 @@ mod tests {
         };
         let (out, placement) = run_ai_scan(&req).unwrap();
         assert_eq!(out.changes[0].suggested_alternative, "curvy");
-        assert_eq!(placement, "GPU 100%");
+        // the fake reply has no scene analysis, negative or usable card, so it was re-scanned twice
+        assert_eq!(placement, "GPU 100% • re-scanned 2× • still missing: scene analysis, negative prompt, cards");
 
         let (tx, rx) = std::sync::mpsc::channel();
         pull_tier_model(&host, AiModelTier::GemmaE2B, tx).unwrap();
@@ -1596,8 +1845,12 @@ mod tests {
 
         let log = log.lock().unwrap();
         let paths: Vec<&str> = log.iter().map(|(p, _)| p.as_str()).collect();
-        assert_eq!(paths, ["/api/tags", "/api/generate", "/api/ps", "/api/pull", "/api/copy", "/api/delete"]);
-        let copy: serde_json::Value = serde_json::from_str(&log[4].1).unwrap();
+        // 1 scan + 2 re-scans for the incomplete fake reply
+        assert_eq!(
+            paths,
+            ["/api/tags", "/api/generate", "/api/generate", "/api/generate", "/api/ps", "/api/pull", "/api/copy", "/api/delete"]
+        );
+        let copy: serde_json::Value = serde_json::from_str(&log[6].1).unwrap();
         assert_eq!(copy["destination"], AiModelTier::GemmaE2B.ollama_name());
         assert_eq!(copy["source"], AiModelTier::GemmaE2B.hf_ref());
         let generate: serde_json::Value = serde_json::from_str(&log[1].1).unwrap();
@@ -1671,6 +1924,61 @@ mod tests {
         assert_eq!(out.issues.len(), 2);
         assert_eq!(out.improved_prompt, "1girl, upper body, neon rim light");
         assert_eq!(out.changes.len(), 1);
+    }
+
+    #[test]
+    fn incomplete_scans_are_detected_and_merged() {
+        let req = AiScanRequest {
+            raw_prompt: "1girl, smile, beach".into(),
+            config: ScanConfig {
+                checkpoint: crate::profiles::CheckpointProfile::PonyV6, target_view: crate::profiles::TargetView::None, pinned_emphasis_raw: String::new(),
+                emphasis_weight: 1.25, cleanup_enabled: true, resolve_conflicts_enabled: true, clamp_weights_enabled: true,
+                camera_angle: 0, pose: 0, dynamic: false, lora_tags_raw: String::new(),
+                detail: crate::profiles::DetailLevel::Balanced,
+            },
+            mode: AiMode::Gpu, host: String::new(), model: String::new(), keep_alive: "30m".into(), think: false,
+        };
+        let card = AiChangeItem {
+            original: String::new(), action: "add".into(), reason: "light".into(),
+            suggested_alternative: "sunset".into(), framing_alternative: String::new(),
+        };
+        let complete = AiJsonOutput {
+            scene_summary: "A girl smiling on a beach at sunset.".into(),
+            scene_breakdown: SceneBreakdown {
+                subject: "1girl".into(), pose: "standing".into(), framing: "cowboy shot".into(),
+                setting: "beach".into(), lighting: "sunset".into(), mood: "happy".into(),
+            },
+            improved_prompt: "score_9, 1girl, smile, beach, sunset".into(),
+            recommended_negative: "worst quality, low quality, blurry, extra fingers, bad hands, indoors".into(),
+            changes: vec![card],
+            ..Default::default()
+        };
+        assert!(scan_problems(&complete, &req).is_empty(), "{:?}", scan_problems(&complete, &req));
+
+        let mut broken = AiJsonOutput { improved_prompt: complete.improved_prompt.clone(), ..Default::default() };
+        assert_eq!(scan_problems(&broken, &req), vec!["scene analysis", "negative prompt", "cards"]);
+        merge_scan(&mut broken, complete.clone(), &req);
+        assert!(scan_problems(&broken, &req).is_empty());
+    }
+
+    /// Danbooru translator on real phrases:
+    /// `TRANSLATE_MODEL=name cargo test live_translate -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn live_translate() {
+        let model = std::env::var("TRANSLATE_MODEL").unwrap_or_else(|_| "prompt-condenser-gemma4-12b".into());
+        for (text, ckpt) in [
+            ("a forlorn maiden sheltering beneath a parasol during a downpour, her tresses plastered to her cheeks", crate::profiles::CheckpointProfile::Illustrious),
+            ("she's doing the thing where you peek out from behind a door, all shy, wearing those socks that go above the knee", crate::profiles::CheckpointProfile::Anima),
+            ("a buxom warrior woman in a skimpy metal bikini, sweaty after battle, smirking smugly", crate::profiles::CheckpointProfile::PonyV6),
+        ] {
+            let t = std::time::Instant::now();
+            let r = danbooru_translate(&TranslateRequest {
+                host: "localhost:11434".into(), model: model.clone(), mode: AiMode::Gpu, text: text.into(), checkpoint: ckpt,
+            }).unwrap();
+            println!("\n[{:.0}s] {text}\n  TAGS   : {}\n  NATURAL: {}\n  FIXED  : {:?}\n  UNKNOWN: {:?}", t.elapsed().as_secs_f32(), r.tags, r.natural, r.fixed, r.unknown);
+            for (f, to) in &r.mapping { println!("    “{f}” → {to}"); }
+        }
     }
 
     /// Reads real images with a vision model, tagger hints included:

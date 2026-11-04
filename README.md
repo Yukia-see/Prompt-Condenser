@@ -11,6 +11,7 @@ A desktop app for **ComfyUI / Stable Diffusion prompts**. Paste a prompt, and it
 - **Extracts Danbooru tags from an image** with the WD EVA02-Large tagger, which runs locally on the CPU.
   - A **Tagger / AI** switch: AI mode has Gemma 4 12B look at the image and write a full prompt in your checkpoint's style, using the tagger's tags as hints. With it on, Deep Scan reads the image first.
 - **LoRA tags box** (under Keep & Emphasize): its tags (`<lora:…>`, trigger words, the details your LoRA needs) go into every output word for word and are never changed. They replace contradicting tags in the prompt (LoRA tag `large breasts` replaces `gigantic breasts`), in the rule-based output and in the AI's rewrite.
+- **Danbooru Words** (button next to Checkpoint Profile): describe something the model may not understand, such as unusual words, metaphors or prose, and the AI turns it into real Danbooru tags. It picks them from Danbooru's tag list, checks them against it, and shows what each phrase became ("peek out from behind a door, all shy" → `peeking, open door, shy`). For Anima, SDXL and Flux it can add a natural-language description as well.
 - **Camera angle and pose pickers** with common prompting and photography terms (Dutch angle, worm's-eye, contrapposto, dynamic pose, …).
 - **Dynamic prompts:** an optional `{a|b|c}` variation view (pose, angle, expression, lighting) for the ComfyUI Dynamic Prompts extension.
 

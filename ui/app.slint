@@ -732,6 +732,19 @@ export component AppWindow inherits Window {
     callback load_image_requested();
     callback remove_image_requested();
     callback image_mode_changed();
+    // Danbooru translator dialog
+    in-out property <bool> translate_open: false;
+    in-out property <bool> translate_busy: false;
+    in-out property <string> translate_input: "";
+    in-out property <string> translate_tags: "";
+    in-out property <string> translate_natural: "";
+    in-out property <string> translate_notes: "";
+    in-out property <string> translate_status: "";
+    in-out property <bool> translate_use_natural: true;
+    // natural language: Anima (0), SDXL (3), Flux (5) — profiles::supports_natural_language
+    property <bool> translate_nl: root.checkpoint_index == 0 || root.checkpoint_index == 3 || root.checkpoint_index == 5;
+    callback translate_requested();
+    callback translate_apply_requested(bool);   // true = replace the Before prompt
     callback undo_image_prompt_requested();
     callback download_tagger_requested();
     callback tag_threshold_changed();
@@ -759,17 +772,26 @@ export component AppWindow inherits Window {
                         spacing: 4px;
                         horizontal-stretch: 1;
                         SectionLabel { text: "CHECKPOINT PROFILE"; }
-                        ComboBox {
-                            model: [
-                                "Anima (Hybrid Tags + Natural Language)",
-                                "Pony Diffusion V6 XL",
-                                "Illustrious / NoobAI XL",
-                                "SDXL (Base / Finetunes)",
-                                "SD 1.5",
-                                "Flux (Natural Language)"
-                            ];
-                            current-index <=> root.checkpoint_index;
-                            selected => { root.analyze_requested(); }
+                        HorizontalLayout {
+                            spacing: 6px;
+                            ComboBox {
+                                horizontal-stretch: 1;
+                                model: [
+                                    "Anima (Hybrid Tags + Natural Language)",
+                                    "Pony Diffusion V6 XL",
+                                    "Illustrious / NoobAI XL",
+                                    "SDXL (Base / Finetunes)",
+                                    "SD 1.5",
+                                    "Flux (Natural Language)"
+                                ];
+                                current-index <=> root.checkpoint_index;
+                                selected => { root.analyze_requested(); }
+                            }
+                            PillButton {
+                                y: (parent.height - self.height) / 2;
+                                text: "Danbooru Words…";
+                                clicked => { root.translate_status = ""; root.translate_open = true; }
+                            }
                         }
                     }
 
@@ -1208,6 +1230,118 @@ export component AppWindow inherits Window {
                         background: zi-ta.has-hover ? M3.secondary-container : M3.surface-container-high;
                         Text { text: "+"; font-size: 14px; color: M3.on-surface; }
                         zi-ta := TouchArea { clicked => { root.zoom_in_requested(); } }
+                    }
+                }
+            }
+        }
+    }
+
+    // ==================== DANBOORU TRANSLATOR DIALOG ====================
+    if root.translate_open : Rectangle {
+        x: 0;
+        y: 0;
+        width: root.width;
+        height: root.height;
+        background: #000000b0;
+        TouchArea { }   // blocks clicks to the window behind
+        Rectangle {
+            width: min(parent.width - 32px, 760px);
+            height: min(parent.height - 32px, 640px);
+            border-radius: 16px;
+            background: M3.surface-container;
+            clip: true;
+            VerticalLayout {
+                padding: 18px;
+                spacing: 8px;
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text {
+                        text: "Danbooru Words";
+                        font-size: 18px;
+                        font-weight: 700;
+                        color: M3.on-surface;
+                        vertical-alignment: center;
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                    PillButton {
+                        text: "✕ Close";
+                        clicked => { root.translate_open = false; }
+                    }
+                }
+                Text {
+                    text: "Describe something the model may not understand (unusual words, metaphors, prose). The AI rewrites it as real Danbooru tags, picked from and checked against Danbooru's tag list.";
+                    font-size: 12px;
+                    color: M3.on-surface-variant;
+                    wrap: word-wrap;
+                }
+                TextEdit {
+                    height: 84px;
+                    font-size: 13px;
+                    wrap: word-wrap;
+                    text <=> root.translate_input;
+                }
+                HorizontalLayout {
+                    spacing: 10px;
+                    alignment: start;
+                    PillButton {
+                        primary: true;
+                        text: root.translate_busy ? "Working…" : "Find Danbooru Tags";
+                        enabled: !root.translate_busy;
+                        clicked => { root.translate_requested(); }
+                    }
+                    Text {
+                        text: root.translate_status;
+                        font-size: 12px;
+                        color: M3.on-surface-variant;
+                        vertical-alignment: center;
+                        wrap: word-wrap;
+                    }
+                }
+                SectionLabel { text: "DANBOORU TAGS (EDITABLE)"; color: M3.primary; }
+                TextEdit {
+                    vertical-stretch: 1;
+                    min-height: 60px;
+                    font-size: 13px;
+                    wrap: word-wrap;
+                    text <=> root.translate_tags;
+                }
+                SectionLabel { text: "WHAT CHANGED"; }
+                TextEdit {
+                    vertical-stretch: 1;
+                    min-height: 60px;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                    read-only: true;
+                    text: root.translate_notes;
+                }
+                if root.translate_nl : CheckBox {
+                    text: "Also add the natural-language scene description";
+                    checked <=> root.translate_use_natural;
+                }
+                if root.translate_nl && root.translate_use_natural : TextEdit {
+                    height: 64px;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                    text <=> root.translate_natural;
+                }
+                if !root.translate_nl : Text {
+                    text: "A natural-language description is available for Anima, SDXL and Flux.";
+                    font-size: 11px;
+                    color: M3.on-surface-variant;
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    alignment: end;
+                    PillButton {
+                        text: "Replace Before";
+                        enabled: root.translate_tags != "" && !root.translate_busy;
+                        clicked => { root.translate_apply_requested(true); }
+                    }
+                    PillButton {
+                        primary: true;
+                        text: "Add to Before";
+                        enabled: root.translate_tags != "" && !root.translate_busy;
+                        clicked => { root.translate_apply_requested(false); }
                     }
                 }
             }
