@@ -628,7 +628,7 @@ fn with_state(f: impl FnOnce(&State)) {
     });
 }
 
-/// Window layout and connection settings remembered between sessions.
+/// Window layout, connection settings and the prompts, remembered between sessions.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 struct Settings {
@@ -642,6 +642,9 @@ struct Settings {
     detail_index: i32,
     /// Image reading: false = Danbooru tagger, true = AI.
     image_use_ai: bool,
+    /// The Before prompt and the Keep & Emphasize list from the last session.
+    raw_prompt: String,
+    pinned_emphasis: String,
 }
 
 impl Default for Settings {
@@ -653,6 +656,8 @@ impl Default for Settings {
             ui_zoom: 0.75,
             detail_index: 1,
             image_use_ai: false,
+            raw_prompt: String::new(),
+            pinned_emphasis: String::new(),
             ollama_host: "localhost:11434".into(),
         }
     }
@@ -676,6 +681,8 @@ fn load_settings(ui: &AppWindow) {
     ui.set_ui_zoom(st.ui_zoom.clamp(ZOOM_MIN, ZOOM_MAX));
     ui.set_detail_index(st.detail_index.clamp(0, 2));
     ui.set_image_use_ai(st.image_use_ai);
+    ui.set_raw_prompt(st.raw_prompt.into());
+    ui.set_pinned_emphasis(st.pinned_emphasis.into());
     if !st.ollama_host.trim().is_empty() {
         ui.set_ollama_host(st.ollama_host.into());
     }
@@ -689,6 +696,8 @@ fn save_settings(ui: &AppWindow) {
         ui_zoom: ui.get_ui_zoom(),
         detail_index: ui.get_detail_index(),
         image_use_ai: ui.get_image_use_ai(),
+        raw_prompt: ui.get_raw_prompt().to_string(),
+        pinned_emphasis: ui.get_pinned_emphasis().to_string(),
         ollama_host: ui.get_ollama_host().to_string(),
     };
     if let Some(path) = settings_path() {
