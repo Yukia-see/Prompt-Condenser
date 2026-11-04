@@ -308,45 +308,140 @@ impl AiMode {
     }
 }
 
-/// The two pre-packaged uncensored models, registered in Ollama under short names.
+/// The AI models the app offers: all Gemma 4, uncensored, registered in Ollama
+/// under short names. (Qwen2.5 / Qwen3 / Qwen3.5 were tried and lost to Gemma.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AiModelTier {
-    Low,
-    High,
-    Best,
-    Max,
+    /// Gemma 4 E2B (~2B active), for low-VRAM machines.
+    GemmaE2B,
+    /// Gemma 4 E4B (~4B active).
+    GemmaE4B,
+    /// Gemma 4 12B Q4: the recommended default.
+    Gemma12,
+    /// Gemma 4 12B Q6_K: slightly more faithful, slower, ~10.7 GB.
+    Gemma12Q6,
 }
 
 impl AiModelTier {
-    pub const ALL: [AiModelTier; 4] = [Self::Low, Self::High, Self::Best, Self::Max];
+    /// Dropdown order, lightest to best: the app selects the last installed one by default.
+    pub const ALL: [AiModelTier; 4] = [Self::GemmaE2B, Self::GemmaE4B, Self::Gemma12, Self::Gemma12Q6];
 
     pub fn label(&self) -> &'static str {
         match self {
-            Self::Low => "Low — Fast 1.5B Uncensored",
-            Self::High => "High — 3B Uncensored",
-            Self::Best => "Best — 7B Uncensored (recommended, ~4.7 GB)",
-            Self::Max => "Max — 14B Uncensored (~9 GB)",
+            Self::GemmaE2B => "Light — Gemma 4 E2B (~4 GB VRAM)",
+            Self::GemmaE4B => "Balanced — Gemma 4 E4B (~6 GB VRAM)",
+            Self::Gemma12 => "Maximum Fast — Gemma 4 12B Q4 (~9 GB VRAM)",
+            Self::Gemma12Q6 => "Maximum Detailed — Gemma 4 12B Q6 (~11 GB VRAM)",
         }
     }
 
     /// Name the model has inside Ollama (set by `install.sh` or the in-app download).
     pub fn ollama_name(&self) -> &'static str {
         match self {
-            Self::Low => "prompt-condenser-low",
-            Self::High => "prompt-condenser-high",
-            Self::Best => "prompt-condenser-best",
-            Self::Max => "prompt-condenser-max",
+            Self::GemmaE2B => "prompt-condenser-gemma4-e2b",
+            Self::GemmaE4B => "prompt-condenser-gemma4-e4b",
+            Self::Gemma12 => "prompt-condenser-gemma4-12b",
+            Self::Gemma12Q6 => "prompt-condenser-gemma4-12b-q6",
         }
     }
 
-    /// Where Ollama downloads it from (same GGUF files the installer bundles).
+    /// How long Ollama keeps the model loaded after a scan. The biggest tier is freed
+    /// quickly: on shared-memory GPUs (like the BC-250) it would otherwise starve system RAM.
+    pub fn keep_alive(&self) -> &'static str {
+        match self {
+            Self::Gemma12Q6 => "2m",
+            _ => "30m",
+        }
+    }
+
+    /// Where Ollama downloads it from. The E2B/E4B builds are text-only (no 1 GB image
+    /// projector), which keeps their memory use down.
     pub fn hf_ref(&self) -> &'static str {
         match self {
-            Self::Low => "hf.co/mradermacher/Qwen2.5-1.5B-Instruct-abliterated-GGUF:Q4_K_M",
-            Self::High => "hf.co/mradermacher/Qwen2.5-3B-Instruct-abliterated-GGUF:Q4_K_M",
-            Self::Best => "hf.co/mradermacher/Qwen2.5-7B-Instruct-abliterated-GGUF:Q4_K_M",
-            Self::Max => "hf.co/mradermacher/Qwen2.5-14B-Instruct-abliterated-GGUF:Q4_K_M",
+            Self::GemmaE2B => "hf.co/TrevorJS/gemma-4-E2B-it-uncensored-GGUF:Q4_K_M",
+            Self::GemmaE4B => "hf.co/TrevorJS/gemma-4-E4B-it-uncensored-GGUF:Q4_K_M",
+            Self::Gemma12 => "hf.co/culturerevolt/gemma-4-12b-heretic-abliterated-GGUF:Q4_K_M",
+            Self::Gemma12Q6 => "hf.co/culturerevolt/gemma-4-12b-heretic-abliterated-GGUF:Q6_K",
         }
     }
 }
 
+/// Camera angles (prompting + photography). (dropdown label, tags). Index 0 = none.
+/// A tags value starting with '{' is a Dynamic Prompts variation group.
+pub const CAMERA_ANGLES: &[(&str, &str)] = &[
+    ("None (keep the prompt's angle)", ""),
+    ("Eye level / straight-on", "straight-on, eye level"),
+    ("High angle (looking down)", "from above, high angle"),
+    ("Low angle (looking up)", "from below, low angle"),
+    ("Bird's-eye view (overhead)", "from above, bird's-eye view, overhead shot"),
+    ("Worm's-eye view (ground up)", "from below, worm's-eye view, extreme low angle"),
+    ("Dutch angle (tilted frame)", "dutch angle, tilted frame"),
+    ("Three-quarter view", "three-quarter view"),
+    ("Profile / side on", "from side, profile"),
+    ("Over the shoulder", "over the shoulder, from behind, looking back"),
+    ("POV / first person", "pov, first-person view"),
+    ("Selfie", "selfie, from above, holding phone"),
+    ("Wide-angle / fisheye", "wide-angle lens, fisheye"),
+    ("Telephoto (compressed, blurred background)", "telephoto lens, depth of field, blurry background"),
+    ("Foreshortening (dynamic perspective)", "foreshortening, dynamic angle, perspective"),
+    ("Cinematic angle", "cinematic angle, dynamic angle"),
+    ("Upside down", "upside-down"),
+    ("Random angle (dynamic prompt)", "{from above|from below|dutch angle|three-quarter view|from side|straight-on}"),
+];
+
+/// Body positions and poses (prompting + photography). (dropdown label, tags). Index 0 = none.
+pub const POSES: &[(&str, &str)] = &[
+    ("None (keep the prompt's pose)", ""),
+    ("Standing", "standing"),
+    ("Contrapposto / S-curve", "standing, contrapposto, hand on hip"),
+    ("Hands on hips (power pose)", "standing, hands on hips"),
+    ("Arms crossed", "standing, crossed arms"),
+    ("Arms up / stretching", "arms up, stretching"),
+    ("Leaning against a wall", "leaning against wall, leaning back"),
+    ("Hand on face / thinking", "hand on own chin, thinking"),
+    ("Peace sign", "peace sign, v"),
+    ("Waving", "waving"),
+    ("Walking", "walking"),
+    ("Running", "running, motion blur"),
+    ("Jumping / midair", "jumping, midair"),
+    ("Dancing", "dancing"),
+    ("Dynamic / action pose", "dynamic pose, action pose"),
+    ("Fighting stance", "fighting stance"),
+    ("Looking back over shoulder", "looking back, looking over shoulder"),
+    ("Sitting", "sitting"),
+    ("Sitting cross-legged", "sitting, crossed legs, indian style"),
+    ("Sitting on a chair", "sitting on chair"),
+    ("Hugging knees", "sitting, knees to chest, hugging own legs"),
+    ("Seiza (kneeling on heels)", "seiza"),
+    ("Wariza (W-sitting)", "wariza"),
+    ("Kneeling", "kneeling"),
+    ("Squatting", "squatting"),
+    ("Lying on back", "lying, on back"),
+    ("Lying on stomach", "lying, on stomach"),
+    ("Lying on side", "lying, on side"),
+    ("Reclining", "reclining"),
+    ("All fours", "all fours"),
+    ("Bent over", "bent over"),
+    ("Arched back", "arched back"),
+    ("Floating", "floating"),
+    ("Sleeping", "sleeping, closed eyes"),
+    ("Candid (natural, unposed)", "candid, natural pose"),
+    ("Random pose (dynamic prompt)", "{standing|sitting|leaning against wall|dynamic pose|looking back|arms up}"),
+];
+
+/// Every tag that belongs to a list above (lowercase), used to spot existing angle /
+/// pose tags in a prompt that a dropdown choice should replace.
+pub fn group_tags(list: &[(&str, &str)]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for (_, tags) in list {
+        if tags.starts_with('{') {
+            continue;
+        }
+        for t in tags.split(',').map(|t| t.trim().to_lowercase()).filter(|t| !t.is_empty()) {
+            if !out.contains(&t) {
+                out.push(t);
+            }
+        }
+    }
+    out
+}

@@ -12,6 +12,10 @@ pub enum ChangeAction {
     WeightClamped,
     KeptEmphasized,
     AiRewrite,
+    /// Tags set by the camera angle dropdown.
+    AngleChoice,
+    /// Tags set by the pose dropdown.
+    PoseChoice,
 }
 
 impl ChangeAction {
@@ -24,6 +28,8 @@ impl ChangeAction {
             Self::WeightClamped => "WEIGHT CLAMPED",
             Self::KeptEmphasized => "KEPT & EMPHASIZED",
             Self::AiRewrite => "AI SUGGESTION",
+            Self::AngleChoice => "CAMERA ANGLE",
+            Self::PoseChoice => "POSE",
         }
     }
 }
@@ -51,6 +57,12 @@ pub struct ScanConfig {
     pub cleanup_enabled: bool,
     pub resolve_conflicts_enabled: bool,
     pub clamp_weights_enabled: bool,
+    /// Index into `profiles::CAMERA_ANGLES` (0 = none).
+    pub camera_angle: usize,
+    /// Index into `profiles::POSES` (0 = none).
+    pub pose: usize,
+    /// Dynamic Prompts {a|b|c} variations wanted.
+    pub dynamic: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -610,6 +622,47 @@ pub fn analyze_with_rules(tokens: &[PromptToken], config: &ScanConfig) -> RuleAn
         processed_tokens.push(tok);
     }
 
+    // Camera angle / pose dropdowns: the user's explicit choice replaces the prompt's
+    // own angle / pose tags (shown as a card so it can be undone).
+    for (list, idx, action, what) in [
+        (crate::profiles::CAMERA_ANGLES, config.camera_angle, ChangeAction::AngleChoice, "camera angle"),
+        (crate::profiles::POSES, config.pose, ChangeAction::PoseChoice, "pose"),
+    ] {
+        let Some((label, tags)) = list.get(idx).filter(|_| idx > 0) else { continue };
+        let group = crate::profiles::group_tags(list);
+        let chosen: Vec<PromptToken> = crate::parser::parse_prompt(tags);
+        let is_chosen = |n: &str| chosen.iter().any(|c| c.normalized == n);
+        let replaced: Vec<String> = processed_tokens
+            .iter()
+            .filter(|t| group.contains(&t.normalized) && !is_chosen(&t.normalized))
+            .map(|t| t.text.clone())
+            .collect();
+        processed_tokens.retain(|t| !(group.contains(&t.normalized) && !is_chosen(&t.normalized)));
+        for mut t in chosen {
+            if processed_tokens.iter().any(|e| e.normalized == t.normalized) {
+                continue;
+            }
+            t.added = true;
+            t.original_index = 940;
+            t.category = TokenCategory::FramingPose;
+            processed_tokens.push(t);
+        }
+        changes.push(PromptChange {
+            id: next_change_id,
+            original: replaced.join(", "),
+            action,
+            reason: if replaced.is_empty() {
+                format!("Your {what} choice: {label}.")
+            } else {
+                format!("Your {what} choice: {label}. It replaces the prompt's own {what} tags.")
+            },
+            suggested_alternative: tags.to_string(),
+            framing_alternative: String::new(),
+            mode: 0,
+        });
+        next_change_id += 1;
+    }
+
     RuleAnalysisResult {
         processed_tokens,
         changes,
@@ -632,6 +685,12 @@ mod tests {
             cleanup_enabled: true,
             resolve_conflicts_enabled: true,
             clamp_weights_enabled: true,
+
+            camera_angle: 0,
+
+            pose: 0,
+
+            dynamic: false,
         }
     }
 
@@ -872,4 +931,24 @@ mod tests {
         assert_eq!(marked_tags(&md, Highlight::Substituted), vec!["(curvy:1.15)"]);
         assert_eq!(marked_tags(&md, Highlight::Added), vec!["moonlight"]);
     }
+
+    #[test]
+    fn angle_and_pose_dropdowns_replace_prompt_tags() {
+        let mut config = cfg(TargetView::None);
+        config.camera_angle = crate::profiles::CAMERA_ANGLES.iter().position(|(l, _)| l.starts_with("Dutch")).unwrap();
+        config.pose = crate::profiles::POSES.iter().position(|(l, _)| *l == "Sitting").unwrap();
+        let (res, out) = run("1girl, solo, from above, standing, smile", &config);
+        assert!(out.contains("dutch angle") && out.contains("sitting"), "{out}");
+        assert!(!out.contains("from above") && !out.contains("standing"), "{out}");
+        assert!(res.changes.iter().any(|c| c.action == ChangeAction::AngleChoice && c.original == "from above"));
+        assert!(res.changes.iter().any(|c| c.action == ChangeAction::PoseChoice && c.original == "standing"));
+    }
+
+    #[test]
+    fn dynamic_syntax_survives_parsing() {
+        let toks = parse_prompt("1girl, {red hair, ponytail|blue hair}, smile");
+        assert_eq!(toks.len(), 3);
+        assert_eq!(toks[1].text, "{red hair, ponytail|blue hair}");
+    }
 }
+

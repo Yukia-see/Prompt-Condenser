@@ -369,7 +369,8 @@ pub fn tidy_ai_prompt(text: &str, checkpoint: CheckpointProfile) -> String {
     let mut queue = parse_prompt(&balanced);
     queue.reverse();
     while let Some(t) = queue.pop() {
-        if t.text.contains(',') && t.category != TokenCategory::LoraOrSpecial {
+        // never split {a, b|c} variation groups
+        if t.text.contains(',') && t.category != TokenCategory::LoraOrSpecial && !t.text.starts_with('{') {
             let mut inner = parse_prompt(&balance_brackets(&t.text));
             inner.reverse();
             queue.extend(inner);

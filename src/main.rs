@@ -1,6 +1,7 @@
 mod ai_engine;
 mod analyzer;
 mod condenser;
+mod dynamic;
 mod parser;
 mod profiles;
 mod scene;
@@ -18,7 +19,7 @@ use std::sync::mpsc;
 slint::include_modules!();
 
 /// What an AI scan was run against; its cards are dropped once any of these change.
-type AiKey = (String, i32, i32); // (prompt, checkpoint index, view index)
+type AiKey = (String, i32, i32, i32, i32); // (prompt, checkpoint, view, camera angle, pose)
 
 /// UI-thread-only state behind the Slint properties.
 #[derive(Default)]
@@ -56,6 +57,8 @@ struct SceneResult {
     issues: String,
     improved_prompt: String,
     recommended_negative: String,
+    /// improved_prompt with {a|b|c} variation groups (when dynamic prompts were on).
+    dynamic_prompt: String,
 }
 
 impl SceneResult {
@@ -87,6 +90,7 @@ impl SceneResult {
             issues,
             improved_prompt: condenser::tidy_ai_prompt(&out.improved_prompt, checkpoint),
             recommended_negative: condenser::tidy_ai_prompt(&out.recommended_negative, checkpoint),
+            dynamic_prompt: condenser::tidy_ai_prompt(&out.dynamic_prompt, checkpoint),
         };
         (!result.summary.is_empty() || !result.improved_prompt.is_empty()).then_some(result)
     }
@@ -121,6 +125,9 @@ fn scan_config(ui: &AppWindow) -> ScanConfig {
         cleanup_enabled: ui.get_cleanup_enabled(),
         resolve_conflicts_enabled: ui.get_resolve_conflicts_enabled(),
         clamp_weights_enabled: ui.get_clamp_weights_enabled(),
+        camera_angle: ui.get_angle_index().max(0) as usize,
+        pose: ui.get_pose_index().max(0) as usize,
+        dynamic: ui.get_dynamic_enabled(),
     }
 }
 
@@ -129,6 +136,8 @@ fn ai_key(ui: &AppWindow) -> AiKey {
         ui.get_raw_prompt().to_string(),
         ui.get_checkpoint_index(),
         ui.get_target_view_index(),
+        ui.get_angle_index(),
+        ui.get_pose_index(),
     )
 }
 
@@ -170,7 +179,7 @@ fn render(ui: &AppWindow, state: &State) {
     // Scene analysis card + optional AI Improved view
     let improved = st.ai_scene.as_ref().map(|sc| sc.improved_prompt.clone()).filter(|p| !p.is_empty());
     ui.set_ai_improved_available(improved.is_some());
-    if improved.is_none() {
+    if (improved.is_none() && ui.get_after_view() == 1) || (!config.dynamic && ui.get_after_view() == 2) {
         ui.set_after_view(0);
     }
     match &st.ai_scene {
@@ -186,7 +195,30 @@ fn render(ui: &AppWindow, state: &State) {
         }
     }
 
-    let (text, markdown, after_tokens, after_chunks) = match improved.filter(|_| ui.get_after_view() == 1) {
+    // Dynamic view: the AI's variation version if the last scan made one, else rule-based variations
+    let dynamic_text = (ui.get_after_view() == 2).then(|| {
+        let from_ai = st.ai_scene.as_ref().map(|sc| sc.dynamic_prompt.clone()).filter(|p| !p.trim().is_empty());
+        match from_ai {
+            Some(p) => {
+                let groups = p.matches('{').count();
+                (p, format!("AI variations: {groups} group(s). Needs the Dynamic Prompts extension / node in ComfyUI."))
+            }
+            None => {
+                let (p, kinds) = dynamic::make_dynamic(&out.final_prompt);
+                let note = if kinds.is_empty() {
+                    "Nothing to vary yet: add a pose, angle, expression or lighting tag (or run a Deep AI Scan).".to_string()
+                } else {
+                    format!("Varies: {}. Needs the Dynamic Prompts extension / node in ComfyUI.", kinds.join(", "))
+                };
+                (p, note)
+            }
+        }
+    });
+    ui.set_dynamic_note(dynamic_text.as_ref().map(|(_, n)| n.clone()).unwrap_or_default().into());
+    let (text, markdown, after_tokens, after_chunks) = if let Some((dyn_text, _)) = dynamic_text {
+        let (t, c) = parser::estimate_clip_tokens(&dyn_text);
+        (dyn_text, String::new(), t, c)
+    } else { match improved.filter(|_| ui.get_after_view() == 1) {
         Some(ai_text) => {
             let dropped = condenser::dropped_tags(&raw, &ai_text, config.checkpoint);
             ui.set_ai_dropped(dropped.join(", ").into());
@@ -195,7 +227,7 @@ fn render(ui: &AppWindow, state: &State) {
             (ai_text, md, t, c)
         }
         None => (out.final_prompt.clone(), out.highlighted_markdown.clone(), out.after_tokens, out.after_chunks),
-    };
+    } };
     if ui.get_after_view() != 1 {
         ui.set_ai_dropped("".into());
     }
@@ -297,7 +329,7 @@ fn to_card(ch: &PromptChange) -> ChangeCardItem {
     let badge_kind = match ch.action {
         ChangeAction::FramingSafeSwap | ChangeAction::PositioningConflict => 0,
         ChangeAction::AiRewrite => 3,
-        ChangeAction::KeptEmphasized => 1,
+        ChangeAction::KeptEmphasized | ChangeAction::AngleChoice | ChangeAction::PoseChoice => 1,
         ChangeAction::RemovedBloat | ChangeAction::MergedDuplicate | ChangeAction::WeightClamped => 2,
     };
     ChangeCardItem {
@@ -586,6 +618,12 @@ fn main() -> Result<(), slint::PlatformError> {
     let ui = AppWindow::new()?;
     load_settings(&ui);
     ui.set_tagger_installed(tagger::is_installed());
+    ui.set_angle_labels(ModelRc::new(VecModel::from(
+        profiles::CAMERA_ANGLES.iter().map(|(l, _)| SharedString::from(*l)).collect::<Vec<_>>(),
+    )));
+    ui.set_pose_labels(ModelRc::new(VecModel::from(
+        profiles::POSES.iter().map(|(l, _)| SharedString::from(*l)).collect::<Vec<_>>(),
+    )));
     let state: State = Rc::new(RefCell::new(AppState::default()));
 
     ui.set_change_cards(ModelRc::from(state.borrow().cards_model.clone()));
@@ -867,6 +905,8 @@ fn main() -> Result<(), slint::PlatformError> {
                 mode: AiMode::from_index(ui.get_ai_mode_index()),
                 host: ui.get_ollama_host().to_string(),
                 model: choice.name.clone(),
+                keep_alive: choice.tier.map(|t| t.keep_alive()).unwrap_or("30m").to_string(),
+                think: false,
             };
 
             ui.set_ai_busy(true);

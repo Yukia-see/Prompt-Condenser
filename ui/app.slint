@@ -122,6 +122,40 @@ component Splitter inherits Rectangle {
     }
 }
 
+// Fixed-size box whose content scrolls up/down with the mouse wheel when it's taller
+// than the box. Shift + wheel and sideways swipes are passed on (rejected), so the
+// strip around it still scrolls sideways. (A nested ScrollView grabbed those too.)
+component ScrollBox inherits Rectangle {
+    in-out property <length> offset: 0px;
+    property <length> max-offset: max(0px, content.preferred-height - root.height);
+    clip: true;
+    TouchArea {
+        scroll-event(e) => {
+            if (e.modifiers.shift || e.delta-y == 0 || root.max-offset <= 0) {
+                return EventResult.reject;
+            }
+            root.offset = max(0px, min(root.max-offset, root.offset - e.delta-y));
+            return EventResult.accept;
+        }
+    }
+    content := VerticalLayout {
+        y: -min(root.offset, root.max-offset);
+        width: root.width;
+        height: max(root.height, self.preferred-height);
+        alignment: start;
+        @children
+    }
+    // position indicator when there's more to see
+    if root.max-offset > 0 : Rectangle {
+        x: root.width - 6px;
+        width: 3px;
+        height: max(24px, root.height * root.height / max(1px, content.preferred-height));
+        y: (root.height - self.height) * min(root.offset, root.max-offset) / root.max-offset;
+        border-radius: 1.5px;
+        background: M3.outline;
+    }
+}
+
 component SceneCard inherits Rectangle {
     in property <string> summary;
     in property <string> details;
@@ -132,26 +166,29 @@ component SceneCard inherits Rectangle {
     border-radius: 12px;
     border-width: 1px;
     border-color: M3.primary;
-    VerticalLayout {
-        padding: 12px;
-        spacing: 6px;
-        alignment: start;
-        HorizontalLayout {
-            Chip { text: "AI SCENE ANALYSIS"; fg: M3.on-primary; bg: M3.primary; }
-            Rectangle { horizontal-stretch: 1; }
-        }
-        Text { text: root.summary; font-size: 13px; font-weight: 600; color: M3.on-surface; wrap: word-wrap; }
-        if root.details != "" : Text { text: root.details; font-size: 11px; color: M3.on-surface-variant; wrap: word-wrap; }
-        if root.issues != "" : Text {
-            text: "What's holding it back:\n" + root.issues;
-            font-size: 11px;
-            color: M3.tertiary;
-            wrap: word-wrap;
-        }
-        if root.show-ai-button : Button {
-            text: "See the AI Improved prompt";
-            primary: true;
-            clicked => { root.show-ai(); }
+    clip: true;
+    ScrollBox {
+        VerticalLayout {
+            padding: 12px;
+            spacing: 6px;
+            alignment: start;
+            HorizontalLayout {
+                Chip { text: "AI SCENE ANALYSIS"; fg: M3.on-primary; bg: M3.primary; }
+                Rectangle { horizontal-stretch: 1; }
+            }
+            Text { text: root.summary; font-size: 13px; font-weight: 600; color: M3.on-surface; wrap: word-wrap; }
+            if root.details != "" : Text { text: root.details; font-size: 11px; color: M3.on-surface-variant; wrap: word-wrap; }
+            if root.issues != "" : Text {
+                text: "What's holding it back:\n" + root.issues;
+                font-size: 11px;
+                color: M3.tertiary;
+                wrap: word-wrap;
+            }
+            if root.show-ai-button : Button {
+                text: "See the AI Improved prompt";
+                primary: true;
+                clicked => { root.show-ai(); }
+            }
         }
     }
 }
@@ -163,69 +200,76 @@ component ChangeCard inherits Rectangle {
     border-radius: 12px;
     border-width: 1px;
     border-color: card.badge_kind == 3 ? M3.primary : card.badge_kind == 0 ? M3.warning : (card.badge_kind == 1 ? M3.success : M3.info);
+    clip: true;
 
-    VerticalLayout {
-        padding: 12px;
-        spacing: 6px;
-        alignment: start;
-
-        HorizontalLayout {
-            spacing: 8px;
-            Chip {
-                text: card.badge;
-                fg: card.badge_kind == 3 ? M3.on-primary : card.badge_kind == 0 ? M3.warning : (card.badge_kind == 1 ? M3.success : M3.info);
-                bg: card.badge_kind == 3 ? M3.primary : card.badge_kind == 0 ? M3.warning-container : (card.badge_kind == 1 ? M3.success-container : M3.info-container);
-            }
-            Text {
-                text: card.original == "" ? "New detail" : "Original: \"" + card.original + "\"";
-                font-size: 12px;
-                font-weight: 700;
-                color: M3.tertiary;
-                overflow: elide;
-                horizontal-stretch: 1;
-            }
-        }
-
-        if card.suggested_alternative != "" : Text {
-            text: "Suggested: " + card.suggested_alternative;
-            font-size: 12px;
-            font-weight: 600;
-            color: M3.success;
-            wrap: word-wrap;
-        }
-
-        if card.has_framing_alt : Text {
-            text: "Or change framing to: " + card.framing_alternative;
-            font-size: 11px;
-            color: M3.info;
-            wrap: word-wrap;
-        }
-
-        HorizontalLayout {
+    ScrollBox {
+        VerticalLayout {
+            padding: 12px;
             spacing: 6px;
             alignment: start;
-            Button {
-                text: card.mode == 0 ? "✓ Applied" : (card.original == "" ? "Add It" : (card.suggested_alternative == "" ? "Remove Tag" : "Use Suggestion"));
-                primary: card.mode == 0;
-                clicked => { root.mode-changed(card.id, 0); }
-            }
-            if card.has_framing_alt : Button {
-                text: card.mode == 1 ? "✓ Framing Swapped" : "Keep & Swap Framing";
-                primary: card.mode == 1;
-                clicked => { root.mode-changed(card.id, 1); }
-            }
-            Button {
-                text: card.original == "" ? (card.mode == 2 ? "✓ Skipped" : "Skip") : (card.mode == 2 ? "✓ Kept Original" : "Keep Original");
-                primary: card.mode == 2;
-                clicked => { root.mode-changed(card.id, 2); }
-            }
-        }
 
-        Text {
-            text: card.reason;
-            font-size: 11px;
-            color: M3.on-surface-variant;
-            wrap: word-wrap;
+            HorizontalLayout {
+                spacing: 8px;
+                Chip {
+                    text: card.badge;
+                    fg: card.badge_kind == 3 ? M3.on-primary : card.badge_kind == 0 ? M3.warning : (card.badge_kind == 1 ? M3.success : M3.info);
+                    bg: card.badge_kind == 3 ? M3.primary : card.badge_kind == 0 ? M3.warning-container : (card.badge_kind == 1 ? M3.success-container : M3.info-container);
+                }
+                Text {
+                    text: card.original == "" ? "New detail" : "Original: \"" + card.original + "\"";
+                    font-size: 12px;
+                    font-weight: 700;
+                    color: M3.tertiary;
+                    overflow: elide;
+                    horizontal-stretch: 1;
+                }
+            }
+
+            if card.suggested_alternative != "" : Text {
+                text: "Suggested: " + card.suggested_alternative;
+                font-size: 12px;
+                font-weight: 600;
+                color: M3.success;
+                wrap: word-wrap;
+            }
+
+            if card.has_framing_alt : Text {
+                text: "Or change framing to: " + card.framing_alternative;
+                font-size: 11px;
+                color: M3.info;
+                wrap: word-wrap;
+            }
+
+            // compact buttons; a third option goes on its own row instead of overflowing
+            HorizontalLayout {
+                spacing: 6px;
+                alignment: start;
+                PillButton {
+                    text: card.mode == 0 ? "✓ Applied" : (card.original == "" ? "Add It" : (card.suggested_alternative == "" ? "Remove Tag" : "Use Suggestion"));
+                    primary: card.mode == 0;
+                    clicked => { root.mode-changed(card.id, 0); }
+                }
+                PillButton {
+                    text: card.original == "" ? (card.mode == 2 ? "✓ Skipped" : "Skip") : (card.mode == 2 ? "✓ Kept Original" : "Keep Original");
+                    primary: card.mode == 2;
+                    clicked => { root.mode-changed(card.id, 2); }
+                }
+            }
+            if card.has_framing_alt : HorizontalLayout {
+                alignment: start;
+                PillButton {
+                    text: card.mode == 1 ? "✓ Framing Swapped" : "Keep & Swap Framing";
+                    primary: card.mode == 1;
+                    clicked => { root.mode-changed(card.id, 1); }
+                }
+            }
+
+            Text {
+                text: card.reason;
+                font-size: 11px;
+                color: M3.on-surface-variant;
+                wrap: word-wrap;
+            }
         }
     }
 }
@@ -239,21 +283,24 @@ component LiveSceneCard inherits Rectangle {
     border-radius: 12px;
     border-width: 1px;
     border-color: M3.info;
-    VerticalLayout {
-        padding: 12px;
-        spacing: 6px;
-        alignment: start;
-        HorizontalLayout {
-            Chip { text: "THE SCENE (LIVE)"; fg: M3.info; bg: M3.info-container; }
-            Rectangle { horizontal-stretch: 1; }
-        }
-        Text { text: root.headline; font-size: 13px; font-weight: 600; color: M3.on-surface; wrap: word-wrap; }
-        if root.details != "" : Text { text: root.details; font-size: 11px; color: M3.on-surface-variant; wrap: word-wrap; }
-        if root.missing != "" : Text {
-            text: "Not specified: " + root.missing;
-            font-size: 11px;
-            color: M3.warning;
-            wrap: word-wrap;
+    clip: true;
+    ScrollBox {
+        VerticalLayout {
+            padding: 12px;
+            spacing: 6px;
+            alignment: start;
+            HorizontalLayout {
+                Chip { text: "THE SCENE (LIVE)"; fg: M3.info; bg: M3.info-container; }
+                Rectangle { horizontal-stretch: 1; }
+            }
+            Text { text: root.headline; font-size: 13px; font-weight: 600; color: M3.on-surface; wrap: word-wrap; }
+            if root.details != "" : Text { text: root.details; font-size: 11px; color: M3.on-surface-variant; wrap: word-wrap; }
+            if root.missing != "" : Text {
+                text: "Not specified: " + root.missing;
+                font-size: 11px;
+                color: M3.warning;
+                wrap: word-wrap;
+            }
         }
     }
 }
@@ -287,7 +334,7 @@ component CardsPanel inherits M3Card {
             }
             Rectangle { horizontal-stretch: 1; }
             if root.cards.length > 1 : Text {
-                text: "wheel: up/down · Shift + wheel: sideways →";
+                text: "wheel over a card: scroll it · Shift + wheel: sideways →";
                 font-size: 11px;
                 color: M3.on-surface-variant;
                 vertical-alignment: center;
@@ -307,39 +354,32 @@ component CardsPanel inherits M3Card {
         // One scroll area for the whole strip, both directions: wheel scrolls tall cards
         // up/down, Shift + wheel scrolls sideways. (Per-card scroll areas used to grab
         // the wheel and block sideways scrolling.)
+        // Sideways strip of same-height cards; each card scrolls up/down on its own
+        // (ScrollBox), Shift + wheel scrolls the strip sideways.
         if root.live-headline != "" || root.cards.length > 0 : row := ScrollView {
             vertical-stretch: 1;
             HorizontalLayout {
-                min-height: row.visible-height;
+                height: row.visible-height;
                 spacing: 8px;
                 alignment: start;
-                if root.live-headline != "" : VerticalLayout {
+                if root.live-headline != "" : LiveSceneCard {
                     width: 380px;
-                    alignment: start;
-                    LiveSceneCard {
-                        headline: root.live-headline;
-                        details: root.live-details;
-                        missing: root.live-missing;
-                    }
+                    headline: root.live-headline;
+                    details: root.live-details;
+                    missing: root.live-missing;
                 }
-                if root.scene-summary != "" : VerticalLayout {
+                if root.scene-summary != "" : SceneCard {
                     width: 380px;
-                    alignment: start;
-                    SceneCard {
-                        summary: root.scene-summary;
-                        details: root.scene-details;
-                        issues: root.scene-issues;
-                        show-ai-button: root.show-ai-button;
-                        show-ai => { root.show-ai(); }
-                    }
+                    summary: root.scene-summary;
+                    details: root.scene-details;
+                    issues: root.scene-issues;
+                    show-ai-button: root.show-ai-button;
+                    show-ai => { root.show-ai(); }
                 }
-                for card in root.cards : VerticalLayout {
-                    width: 320px;
-                    alignment: start;
-                    ChangeCard {
-                        card: card;
-                        mode-changed(id, mode) => { root.mode-changed(id, mode); }
-                    }
+                for card in root.cards : ChangeCard {
+                    width: 300px;
+                    card: card;
+                    mode-changed(id, mode) => { root.mode-changed(id, mode); }
                 }
             }
         }
@@ -355,6 +395,8 @@ component PromptColumn inherits HorizontalLayout {
     in property <string> condensed-plain;
     in property <int> after-view;
     in property <bool> ai-improved-available;
+    in property <bool> dynamic-enabled;
+    in property <string> dynamic-note;
     in property <string> ai-dropped;
     in property <string> substituted-list;
     in property <string> added-list;
@@ -418,23 +460,28 @@ component PromptColumn inherits HorizontalLayout {
                 HorizontalLayout {
                     spacing: 10px;
                     Text {
-                        text: root.after-view == 1 ? "AFTER — AI IMPROVED" : "AFTER — CONDENSED & CONFLICT-FREE";
+                        text: root.after-view == 2 ? "AFTER — DYNAMIC PROMPT" : (root.after-view == 1 ? "AFTER — AI IMPROVED" : "AFTER — CONDENSED & CONFLICT-FREE");
                         font-size: 12px;
                         font-weight: 700;
                         color: M3.success;
                         vertical-alignment: center;
                     }
-                    if root.ai-improved-available : HorizontalLayout {
+                    if root.ai-improved-available || root.dynamic-enabled : HorizontalLayout {
                         spacing: 4px;
-                        Button {
+                        PillButton {
                             text: "Rule-based";
                             primary: root.after-view == 0;
                             clicked => { root.after-view-changed(0); }
                         }
-                        Button {
+                        if root.ai-improved-available : PillButton {
                             text: "AI Improved";
                             primary: root.after-view == 1;
                             clicked => { root.after-view-changed(1); }
+                        }
+                        if root.dynamic-enabled : PillButton {
+                            text: "Dynamic";
+                            primary: root.after-view == 2;
+                            clicked => { root.after-view-changed(2); }
                         }
                     }
                     Rectangle { horizontal-stretch: 1; }
@@ -465,6 +512,12 @@ component PromptColumn inherits HorizontalLayout {
                     text: "Dropped from your prompt: " + root.ai-dropped + " — copy them back if you want them.";
                     font-size: 11px;
                     color: M3.tertiary;
+                    wrap: word-wrap;
+                }
+                if root.after-view == 2 && root.dynamic-note != "" : Text {
+                    text: root.dynamic-note;
+                    font-size: 11px;
+                    color: M3.info;
                     wrap: word-wrap;
                 }
                 if root.substituted-list != "" : Text {
@@ -595,6 +648,12 @@ export component AppWindow inherits Window {
     in-out property <int> checkpoint_index: 0;
     in-out property <int> target_view_index: 0;
     in-out property <int> ai_mode_index: 0;   // 0 = GPU, 1 = CPU only, 2 = AI off
+    in-out property <[string]> angle_labels: [];
+    in-out property <int> angle_index: 0;      // index into profiles::CAMERA_ANGLES
+    in-out property <[string]> pose_labels: [];
+    in-out property <int> pose_index: 0;       // index into profiles::POSES
+    in-out property <bool> dynamic_enabled: false;
+    in-out property <string> dynamic_note: "";
     in-out property <[string]> model_labels: [];
     in-out property <int> model_index: 0;
     in-out property <bool> model_needs_download: false;
@@ -733,6 +792,28 @@ export component AppWindow inherits Window {
                     VerticalLayout {
                         spacing: 4px;
                         horizontal-stretch: 1;
+                        SectionLabel { text: "CAMERA ANGLE"; }
+                        ComboBox {
+                            model: root.angle_labels;
+                            current-index <=> root.angle_index;
+                            selected => { root.analyze_requested(); }
+                        }
+                    }
+
+                    VerticalLayout {
+                        spacing: 4px;
+                        horizontal-stretch: 1;
+                        SectionLabel { text: "POSE / BODY POSITION"; }
+                        ComboBox {
+                            model: root.pose_labels;
+                            current-index <=> root.pose_index;
+                            selected => { root.analyze_requested(); }
+                        }
+                    }
+
+                    VerticalLayout {
+                        spacing: 4px;
+                        horizontal-stretch: 1;
                         SectionLabel { text: "AI MODE"; }
                         ComboBox {
                             model: [
@@ -842,6 +923,11 @@ export component AppWindow inherits Window {
                         CheckBox {
                             text: "Clamp runaway weights";
                             checked <=> root.clamp_weights_enabled;
+                            toggled => { root.analyze_requested(); }
+                        }
+                        CheckBox {
+                            text: "Dynamic prompts {a|b|c}";
+                            checked <=> root.dynamic_enabled;
                             toggled => { root.analyze_requested(); }
                         }
                     }
@@ -1006,6 +1092,8 @@ export component AppWindow inherits Window {
                 condensed-plain: root.condensed_prompt;
                 after-view: root.after_view;
                 ai-improved-available: root.ai_improved_available;
+                dynamic-enabled: root.dynamic_enabled;
+                dynamic-note: root.dynamic_note;
                 ai-dropped: root.ai_dropped;
                 substituted-list: root.substituted_list;
                 added-list: root.added_list;

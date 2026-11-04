@@ -81,11 +81,12 @@ pub fn parse_prompt(input: &str) -> Vec<PromptToken> {
 
     for ch in normalized_input.chars() {
         match ch {
-            '(' | '[' => {
+            // {a|b} is Dynamic Prompts variation syntax: keep it as one segment
+            '(' | '[' | '{' => {
                 paren_depth += 1;
                 current.push(ch);
             }
-            ')' | ']' => {
+            ')' | ']' | '}' => {
                 paren_depth = (paren_depth - 1).max(0);
                 current.push(ch);
             }
