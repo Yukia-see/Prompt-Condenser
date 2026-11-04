@@ -424,10 +424,18 @@ fn balance_brackets(text: &str) -> String {
 /// The user's tags that an AI rewrite left out (filler the rules would drop anyway is ignored).
 pub fn dropped_tags(raw_prompt: &str, ai_text: &str, checkpoint: CheckpointProfile) -> Vec<String> {
     let kept: HashSet<String> = parse_prompt(ai_text).into_iter().map(|t| t.normalized).collect();
+    // "kimono" is kept by "red silk kimono", "brown hair" by "chestnut brown hair"
+    let enriched = |tag: &str| {
+        kept.iter().any(|k| {
+            let words: Vec<&str> = k.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
+            let want: Vec<&str> = tag.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
+            !want.is_empty() && words.windows(want.len()).any(|w| w == want.as_slice())
+        })
+    };
     let mut seen = HashSet::new();
     parse_prompt(raw_prompt)
         .into_iter()
-        .filter(|t| !kept.contains(&t.normalized))
+        .filter(|t| !kept.contains(&t.normalized) && !enriched(&t.normalized))
         .filter(|t| checkpoint.check_bloat_tag(&t.normalized).is_none())
         .filter(|t| seen.insert(t.normalized.clone()))
         .map(|t| t.text)

@@ -421,12 +421,7 @@ pub fn build_ai_system_and_user_prompt_for(raw_prompt: &str, config: &ScanConfig
              tags that pull the camera away from the framing, filler, vague tags, wrong syntax or weights, and gaps that \
              make results generic (no lighting, no background, unclear pose or expression)."
         ),
-        "improved_prompt: rewrite the full prompt so it delivers the SAME scene more convincingly. Keep every subject, \
-         character, LoRA tag (<lora:...>) and the user's core ideas. Fix every issue. Fill gaps: if there's no lighting, \
-         background/setting or expression, add specific ones that fit THIS scene's setting, time of day and mood. Invent \
-         them from the scene; don't reuse stock phrases. Body-part tags that break the framing become framing-safe \
-         equivalents (e.g. 'ass' with upper body -> 'curvy, hourglass figure, narrow waist, arched back')."
-            .to_string(),
+        improved_prompt_step(config),
     ];
     if config.dynamic {
         steps.push(
@@ -511,6 +506,47 @@ pub fn build_ai_system_and_user_prompt_for(raw_prompt: &str, config: &ScanConfig
         _ => format!("Analyze and improve this ComfyUI prompt:\n\"\"\"\n{}\n\"\"\"", raw_prompt.trim()),
     };
     (system_prompt, user_prompt)
+}
+
+/// The improved_prompt task, worded for the chosen detail level.
+fn improved_prompt_step(config: &ScanConfig) -> String {
+    use crate::profiles::DetailLevel;
+    let base = "improved_prompt: rewrite the full prompt so it delivers the SAME scene more convincingly. Keep every \
+                subject, character, LoRA tag (<lora:...>) and the user's core ideas. Fix every issue. Body-part tags that \
+                break the framing become framing-safe equivalents (e.g. 'ass' with upper body -> 'curvy, hourglass \
+                figure, narrow waist, arched back').";
+    let prose = !config.checkpoint.uses_explicit_weights() || config.checkpoint.supports_natural_language();
+    match config.detail {
+        DetailLevel::Faithful => format!(
+            "{base} DETAIL LEVEL = FAITHFUL: keep the user's tags and wording; only fix what's wrong (conflicts, filler, \
+             syntax, weights). Add at most 3 tags, and only to fill an obvious gap such as missing lighting."
+        ),
+        DetailLevel::Balanced => format!(
+            "{base} Fill gaps: if there's no lighting, background/setting or expression, add specific ones that fit THIS \
+             scene's setting, time of day and mood. Invent them from the scene; don't reuse stock phrases."
+        ),
+        DetailLevel::Rich => format!(
+            "{base} DETAIL LEVEL = RICH: turn it into a detailed, vivid description of the same scene. Go through this \
+             checklist and describe every item that fits the scene: \
+             CHARACTER (hair length, style and color; hair accessories; eye color and shape; skin; build; expression; hands); \
+             OUTFIT (each garment's type, material, fit, color and pattern; accessories, jewelry, footwear); \
+             POSE (body position, what the hands do, head tilt, where the gaze goes); \
+             SETTING (foreground, background, props, architecture or nature details); \
+             LIGHT (light source, its direction and color, time of day, shadows, reflections); \
+             CAMERA (shot type, angle, lens feel, depth of field); \
+             ATMOSPHERE (mood, weather, particles like petals or dust, color palette, art style or medium). \
+             Write descriptive pairs instead of bare tags ('flowing silver hair' rather than 'silver hair', 'red silk \
+             kimono with gold embroidery' rather than 'kimono'); enriching a user's tag this way still counts as keeping it. \
+             {length} Every added detail must fit the scene's setting, time of day and mood and must never contradict \
+             the user's tags.",
+            length = if prose {
+                "Aim for 40-60 tags, or 3-5 vivid sentences for natural-language checkpoints (subject, appearance, action, \
+                 setting, light, style, in that order)."
+            } else {
+                "Aim for 40-60 tags, most important first, so it stays within about three 75-token chunks."
+            }
+        ),
+    }
 }
 
 /// The generic-format instructions (used where no model is known yet).
@@ -1061,7 +1097,12 @@ fn generate_body<'a>(req: &'a AiScanRequest, system: &'a str, prompt: &'a str) -
         options: GenerateOptions {
             temperature: ModelFamily::detect(&req.model).temperature(),
             // reasoning tokens count against this too
-            num_predict: if req.think { 5000 } else if req.config.dynamic { 2400 } else { 1800 },
+            num_predict: if req.think {
+                5000
+            } else {
+                let rich = req.config.detail == crate::profiles::DetailLevel::Rich;
+                1800 + if req.config.dynamic { 600 } else { 0 } + if rich { 800 } else { 0 }
+            },
             num_ctx: 8192,
             num_gpu: if req.mode == AiMode::CpuOnly { Some(0) } else { None },
         },
@@ -1279,6 +1320,8 @@ mod tests {
                 pose: 0,
 
                 dynamic: false,
+
+                detail: crate::profiles::DetailLevel::Balanced,
             },
             mode: AiMode::CpuOnly,
             host: "localhost".into(),
@@ -1386,6 +1429,8 @@ mod tests {
                 pose: 0,
 
                 dynamic: false,
+
+                detail: crate::profiles::DetailLevel::Balanced,
             },
             mode: AiMode::Gpu,
             host: host.clone(),
@@ -1436,6 +1481,8 @@ mod tests {
                 pose: 0,
 
                 dynamic: false,
+
+                detail: crate::profiles::DetailLevel::Balanced,
             },
             mode: AiMode::Gpu,
             host,
@@ -1548,6 +1595,7 @@ mod tests {
                         camera_angle: std::env::var("COMPARE_ANGLE").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
                         pose: 0,
                         dynamic: std::env::var("COMPARE_DYNAMIC").is_ok(),
+                        detail: match std::env::var("COMPARE_DETAIL").as_deref() { Ok("rich") => crate::profiles::DetailLevel::Rich, Ok("faithful") => crate::profiles::DetailLevel::Faithful, _ => crate::profiles::DetailLevel::Balanced },
                     },
                     mode: AiMode::Gpu,
                     host: "localhost:11434".into(),
@@ -1607,6 +1655,7 @@ mod tests {
  camera_angle: 0,
  pose: 0,
  dynamic: false,
+ detail: crate::profiles::DetailLevel::Balanced,
         };
         let joined = |p: &str, v| prompt_guidance(p, &cfg(v)).join("\n");
 
@@ -1643,11 +1692,12 @@ mod tests {
         let mut cfg = ScanConfig {
             checkpoint: CheckpointProfile::Anima, target_view: TargetView::None, pinned_emphasis_raw: String::new(),
             emphasis_weight: 1.25, cleanup_enabled: true, resolve_conflicts_enabled: true, clamp_weights_enabled: true,
-            camera_angle: 6, pose: 0, dynamic: true,
+            camera_angle: 6, pose: 0, dynamic: true, detail: crate::profiles::DetailLevel::Rich,
         };
         let p = "1girl, solo, smile, kimono, shrine, night";
         let (g, gu) = build_ai_system_and_user_prompt_for(p, &cfg, ModelFamily::Gemma);
         assert!(g.contains("## Task") && g.contains("```json") && g.contains("dynamic_prompt") && g.contains("Dutch angle"));
+        assert!(g.contains("DETAIL LEVEL = RICH") && g.contains("CHARACTER (hair"));
         assert!(gu.contains("JSON object only"));
         cfg.dynamic = false;
         let (q, _) = build_ai_system_and_user_prompt_for(p, &cfg, ModelFamily::Qwen25);

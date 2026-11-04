@@ -439,3 +439,25 @@ pub fn group_tags(list: &[(&str, &str)]) -> Vec<String> {
     }
     out
 }
+
+/// How much the deep scan may enrich the prompt. Index order matches the UI dropdown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum DetailLevel {
+    /// Fix problems only; add almost nothing.
+    Faithful,
+    /// Fix problems and fill obvious gaps (lighting, background, expression).
+    #[default]
+    Balanced,
+    /// Full descriptive expansion: a detail checklist, descriptive pairs, 40-60 tags.
+    Rich,
+}
+
+impl DetailLevel {
+    pub fn from_index(idx: i32) -> Self {
+        match idx {
+            0 => Self::Faithful,
+            2 => Self::Rich,
+            _ => Self::Balanced,
+        }
+    }
+}

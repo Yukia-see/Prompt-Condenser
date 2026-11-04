@@ -653,6 +653,7 @@ export component AppWindow inherits Window {
     in-out property <[string]> pose_labels: [];
     in-out property <int> pose_index: 0;       // index into profiles::POSES
     in-out property <bool> dynamic_enabled: false;
+    in-out property <int> detail_index: 1;     // 0 Faithful, 1 Balanced, 2 Rich (profiles::DetailLevel)
     in-out property <string> dynamic_note: "";
     in-out property <[string]> model_labels: [];
     in-out property <int> model_index: 0;
@@ -929,6 +930,17 @@ export component AppWindow inherits Window {
                             text: "Dynamic prompts {a|b|c}";
                             checked <=> root.dynamic_enabled;
                             toggled => { root.analyze_requested(); }
+                        }
+                    }
+
+                    VerticalLayout {
+                        spacing: 4px;
+                        alignment: start;
+                        SectionLabel { text: "AI DETAIL"; }
+                        ComboBox {
+                            model: ["Faithful — fix only", "Balanced", "Rich — detailed & descriptive"];
+                            current-index <=> root.detail_index;
+                            selected => { root.ai_settings_changed(); }
                         }
                     }
 

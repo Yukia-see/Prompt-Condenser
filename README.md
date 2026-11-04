@@ -7,6 +7,7 @@ A desktop app for **ComfyUI / Stable Diffusion prompts**. Paste a prompt, and it
 - **Describes the scene** your prompt creates, live, and points out what's missing (lighting, background, expression…).
 - **Recommends a negative prompt** that fits your checkpoint and camera view.
 - **Runs a Deep AI Scan** (optional) through [Ollama](https://ollama.com) with Vulkan GPU support. It returns a scene analysis, an improved prompt, a tailored negative prompt and individual suggestions. The instructions adapt to your prompt and to the model.
+  - **AI Detail** dropdown: *Faithful* (fix problems only), *Balanced* (fix and fill gaps), or *Rich* (a detailed, descriptive rewrite: hair, outfit materials, pose, setting, light, camera and atmosphere, about 40–60 tags).
 - **Extracts Danbooru tags from an image** with the WD EVA02-Large tagger, which runs locally on the CPU.
 - **Camera angle and pose pickers** with common prompting and photography terms (Dutch angle, worm's-eye, contrapposto, dynamic pose, …).
 - **Dynamic prompts:** an optional `{a|b|c}` variation view (pose, angle, expression, lighting) for the ComfyUI Dynamic Prompts extension.

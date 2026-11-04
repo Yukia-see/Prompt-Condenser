@@ -128,6 +128,7 @@ fn scan_config(ui: &AppWindow) -> ScanConfig {
         camera_angle: ui.get_angle_index().max(0) as usize,
         pose: ui.get_pose_index().max(0) as usize,
         dynamic: ui.get_dynamic_enabled(),
+        detail: crate::profiles::DetailLevel::from_index(ui.get_detail_index()),
     }
 }
 
@@ -528,6 +529,8 @@ struct Settings {
     ollama_host: String,
     /// Whole-UI zoom on top of the monitor's scale (1.0 = Slint's normal size).
     ui_zoom: f32,
+    /// AI detail level (0 Faithful, 1 Balanced, 2 Rich).
+    detail_index: i32,
 }
 
 impl Default for Settings {
@@ -537,6 +540,7 @@ impl Default for Settings {
             side_width: 320.0,
             cards_strip_height: 250.0,
             ui_zoom: 0.75,
+            detail_index: 1,
             ollama_host: "localhost:11434".into(),
         }
     }
@@ -558,6 +562,7 @@ fn load_settings(ui: &AppWindow) {
     ui.set_side_width(st.side_width.max(160.0));
     ui.set_cards_strip_height(st.cards_strip_height.max(140.0));
     ui.set_ui_zoom(st.ui_zoom.clamp(ZOOM_MIN, ZOOM_MAX));
+    ui.set_detail_index(st.detail_index.clamp(0, 2));
     if !st.ollama_host.trim().is_empty() {
         ui.set_ollama_host(st.ollama_host.into());
     }
@@ -569,6 +574,7 @@ fn save_settings(ui: &AppWindow) {
         side_width: ui.get_side_width(),
         cards_strip_height: ui.get_cards_strip_height(),
         ui_zoom: ui.get_ui_zoom(),
+        detail_index: ui.get_detail_index(),
         ollama_host: ui.get_ollama_host().to_string(),
     };
     if let Some(path) = settings_path() {

@@ -63,6 +63,8 @@ pub struct ScanConfig {
     pub pose: usize,
     /// Dynamic Prompts {a|b|c} variations wanted.
     pub dynamic: bool,
+    /// How much the deep scan may enrich the prompt.
+    pub detail: crate::profiles::DetailLevel,
 }
 
 #[derive(Debug, Clone)]
@@ -691,6 +693,8 @@ mod tests {
             pose: 0,
 
             dynamic: false,
+
+            detail: crate::profiles::DetailLevel::Balanced,
         }
     }
 
@@ -949,6 +953,16 @@ mod tests {
         let toks = parse_prompt("1girl, {red hair, ponytail|blue hair}, smile");
         assert_eq!(toks.len(), 3);
         assert_eq!(toks[1].text, "{red hair, ponytail|blue hair}");
+    }
+
+    #[test]
+    fn enriched_tags_are_not_reported_as_dropped() {
+        let dropped = crate::condenser::dropped_tags(
+            "1girl, kimono, brown hair, smile, cherry blossoms",
+            "1girl, red silk kimono with gold embroidery, chestnut brown hair, gentle smile",
+            CheckpointProfile::Anima,
+        );
+        assert_eq!(dropped, vec!["cherry blossoms"]);
     }
 }
 
