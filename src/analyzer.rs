@@ -375,8 +375,8 @@ pub fn check_pinned_visibility_conflict(
 pub fn analyze_with_rules(tokens: &[PromptToken], config: &ScanConfig) -> RuleAnalysisResult {
     let effective_view = detect_effective_view(tokens, config.target_view);
 
-    // Parse user's pinned emphasis parts
-    // Pinned parts only boost tags already in the prompt; they are never added.
+    // Parse user's pinned emphasis parts (Keep & Emphasize). They're boosted where the
+    // prompt has them, added where it doesn't, and win over conflicting tags (below).
     let pinned_norms: Vec<String> = config
         .pinned_emphasis_raw
         .split(',')
@@ -665,11 +665,132 @@ pub fn analyze_with_rules(tokens: &[PromptToken], config: &ScanConfig) -> RuleAn
         next_change_id += 1;
     }
 
+    // Keep & Emphasize tags have the last word: each one replaces prompt tags that
+    // contradict it ("large breasts" beats "gigantic breasts") and is added when missing.
+    for keep in crate::parser::parse_prompt(&config.pinned_emphasis_raw) {
+        let conflicting: Vec<String> = processed_tokens
+            .iter()
+            .filter(|t| keep_conflicts(&keep.normalized, &t.normalized))
+            .map(|t| t.text.clone())
+            .collect();
+        processed_tokens.retain(|t| !keep_conflicts(&keep.normalized, &t.normalized));
+        let present = processed_tokens
+            .iter()
+            .any(|t| t.normalized == keep.normalized || t.normalized.contains(keep.normalized.as_str()));
+        if present && conflicting.is_empty() {
+            continue; // already boosted by the token loop
+        }
+        if !present {
+            let mut t = keep.clone();
+            t.weight = config.emphasis_weight;
+            t.category = TokenCategory::PinnedEmphasis;
+            t.added = conflicting.is_empty();
+            t.replaced = !conflicting.is_empty();
+            t.original_index = 30;
+            processed_tokens.push(t);
+        }
+        changes.push(PromptChange {
+            id: next_change_id,
+            original: conflicting.join(", "),
+            action: ChangeAction::KeptEmphasized,
+            reason: if conflicting.is_empty() {
+                format!(
+                    "'{}' is on your Keep & Emphasize list, so it's added at weight {:.2}.",
+                    keep.text, config.emphasis_weight
+                )
+            } else {
+                format!(
+                    "Your Keep tag '{}' takes precedence over '{}'.",
+                    keep.text,
+                    conflicting.join("', '")
+                )
+            },
+            suggested_alternative: keep.text.clone(),
+            framing_alternative: String::new(),
+            mode: 0,
+        });
+        next_change_id += 1;
+    }
+
     RuleAnalysisResult {
         processed_tokens,
         changes,
         active_framing_detected: effective_view,
     }
+}
+
+/// Words that set one attribute of a body part or feature. Two tags about the same thing
+/// (same last word) that both set the same attribute contradict each other.
+const SIZE_WORDS: &[&str] = &[
+    "flat", "tiny", "small", "petite", "medium", "large", "big", "huge", "gigantic", "giant", "enormous",
+    "massive", "hyper", "wide", "narrow", "thick", "slim", "plump",
+];
+const LENGTH_WORDS: &[&str] = &["short", "medium", "long", "very", "absurdly", "shoulder-length", "bob"];
+const COLOR_WORDS: &[&str] = &[
+    "black", "white", "silver", "grey", "gray", "blonde", "blond", "brown", "red", "blue", "green", "pink",
+    "purple", "orange", "yellow", "aqua", "platinum", "multicolored", "two-tone", "gradient", "streaked",
+    "dark", "light", "golden", "teal", "violet", "crimson", "auburn",
+];
+
+fn head_word(word: &str) -> &str {
+    match word {
+        "chest" | "breast" | "boobs" | "tits" => "breasts",
+        "butt" | "buttocks" => "ass",
+        "eye" => "eyes",
+        "thigh" => "thighs",
+        w => w,
+    }
+}
+
+/// True when `tag` contradicts the Keep tag `keep`: same subject, same attribute,
+/// different value ("gigantic breasts" vs "large breasts", "black hair" vs "silver hair").
+/// Long clauses (prose) are never treated as conflicts.
+pub fn keep_conflicts(keep: &str, tag: &str) -> bool {
+    if keep == tag || tag.contains(keep) || keep.contains(tag) {
+        return false;
+    }
+    let kw: Vec<&str> = keep.split_whitespace().collect();
+    let tw: Vec<&str> = tag.split_whitespace().collect();
+    if kw.len() < 2 || tw.len() < 2 || tw.len() > 4 {
+        return false;
+    }
+    if head_word(kw[kw.len() - 1]) != head_word(tw[tw.len() - 1]) {
+        return false;
+    }
+    let (km, tm) = (&kw[..kw.len() - 1], &tw[..tw.len() - 1]);
+    [SIZE_WORDS, LENGTH_WORDS, COLOR_WORDS]
+        .iter()
+        .any(|class| km.iter().any(|w| class.contains(w)) && tm.iter().any(|w| class.contains(w)))
+}
+
+/// Makes sure an AI-written prompt honors the Keep list: contradicting tags are dropped
+/// and missing Keep tags are put in right after the quality tags.
+pub fn enforce_keep(text: &str, config: &ScanConfig) -> String {
+    let keeps = crate::parser::parse_prompt(&config.pinned_emphasis_raw);
+    if keeps.is_empty() || text.trim().is_empty() {
+        return text.to_string();
+    }
+    let mut parts: Vec<(String, String, bool)> = crate::parser::parse_prompt(text)
+        .into_iter()
+        .filter(|t| !keeps.iter().any(|k| keep_conflicts(&k.normalized, &t.normalized)))
+        .map(|t| (t.raw.clone(), t.normalized.clone(), t.category == TokenCategory::QualityMeta))
+        .collect();
+    let insert_at = parts.iter().take_while(|p| p.2).count();
+    let missing: Vec<(String, String, bool)> = keeps
+        .iter()
+        .filter(|k| !parts.iter().any(|p| p.1 == k.normalized || p.1.contains(k.normalized.as_str())))
+        .map(|k| {
+            let w = config.emphasis_weight;
+            let raw = if config.checkpoint.uses_explicit_weights() && (w - 1.0).abs() > 0.01 {
+                format!("({}:{w:.2})", k.text)
+            } else {
+                k.text.clone()
+            };
+            (raw, k.normalized.clone(), false)
+        })
+        .collect();
+    parts.splice(insert_at..insert_at, missing);
+    parts.into_iter().map(|p| p.0).collect::<Vec<_>>().join(", ")
 }
 
 #[cfg(test)]
@@ -772,13 +893,35 @@ mod tests {
     }
 
     #[test]
-    fn pinned_parts_not_in_prompt_are_never_added() {
+    fn keep_tags_are_added_when_missing() {
         let mut config = cfg(TargetView::None);
-        config.pinned_emphasis_raw = "ass, toned back, cybernetic spine".into();
+        config.pinned_emphasis_raw = "toned back, cybernetic spine".into();
         let (_, out) = run("1girl, silver hair, toned back", &config);
-        assert!(!out.contains("cybernetic spine"));
-        assert!(!out.contains("ass"));
+        assert!(out.contains("(cybernetic spine:1.25)"));
         assert!(out.contains("(toned back:1.25)"));
+        assert_eq!(out.matches("toned back").count(), 1);
+    }
+
+    #[test]
+    fn keep_tags_beat_conflicting_tags() {
+        let mut config = cfg(TargetView::None);
+        config.pinned_emphasis_raw = "large breasts, silver hair".into();
+        let (_, out) = run("1girl, gigantic breasts, black hair, long hair, blue eyes", &config);
+        assert!(out.contains("(large breasts:1.25)") && out.contains("(silver hair:1.25)"), "{out}");
+        assert!(!out.contains("gigantic") && !out.contains("black hair"), "{out}");
+        assert!(out.contains("long hair") && out.contains("blue eyes"), "{out}");
+        assert!(keep_conflicts("flat chest", "huge breasts"));
+        assert!(!keep_conflicts("large breasts", "breasts out"));
+        assert!(!keep_conflicts("long hair", "silver hair"));
+    }
+
+    #[test]
+    fn ai_prompt_honors_keep_list() {
+        let mut config = cfg(TargetView::None);
+        config.checkpoint = CheckpointProfile::PonyV6;
+        config.pinned_emphasis_raw = "large breasts, red scarf".into();
+        let out = enforce_keep("score_9, score_8_up, 1girl, gigantic breasts, smile, red scarf", &config);
+        assert_eq!(out, "score_9, score_8_up, (large breasts:1.25), 1girl, smile, red scarf");
     }
 
     #[test]

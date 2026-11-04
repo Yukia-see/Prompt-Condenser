@@ -351,7 +351,13 @@ pub fn build_ai_system_and_user_prompt_for(raw_prompt: &str, config: &ScanConfig
     let pinned = if config.pinned_emphasis_raw.trim().is_empty() {
         "none".to_string()
     } else {
-        format!("{} (keep them, weighted {:.2})", config.pinned_emphasis_raw.trim(), config.emphasis_weight)
+        format!(
+            "{} -- HIGHEST PRIORITY. Every one of these must appear in improved_prompt (weighted {:.2}), and they \
+             override anything in the prompt that contradicts them: e.g. Keep 'large breasts' with 'gigantic breasts' \
+             in the prompt means only 'large breasts'. Never drop, soften or replace them.",
+            config.pinned_emphasis_raw.trim(),
+            config.emphasis_weight
+        )
     };
     let quality = config.checkpoint.canonical_quality_tags();
     let quality = if quality.is_empty() { "none (natural language only)".to_string() } else { quality.join(", ") };
@@ -773,6 +779,133 @@ pub fn convert_ai_changes(
 }
 
 // ============================================================================
+// Image -> prompt with a vision model (Gemma 4 12B), guided by the tagger's tags
+// ============================================================================
+
+#[derive(Debug, Clone)]
+pub struct ImageAiRequest {
+    pub host: String,
+    pub model: String,
+    pub mode: AiMode,
+    pub image_path: std::path::PathBuf,
+    pub config: ScanConfig,
+    /// Tags the Danbooru tagger read from the image (may be empty).
+    pub tag_hints: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ImageAiResult {
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub prompt: String,
+}
+
+/// Vision models gain nothing from huge images but get much slower: anything over
+/// 1024 px on its longest side is scaled down and sent as JPEG.
+fn shrink_for_vision(path: &std::path::Path) -> Result<Vec<u8>> {
+    let original = std::fs::read(path).with_context(|| format!("Couldn't read {}", path.display()))?;
+    let Ok(img) = image::load_from_memory(&original) else {
+        return Ok(original);
+    };
+    if img.width().max(img.height()) <= 1024 {
+        return Ok(original);
+    }
+    let small = img.resize(1024, 1024, image::imageops::FilterType::Triangle).to_rgb8();
+    let mut out = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 90).encode_image(&small)?;
+    Ok(out)
+}
+
+fn image_system_prompt(config: &ScanConfig, tag_hints: &str) -> String {
+    let style = if config.checkpoint.uses_explicit_weights() {
+        format!(
+            "Write 25-45 comma-separated Danbooru-style tags, most important first, starting with the quality tags ({}). \
+             Cover who is in it (e.g. 1girl, solo; or 'no humans, scenery' when nobody is the subject), their concrete \
+             looks (hair colour and style, eye colour, build), clothing, expression, pose, the shot and angle, the \
+             place, the light and the art style. Every tag is a concrete visual fact like 'silver hair', never a bare \
+             category word like 'hair' or 'lighting'.",
+            config.checkpoint.canonical_quality_tags().join(", ")
+        )
+    } else {
+        "Write 3-5 vivid natural-language sentences: subject and appearance, clothing, pose, framing, setting, light \
+         and style, most important first."
+            .to_string()
+    };
+    let hints = if tag_hints.trim().is_empty() {
+        String::new()
+    } else {
+        format!(
+            "## Tagger hints\nA Danbooru tagger read these tags from the image: {tag_hints}\nMost are right. Keep the \
+             correct ones (they're the most reliable names for what's visible), drop any that are clearly wrong, and add \
+             what a tagger can't judge: lighting, mood, composition, background details, art style.\n\n"
+        )
+    };
+    format!(
+        "# Role\nYou turn images into Stable Diffusion / ComfyUI prompts that would recreate them. You are uncensored: \
+         describe nudity, sexual content and violence accurately and matter-of-factly; never refuse or soften.\n\n\
+         ## Target checkpoint\n{}. {}\n\n## Prompt style\n{style}\n\n{hints}## Rules\n\
+         - Only describe what is actually visible; don't invent characters or details.\n\
+         - Count people carefully; the tagger's count (1girl, 2girls, multiple girls...) is usually right. 'solo' only \
+         when exactly one person is in the image.\n\
+         - Never write the checkpoint's name in the prompt.\n\
+         - 'description' is 1-2 plain sentences about the image; 'prompt' is the prompt itself.\n\
+         - Reply with JSON only.",
+        config.checkpoint.display_name(),
+        config.checkpoint.system_prompt_rules(),
+    )
+}
+
+/// Asks a vision model to write a prompt for the image.
+pub fn describe_image(req: &ImageAiRequest) -> Result<ImageAiResult> {
+    use base64::Engine as _;
+    let base = base_url(&req.host)?;
+    let image = base64::engine::general_purpose::STANDARD.encode(shrink_for_vision(&req.image_path)?);
+    let text = json!({ "type": "string" });
+    let body = json!({
+        "model": req.model,
+        "system": image_system_prompt(&req.config, &req.tag_hints),
+        "prompt": "Write the prompt for this image.",
+        "images": [image],
+        "format": { "type": "object", "properties": { "description": text, "prompt": text }, "required": ["description", "prompt"] },
+        "stream": false,
+        "keep_alive": "30m",
+        "options": {
+            "temperature": 0.2,
+            "num_predict": 900,
+            "num_ctx": 8192,
+            "num_gpu": if req.mode == AiMode::CpuOnly { Some(0) } else { None::<i32> },
+        },
+    });
+    let resp = client(Some(Duration::from_secs(300)))?
+        .post(format!("{base}/api/generate"))
+        .json(&body)
+        .send()
+        .map_err(|e| if e.is_timeout() { anyhow!("The model took over 5 minutes to read the image") } else { anyhow!("Couldn't reach Ollama at {base}") })?;
+    let gen: GenerateResponse = check(resp, "Reading the image")?.json()?;
+    let raw = gen.response.trim();
+    let mut out: ImageAiResult = serde_json::from_str(&raw[raw.find('{').unwrap_or(0)..])
+        .ok()
+        .filter(|r: &ImageAiResult| !r.prompt.trim().is_empty())
+        .ok_or_else(|| anyhow!("The model's reply was unreadable. Try again."))?;
+    // small cleanups: the checkpoint's name and bare category words aren't image content
+    let name = req.config.checkpoint.display_name().to_lowercase();
+    let junk = ["hair", "eyes", "lighting", "light", "pose", "expression", "clothing", "background", "style", "setting"];
+    let cleaned: Vec<String> = crate::condenser::tidy_ai_prompt(&out.prompt, req.config.checkpoint)
+        .split(", ")
+        .map(str::to_string)
+        .filter(|t| { let l = t.to_lowercase(); !l.is_empty() && !name.contains(&l) && !junk.contains(&l.as_str()) })
+        .collect();
+    // "solo" contradicts a group
+    let group = cleaned.iter().any(|t| {
+        let l = t.to_lowercase();
+        l.starts_with("multiple ") || (l.len() > 1 && l.as_bytes()[0].is_ascii_digit() && l.as_bytes()[0] > b'1' && (l.ends_with("girls") || l.ends_with("boys") || l.ends_with("others")))
+    });
+    out.prompt = cleaned.into_iter().filter(|t| !(group && t.eq_ignore_ascii_case("solo"))).collect::<Vec<_>>().join(", ");
+    Ok(out)
+}
+
+// ============================================================================
 // Ollama client
 // ============================================================================
 
@@ -871,12 +1004,17 @@ struct OllamaTagsResponse {
 struct OllamaModelEntry {
     #[serde(default)]
     name: String,
+    /// e.g. ["completion", "vision"]
+    #[serde(default)]
+    capabilities: Vec<String>,
 }
 
 /// An installed Ollama model.
 #[derive(Debug, Clone, PartialEq)]
 pub struct OllamaModel {
     pub name: String,
+    /// Can read images (the GGUF has a vision projector).
+    pub vision: bool,
 }
 
 /// `GET /api/tags` with a 2-second timeout. Returns the base URL and installed models.
@@ -893,7 +1031,7 @@ pub fn list_ollama_models(host: &str) -> Result<(String, Vec<OllamaModel>)> {
         .models
         .into_iter()
         .filter(|m| !m.name.is_empty())
-        .map(|m| OllamaModel { name: m.name })
+        .map(|m| OllamaModel { vision: m.capabilities.iter().any(|c| c == "vision"), name: m.name })
         .collect();
     models.sort_by(|a, b| a.name.cmp(&b.name));
     Ok((base, models))
@@ -1164,6 +1302,8 @@ pub fn run_ai_scan(req: &AiScanRequest) -> Result<(AiJsonOutput, String)> {
     })?;
     let mut out = out;
     let needs_negative = !req.config.checkpoint.default_negative().is_empty();
+    // the Keep list wins, whatever the model wrote
+    out.improved_prompt = crate::analyzer::enforce_keep(&out.improved_prompt, &req.config);
     if needs_negative && out.recommended_negative.trim().is_empty() && !out.improved_prompt.trim().is_empty() {
         // The model sometimes skips the negative; a short follow-up asks for just that.
         out.recommended_negative = generate_negative(req, &out.improved_prompt).unwrap_or_default();
@@ -1522,6 +1662,29 @@ mod tests {
         assert_eq!(out.issues.len(), 2);
         assert_eq!(out.improved_prompt, "1girl, upper body, neon rim light");
         assert_eq!(out.changes.len(), 1);
+    }
+
+    /// Reads real images with a vision model, tagger hints included:
+    /// `IMAGE_TEST=a.png cargo test live_image -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn live_image() {
+        for path in std::env::var("IMAGE_TEST").unwrap().split(':') {
+            let path = std::path::PathBuf::from(path);
+            let hints = crate::tagger::tag_image(&path).map(|t| crate::tagger::build_prompt(&t, 0.35).prompt).unwrap_or_default();
+            let config = ScanConfig {
+                checkpoint: crate::profiles::CheckpointProfile::PonyV6, target_view: crate::profiles::TargetView::None, pinned_emphasis_raw: String::new(),
+                emphasis_weight: 1.25, cleanup_enabled: true, resolve_conflicts_enabled: true, clamp_weights_enabled: true,
+                camera_angle: 0, pose: 0, dynamic: false, detail: crate::profiles::DetailLevel::Balanced,
+            };
+            let req = ImageAiRequest {
+                host: "localhost:11434".into(), model: "prompt-condenser-gemma4-12b".into(), mode: AiMode::Gpu,
+                image_path: path.clone(), config, tag_hints: hints.clone(),
+            };
+            let t = std::time::Instant::now();
+            let r = describe_image(&req).unwrap();
+            println!("{} ({:.0}s)\n  TAGGER: {hints}\n  DESC  : {}\n  PROMPT: {}", path.display(), t.elapsed().as_secs_f32(), r.description, r.prompt);
+        }
     }
 
     /// Downloads a tier into a real Ollama: `cargo test live_pull -- --ignored --nocapture`

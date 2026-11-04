@@ -664,7 +664,8 @@ export component AppWindow inherits Window {
     in-out property <image> image_thumb;
     in-out property <string> image_status: "Extract Danbooru tags from any image (WD EVA02)";
     in-out property <bool> tagger_installed: false;
-    in-out property <bool> tagger_busy: false;
+    in-out property <bool> tagger_busy: false;   // busy reading an image (tagger or AI)
+    in-out property <bool> image_use_ai: false;  // Tagger (false) / AI (true) switch
     in-out property <float> tag_threshold: 0.35;
     in-out property <bool> image_can_undo: false;
 
@@ -729,6 +730,8 @@ export component AppWindow inherits Window {
     callback connect_ollama_requested();
     callback load_image_requested();
     callback remove_image_requested();
+    callback image_mode_changed();
+    callback add_image_tags_to_keep();
     callback undo_image_prompt_requested();
     callback download_tagger_requested();
     callback tag_threshold_changed();
@@ -974,7 +977,7 @@ export component AppWindow inherits Window {
                                     clicked => { root.remove_image_requested(); }
                                 }
                             }
-                            if root.tagger_installed : Slider {
+                            if root.tagger_installed && !root.image_use_ai : Slider {
                                 width: 110px;
                                 minimum: 0.2;
                                 maximum: 0.7;
@@ -985,7 +988,7 @@ export component AppWindow inherits Window {
                         VerticalLayout {
                             spacing: 4px;
                             alignment: start;
-                            SectionLabel { text: "IMAGE → DANBOORU TAGS"; color: M3.primary; }
+                            SectionLabel { text: root.image_use_ai ? "IMAGE → PROMPT (AI)" : "IMAGE → DANBOORU TAGS"; color: M3.primary; }
                             Text {
                                 text: root.image_status;
                                 font-size: 11px;
@@ -1002,13 +1005,34 @@ export component AppWindow inherits Window {
                                     enabled: !root.tagger_busy;
                                     clicked => { root.load_image_requested(); }
                                 }
-                                if root.image_loaded && root.tagger_installed : Text {
+                                // Tagger / AI switch (re-reads the loaded image right away)
+                                HorizontalLayout {
+                                    spacing: 2px;
+                                    PillButton {
+                                        text: "Tagger";
+                                        primary: !root.image_use_ai;
+                                        enabled: !root.tagger_busy;
+                                        clicked => { root.image_use_ai = false; root.image_mode_changed(); }
+                                    }
+                                    PillButton {
+                                        text: "AI";
+                                        primary: root.image_use_ai;
+                                        enabled: !root.tagger_busy;
+                                        clicked => { root.image_use_ai = true; root.image_mode_changed(); }
+                                    }
+                                }
+                                if root.image_loaded : PillButton {
+                                    text: "Add to Keep";
+                                    enabled: !root.tagger_busy;
+                                    clicked => { root.add_image_tags_to_keep(); }
+                                }
+                                if root.image_loaded && root.tagger_installed && !root.image_use_ai : Text {
                                     text: "Lower = more tags";
                                     font-size: 11px;
                                     color: M3.on-surface-variant;
                                     vertical-alignment: center;
                                 }
-                                if !root.tagger_installed : PillButton {
+                                if !root.tagger_installed && !root.image_use_ai : PillButton {
                                     text: "Download Tagger (1.2 GB)";
                                     enabled: !root.tagger_busy;
                                     clicked => { root.download_tagger_requested(); }

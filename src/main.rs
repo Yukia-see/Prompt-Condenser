@@ -44,6 +44,12 @@ struct AppState {
     prompt_before_image: Option<String>,
     /// Tag scores for the loaded image, so the threshold slider re-filters instantly.
     last_tags: Option<Vec<tagger::ScoredTag>>,
+    /// The AI's reading of the loaded image (cached, so switching modes is instant).
+    image_ai: Option<ai_engine::ImageAiResult>,
+    /// Installed Ollama models that can read images.
+    vision_models: Vec<String>,
+    /// Deep Scan was pressed while the AI was still reading the image: scan once it's done.
+    scan_after_image: bool,
     /// Kept alive for the whole session: on Linux the copied text disappears
     /// when the `Clipboard` that owns it is dropped.
     clipboard: Option<arboard::Clipboard>,
@@ -432,6 +438,7 @@ fn connect_ollama(ui: &AppWindow, quiet: bool) {
             with_state(|state| match result {
                 Ok((base, models)) => {
                     let n = models.len();
+                    state.borrow_mut().vision_models = models.iter().filter(|m| m.vision).map(|m| m.name.clone()).collect();
                     set_model_choices(&ui, state, build_model_choices(&models));
                     ui.set_ollama_connected(true);
                     ui.set_ollama_status(format!("Connected to {base} — {n} model(s)").into());
@@ -454,12 +461,114 @@ fn connect_ollama(ui: &AppWindow, quiet: bool) {
 /// Puts an image's prompt into the Before box, remembering what was there for Undo.
 fn set_prompt_from_image(ui: &AppWindow, state: &State, prompt: &str) {
     let current = ui.get_raw_prompt().to_string();
-    if !current.trim().is_empty() && current.trim() != prompt.trim() {
+    // remember the prompt from before this image only once, so flipping Tagger / AI
+    // doesn't overwrite what Undo goes back to
+    let already = state.borrow().prompt_before_image.is_some();
+    if !already && !current.trim().is_empty() && current.trim() != prompt.trim() {
         state.borrow_mut().prompt_before_image = Some(current);
         ui.set_image_can_undo(true);
     }
     ui.set_raw_prompt(prompt.into());
     analyze(ui, state);
+}
+
+/// Reads the loaded image with the method the Tagger / AI switch selects, reusing a
+/// cached result when there is one.
+fn image_extract(ui: &AppWindow, state: &State) {
+    if state.borrow().image_path.is_none() {
+        return;
+    }
+    if ui.get_image_use_ai() {
+        let cached = state.borrow().image_ai.clone();
+        match cached {
+            Some(res) => apply_ai_image(ui, state, &res, None),
+            None => run_ai_image(ui, state),
+        }
+    } else if state.borrow().last_tags.is_some() {
+        apply_tags(ui, state, Some(0.0));
+    } else if tagger::is_installed() {
+        run_tagger(ui, state);
+    } else {
+        ui.set_image_status("Download the Danbooru tagger once (1.2 GB) to extract tags.".into());
+    }
+}
+
+/// The model for reading images: the selected one if it can see, else any installed one that can.
+fn vision_model(ui: &AppWindow, state: &State) -> Option<String> {
+    let st = state.borrow();
+    let selected = st.model_choices.get(ui.get_model_index().max(0) as usize).map(|c| c.name.clone());
+    selected
+        .filter(|s| st.vision_models.iter().any(|v| ai_engine::same_model(v, s)))
+        .or_else(|| st.vision_models.first().cloned())
+}
+
+/// Lets a vision model write the prompt, with the tagger's tags as hints (off the UI thread).
+fn run_ai_image(ui: &AppWindow, state: &State) {
+    let Some(path) = state.borrow().image_path.clone() else { return };
+    if !ui.get_ollama_connected() {
+        ui.set_image_status("AI mode needs Ollama: connect first (or switch to Tagger).".into());
+        return;
+    }
+    let Some(model) = vision_model(ui, state) else {
+        ui.set_image_status(
+            "AI mode needs a model that can see images: download Maximum Fast (Gemma 4 12B) in the AI model list.".into(),
+        );
+        return;
+    };
+    let cached_tags = state.borrow().last_tags.clone();
+    let req = ai_engine::ImageAiRequest {
+        host: ui.get_ollama_host().to_string(),
+        model: model.clone(),
+        mode: AiMode::from_index(ui.get_ai_mode_index()),
+        image_path: path.clone(),
+        config: scan_config(ui),
+        tag_hints: String::new(),
+    };
+    let threshold = ui.get_tag_threshold();
+    ui.set_tagger_busy(true);
+    ui.set_image_status(format!("AI is reading the image with {model}…").into());
+    let weak = ui.as_weak();
+    std::thread::spawn(move || {
+        let started = std::time::Instant::now();
+        // the tagger's tags make the AI's reading more reliable
+        let tags = cached_tags.or_else(|| tagger::is_installed().then(|| tagger::tag_image(&path).ok()).flatten());
+        let mut req = req;
+        if let Some(t) = &tags {
+            req.tag_hints = tagger::build_prompt(t, threshold).prompt;
+        }
+        let result = ai_engine::describe_image(&req);
+        let secs = started.elapsed().as_secs_f32();
+        let _ = weak.upgrade_in_event_loop(move |ui| {
+            ui.set_tagger_busy(false);
+            with_state(|state| {
+                if tags.is_some() {
+                    state.borrow_mut().last_tags = tags;
+                }
+                match result {
+                    Ok(res) => {
+                        state.borrow_mut().image_ai = Some(res.clone());
+                        // only show it if the switch is still on AI
+                        if ui.get_image_use_ai() {
+                            apply_ai_image(&ui, state, &res, Some(secs));
+                        }
+                        if std::mem::take(&mut state.borrow_mut().scan_after_image) {
+                            ui.invoke_run_ai_scan_requested();
+                        }
+                    }
+                    Err(e) => {
+                        state.borrow_mut().scan_after_image = false;
+                        ui.set_image_status(format!("AI image reading failed: {e:#}").into());
+                    }
+                }
+            });
+        });
+    });
+}
+
+fn apply_ai_image(ui: &AppWindow, state: &State, res: &ai_engine::ImageAiResult, secs: Option<f32>) {
+    set_prompt_from_image(ui, state, &res.prompt);
+    let timing = secs.map(|s| format!(" • {s:.0} s")).unwrap_or_default();
+    ui.set_image_status(format!("AI{timing}: {}", res.description.trim()).into());
 }
 
 /// Runs the Danbooru tagger on the loaded image (off the UI thread).
@@ -499,7 +608,7 @@ fn apply_tags(ui: &AppWindow, state: &State, secs: Option<f32>) {
         ui.set_raw_prompt(built.prompt.clone().into());
         analyze(ui, state);
     }
-    let timing = secs.map(|s| format!(" • {s:.1} s")).unwrap_or_default();
+    let timing = secs.filter(|s| *s > 0.0).map(|s| format!(" • {s:.1} s")).unwrap_or_default();
     ui.set_image_status(
         format!(
             "{} Danbooru tags ({} character) • rating: {}{timing}",
@@ -531,6 +640,8 @@ struct Settings {
     ui_zoom: f32,
     /// AI detail level (0 Faithful, 1 Balanced, 2 Rich).
     detail_index: i32,
+    /// Image reading: false = Danbooru tagger, true = AI.
+    image_use_ai: bool,
 }
 
 impl Default for Settings {
@@ -541,6 +652,7 @@ impl Default for Settings {
             cards_strip_height: 250.0,
             ui_zoom: 0.75,
             detail_index: 1,
+            image_use_ai: false,
             ollama_host: "localhost:11434".into(),
         }
     }
@@ -563,6 +675,7 @@ fn load_settings(ui: &AppWindow) {
     ui.set_cards_strip_height(st.cards_strip_height.max(140.0));
     ui.set_ui_zoom(st.ui_zoom.clamp(ZOOM_MIN, ZOOM_MAX));
     ui.set_detail_index(st.detail_index.clamp(0, 2));
+    ui.set_image_use_ai(st.image_use_ai);
     if !st.ollama_host.trim().is_empty() {
         ui.set_ollama_host(st.ollama_host.into());
     }
@@ -575,6 +688,7 @@ fn save_settings(ui: &AppWindow) {
         cards_strip_height: ui.get_cards_strip_height(),
         ui_zoom: ui.get_ui_zoom(),
         detail_index: ui.get_detail_index(),
+        image_use_ai: ui.get_image_use_ai(),
         ollama_host: ui.get_ollama_host().to_string(),
     };
     if let Some(path) = settings_path() {
@@ -808,12 +922,11 @@ fn main() -> Result<(), slint::PlatformError> {
                 let mut st = state.borrow_mut();
                 st.image_path = Some(path);
                 st.last_tags = None;
+                st.image_ai = None;
+                st.prompt_before_image = None; // Undo goes back to the prompt from before this image
             }
-            if tagger::is_installed() {
-                run_tagger(&ui, &state);
-            } else {
-                ui.set_image_status("Download the Danbooru tagger once (1.2 GB) to extract tags.".into());
-            }
+            ui.set_image_can_undo(false);
+            image_extract(&ui, &state);
         });
     }
     {
@@ -825,6 +938,7 @@ fn main() -> Result<(), slint::PlatformError> {
                 let mut st = state.borrow_mut();
                 st.image_path = None;
                 st.last_tags = None;
+                st.image_ai = None;
             }
             ui.set_image_loaded(false);
             ui.set_image_thumb(slint::Image::default());
@@ -835,10 +949,54 @@ fn main() -> Result<(), slint::PlatformError> {
     {
         let weak = ui.as_weak();
         let state = state.clone();
+        ui.on_image_mode_changed(move || {
+            if let Some(ui) = weak.upgrade() {
+                image_extract(&ui, &state);
+            }
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_add_image_tags_to_keep(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            // the image's tags from the active mode, minus quality / rating filler
+            let text = {
+                let st = state.borrow();
+                if ui.get_image_use_ai() {
+                    st.image_ai.as_ref().map(|r| r.prompt.clone())
+                } else {
+                    st.last_tags.as_ref().map(|t| tagger::build_prompt(t, ui.get_tag_threshold()).prompt)
+                }
+            };
+            let Some(text) = text else {
+                ui.set_status_message("Nothing extracted from the image yet.".into());
+                return;
+            };
+            let current = ui.get_pinned_emphasis().to_string();
+            let mut seen: Vec<String> = parser::parse_prompt(&current).into_iter().map(|t| t.normalized).collect();
+            let mut parts: Vec<String> = current.split(',').map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect();
+            let mut added = 0;
+            for t in parser::parse_prompt(&text) {
+                if t.category == parser::TokenCategory::QualityMeta || seen.contains(&t.normalized) {
+                    continue;
+                }
+                seen.push(t.normalized.clone());
+                parts.push(t.text.clone());
+                added += 1;
+            }
+            ui.set_pinned_emphasis(parts.join(", ").into());
+            analyze(&ui, &state);
+            ui.set_status_message(format!("Added {added} tag(s) from the image to Keep & Emphasize.").into());
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let state = state.clone();
         ui.on_tag_threshold_changed(move || {
             let Some(ui) = weak.upgrade() else { return };
             let has_tags = state.borrow().last_tags.is_some();
-            if has_tags {
+            if has_tags && !ui.get_image_use_ai() {
                 apply_tags(&ui, &state, None);
             }
         });
@@ -896,6 +1054,21 @@ fn main() -> Result<(), slint::PlatformError> {
         let state = state.clone();
         ui.on_run_ai_scan_requested(move || {
             let Some(ui) = weak.upgrade() else { return };
+            // With an image loaded and the switch on AI, read the image first, then scan.
+            if ui.get_image_use_ai() && ui.get_image_loaded() {
+                if ui.get_tagger_busy() {
+                    state.borrow_mut().scan_after_image = true;
+                    ui.set_status_message("Deep scan starts as soon as the AI has read the image…".into());
+                    return;
+                }
+                let unread = state.borrow().image_ai.is_none();
+                if unread && vision_model(&ui, &state).is_some() {
+                    state.borrow_mut().scan_after_image = true;
+                    run_ai_image(&ui, &state);
+                    ui.set_status_message("Reading the image with AI first, then running the deep scan…".into());
+                    return;
+                }
+            }
             let raw = ui.get_raw_prompt().to_string();
             if raw.trim().is_empty() {
                 ui.set_status_message("Paste a prompt first.".into());
