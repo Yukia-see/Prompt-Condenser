@@ -63,6 +63,8 @@ pub struct ScanConfig {
     pub pose: usize,
     /// Dynamic Prompts {a|b|c} variations wanted.
     pub dynamic: bool,
+    /// The LoRA box: tags put into the output word for word.
+    pub lora_tags_raw: String,
     /// How much the deep scan may enrich the prompt.
     pub detail: crate::profiles::DetailLevel,
 }
@@ -375,8 +377,8 @@ pub fn check_pinned_visibility_conflict(
 pub fn analyze_with_rules(tokens: &[PromptToken], config: &ScanConfig) -> RuleAnalysisResult {
     let effective_view = detect_effective_view(tokens, config.target_view);
 
-    // Parse user's pinned emphasis parts (Keep & Emphasize). They're boosted where the
-    // prompt has them, added where it doesn't, and win over conflicting tags (below).
+    // Parse user's pinned emphasis parts
+    // Pinned parts only boost tags already in the prompt; they are never added.
     let pinned_norms: Vec<String> = config
         .pinned_emphasis_raw
         .split(',')
@@ -665,47 +667,26 @@ pub fn analyze_with_rules(tokens: &[PromptToken], config: &ScanConfig) -> RuleAn
         next_change_id += 1;
     }
 
-    // Keep & Emphasize tags have the last word: each one replaces prompt tags that
-    // contradict it ("large breasts" beats "gigantic breasts") and is added when missing.
-    for keep in crate::parser::parse_prompt(&config.pinned_emphasis_raw) {
+    // LoRA tags (their own box) go into the output word for word (`insert_lora_block`).
+    // Here the prompt's own copies are dropped, and tags that contradict one are
+    // replaced by it ("large breasts" beats "gigantic breasts"), with a card each.
+    for lora in crate::parser::parse_prompt(&config.lora_tags_raw) {
+        processed_tokens.retain(|t| t.normalized != lora.normalized);
         let conflicting: Vec<String> = processed_tokens
             .iter()
-            .filter(|t| keep_conflicts(&keep.normalized, &t.normalized))
+            .filter(|t| tags_conflict(&lora.normalized, &t.normalized))
             .map(|t| t.text.clone())
             .collect();
-        processed_tokens.retain(|t| !keep_conflicts(&keep.normalized, &t.normalized));
-        let present = processed_tokens
-            .iter()
-            .any(|t| t.normalized == keep.normalized || t.normalized.contains(keep.normalized.as_str()));
-        if present && conflicting.is_empty() {
-            continue; // already boosted by the token loop
+        if conflicting.is_empty() {
+            continue;
         }
-        if !present {
-            let mut t = keep.clone();
-            t.weight = config.emphasis_weight;
-            t.category = TokenCategory::PinnedEmphasis;
-            t.added = conflicting.is_empty();
-            t.replaced = !conflicting.is_empty();
-            t.original_index = 30;
-            processed_tokens.push(t);
-        }
+        processed_tokens.retain(|t| !tags_conflict(&lora.normalized, &t.normalized));
         changes.push(PromptChange {
             id: next_change_id,
             original: conflicting.join(", "),
             action: ChangeAction::KeptEmphasized,
-            reason: if conflicting.is_empty() {
-                format!(
-                    "'{}' is on your Keep & Emphasize list, so it's added at weight {:.2}.",
-                    keep.text, config.emphasis_weight
-                )
-            } else {
-                format!(
-                    "Your Keep tag '{}' takes precedence over '{}'.",
-                    keep.text,
-                    conflicting.join("', '")
-                )
-            },
-            suggested_alternative: keep.text.clone(),
+            reason: format!("Your LoRA tag '{}' takes precedence over '{}'.", lora.text, conflicting.join("', '")),
+            suggested_alternative: String::new(),
             framing_alternative: String::new(),
             mode: 0,
         });
@@ -742,10 +723,10 @@ fn head_word(word: &str) -> &str {
     }
 }
 
-/// True when `tag` contradicts the Keep tag `keep`: same subject, same attribute,
+/// True when `tag` contradicts `keep` (a LoRA tag): same subject, same attribute,
 /// different value ("gigantic breasts" vs "large breasts", "black hair" vs "silver hair").
 /// Long clauses (prose) are never treated as conflicts.
-pub fn keep_conflicts(keep: &str, tag: &str) -> bool {
+pub fn tags_conflict(keep: &str, tag: &str) -> bool {
     if keep == tag || tag.contains(keep) || keep.contains(tag) {
         return false;
     }
@@ -763,34 +744,25 @@ pub fn keep_conflicts(keep: &str, tag: &str) -> bool {
         .any(|class| km.iter().any(|w| class.contains(w)) && tm.iter().any(|w| class.contains(w)))
 }
 
-/// Makes sure an AI-written prompt honors the Keep list: contradicting tags are dropped
-/// and missing Keep tags are put in right after the quality tags.
-pub fn enforce_keep(text: &str, config: &ScanConfig) -> String {
-    let keeps = crate::parser::parse_prompt(&config.pinned_emphasis_raw);
-    if keeps.is_empty() || text.trim().is_empty() {
+/// Puts the LoRA box's text into a finished prompt word for word, right after the
+/// leading quality tags, and drops the prompt's own copies of those tags.
+/// With `strip_conflicts`, tags that contradict a LoRA tag are dropped too (used on AI
+/// text; the rule output already handled them as cards).
+pub fn insert_lora_block(text: &str, config: &ScanConfig, strip_conflicts: bool) -> String {
+    let block = config.lora_tags_raw.trim().trim_matches(',').trim();
+    if block.is_empty() {
         return text.to_string();
     }
-    let mut parts: Vec<(String, String, bool)> = crate::parser::parse_prompt(text)
+    let loras = crate::parser::parse_prompt(block);
+    let parts: Vec<_> = crate::parser::parse_prompt(text)
         .into_iter()
-        .filter(|t| !keeps.iter().any(|k| keep_conflicts(&k.normalized, &t.normalized)))
-        .map(|t| (t.raw.clone(), t.normalized.clone(), t.category == TokenCategory::QualityMeta))
+        .filter(|t| !loras.iter().any(|l| l.normalized == t.normalized))
+        .filter(|t| !strip_conflicts || !loras.iter().any(|l| tags_conflict(&l.normalized, &t.normalized)))
         .collect();
-    let insert_at = parts.iter().take_while(|p| p.2).count();
-    let missing: Vec<(String, String, bool)> = keeps
-        .iter()
-        .filter(|k| !parts.iter().any(|p| p.1 == k.normalized || p.1.contains(k.normalized.as_str())))
-        .map(|k| {
-            let w = config.emphasis_weight;
-            let raw = if config.checkpoint.uses_explicit_weights() && (w - 1.0).abs() > 0.01 {
-                format!("({}:{w:.2})", k.text)
-            } else {
-                k.text.clone()
-            };
-            (raw, k.normalized.clone(), false)
-        })
-        .collect();
-    parts.splice(insert_at..insert_at, missing);
-    parts.into_iter().map(|p| p.0).collect::<Vec<_>>().join(", ")
+    let at = parts.iter().take_while(|t| t.category == TokenCategory::QualityMeta).count();
+    let mut out: Vec<String> = parts.iter().map(|t| t.raw.trim().to_string()).collect();
+    out.insert(at, block.to_string());
+    out.join(", ")
 }
 
 #[cfg(test)]
@@ -814,6 +786,8 @@ mod tests {
             pose: 0,
 
             dynamic: false,
+
+            lora_tags_raw: String::new(),
 
             detail: crate::profiles::DetailLevel::Balanced,
         }
@@ -893,35 +867,37 @@ mod tests {
     }
 
     #[test]
-    fn keep_tags_are_added_when_missing() {
+    fn pinned_parts_not_in_prompt_are_never_added() {
         let mut config = cfg(TargetView::None);
-        config.pinned_emphasis_raw = "toned back, cybernetic spine".into();
+        config.pinned_emphasis_raw = "ass, toned back, cybernetic spine".into();
         let (_, out) = run("1girl, silver hair, toned back", &config);
-        assert!(out.contains("(cybernetic spine:1.25)"));
+        assert!(!out.contains("cybernetic spine"));
+        assert!(!out.contains("ass"));
         assert!(out.contains("(toned back:1.25)"));
-        assert_eq!(out.matches("toned back").count(), 1);
     }
 
     #[test]
-    fn keep_tags_beat_conflicting_tags() {
+    fn lora_tags_beat_conflicting_tags_and_stay_verbatim() {
         let mut config = cfg(TargetView::None);
-        config.pinned_emphasis_raw = "large breasts, silver hair".into();
-        let (_, out) = run("1girl, gigantic breasts, black hair, long hair, blue eyes", &config);
-        assert!(out.contains("(large breasts:1.25)") && out.contains("(silver hair:1.25)"), "{out}");
+        config.lora_tags_raw = "<lora:mewson:0.8>, mewson, large breasts, silver hair,".into();
+        let (_, out) = run("masterpiece, 1girl, gigantic breasts, black hair, long hair, blue eyes, mewson", &config);
+        let out = insert_lora_block(&out, &config, false);
+        assert!(out.contains("<lora:mewson:0.8>, mewson, large breasts, silver hair"), "{out}");
+        assert_eq!(out.matches("mewson,").count(), 1, "{out}");
         assert!(!out.contains("gigantic") && !out.contains("black hair"), "{out}");
         assert!(out.contains("long hair") && out.contains("blue eyes"), "{out}");
-        assert!(keep_conflicts("flat chest", "huge breasts"));
-        assert!(!keep_conflicts("large breasts", "breasts out"));
-        assert!(!keep_conflicts("long hair", "silver hair"));
+        assert!(tags_conflict("flat chest", "huge breasts"));
+        assert!(!tags_conflict("large breasts", "breasts out"));
+        assert!(!tags_conflict("long hair", "silver hair"));
     }
 
     #[test]
-    fn ai_prompt_honors_keep_list() {
+    fn ai_prompt_gets_the_lora_block() {
         let mut config = cfg(TargetView::None);
         config.checkpoint = CheckpointProfile::PonyV6;
-        config.pinned_emphasis_raw = "large breasts, red scarf".into();
-        let out = enforce_keep("score_9, score_8_up, 1girl, gigantic breasts, smile, red scarf", &config);
-        assert_eq!(out, "score_9, score_8_up, (large breasts:1.25), 1girl, smile, red scarf");
+        config.lora_tags_raw = "large breasts, red scarf".into();
+        let out = insert_lora_block("score_9, score_8_up, 1girl, gigantic breasts, smile, red scarf", &config, true);
+        assert_eq!(out, "score_9, score_8_up, large breasts, red scarf, 1girl, smile");
     }
 
     #[test]

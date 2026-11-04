@@ -134,6 +134,7 @@ fn scan_config(ui: &AppWindow) -> ScanConfig {
         camera_angle: ui.get_angle_index().max(0) as usize,
         pose: ui.get_pose_index().max(0) as usize,
         dynamic: ui.get_dynamic_enabled(),
+        lora_tags_raw: ui.get_lora_tags().to_string(),
         detail: crate::profiles::DetailLevel::from_index(ui.get_detail_index()),
     }
 }
@@ -181,10 +182,15 @@ fn render(ui: &AppWindow, state: &State) {
     let raw = ui.get_raw_prompt();
     let st = state.borrow();
     let all_changes: Vec<PromptChange> = st.changes.iter().chain(&st.ai_changes).cloned().collect();
-    let out = condenser::build_condensed_output(&raw, &st.base_tokens, &all_changes, &config);
+    let mut out = condenser::build_condensed_output(&raw, &st.base_tokens, &all_changes, &config);
+    // the LoRA box goes in word for word, in every view
+    let rule_prompt = out.final_prompt.clone();
+    out.final_prompt = analyzer::insert_lora_block(&out.final_prompt, &config, false);
+    (out.after_tokens, out.after_chunks) = parser::estimate_clip_tokens(&out.final_prompt);
+    let with_loras = |t: String| analyzer::insert_lora_block(&t, &config, true);
 
     // Scene analysis card + optional AI Improved view
-    let improved = st.ai_scene.as_ref().map(|sc| sc.improved_prompt.clone()).filter(|p| !p.is_empty());
+    let improved = st.ai_scene.as_ref().map(|sc| sc.improved_prompt.clone()).filter(|p| !p.is_empty()).map(with_loras);
     ui.set_ai_improved_available(improved.is_some());
     if (improved.is_none() && ui.get_after_view() == 1) || (!config.dynamic && ui.get_after_view() == 2) {
         ui.set_after_view(0);
@@ -207,11 +213,14 @@ fn render(ui: &AppWindow, state: &State) {
         let from_ai = st.ai_scene.as_ref().map(|sc| sc.dynamic_prompt.clone()).filter(|p| !p.trim().is_empty());
         match from_ai {
             Some(p) => {
+                let p = with_loras(p);
                 let groups = p.matches('{').count();
                 (p, format!("AI variations: {groups} group(s). Needs the Dynamic Prompts extension / node in ComfyUI."))
             }
             None => {
-                let (p, kinds) = dynamic::make_dynamic(&out.final_prompt);
+                // vary the rule output, never the LoRA tags
+                let (p, kinds) = dynamic::make_dynamic(&rule_prompt);
+                let p = analyzer::insert_lora_block(&p, &config, false);
                 let note = if kinds.is_empty() {
                     "Nothing to vary yet: add a pose, angle, expression or lighting tag (or run a Deep AI Scan).".to_string()
                 } else {
@@ -645,6 +654,7 @@ struct Settings {
     /// The Before prompt and the Keep & Emphasize list from the last session.
     raw_prompt: String,
     pinned_emphasis: String,
+    lora_tags: String,
 }
 
 impl Default for Settings {
@@ -658,6 +668,7 @@ impl Default for Settings {
             image_use_ai: false,
             raw_prompt: String::new(),
             pinned_emphasis: String::new(),
+            lora_tags: String::new(),
             ollama_host: "localhost:11434".into(),
         }
     }
@@ -683,6 +694,7 @@ fn load_settings(ui: &AppWindow) {
     ui.set_image_use_ai(st.image_use_ai);
     ui.set_raw_prompt(st.raw_prompt.into());
     ui.set_pinned_emphasis(st.pinned_emphasis.into());
+    ui.set_lora_tags(st.lora_tags.into());
     if !st.ollama_host.trim().is_empty() {
         ui.set_ollama_host(st.ollama_host.into());
     }
@@ -698,6 +710,7 @@ fn save_settings(ui: &AppWindow) {
         image_use_ai: ui.get_image_use_ai(),
         raw_prompt: ui.get_raw_prompt().to_string(),
         pinned_emphasis: ui.get_pinned_emphasis().to_string(),
+        lora_tags: ui.get_lora_tags().to_string(),
         ollama_host: ui.get_ollama_host().to_string(),
     };
     if let Some(path) = settings_path() {
@@ -962,41 +975,6 @@ fn main() -> Result<(), slint::PlatformError> {
             if let Some(ui) = weak.upgrade() {
                 image_extract(&ui, &state);
             }
-        });
-    }
-    {
-        let weak = ui.as_weak();
-        let state = state.clone();
-        ui.on_add_image_tags_to_keep(move || {
-            let Some(ui) = weak.upgrade() else { return };
-            // the image's tags from the active mode, minus quality / rating filler
-            let text = {
-                let st = state.borrow();
-                if ui.get_image_use_ai() {
-                    st.image_ai.as_ref().map(|r| r.prompt.clone())
-                } else {
-                    st.last_tags.as_ref().map(|t| tagger::build_prompt(t, ui.get_tag_threshold()).prompt)
-                }
-            };
-            let Some(text) = text else {
-                ui.set_status_message("Nothing extracted from the image yet.".into());
-                return;
-            };
-            let current = ui.get_pinned_emphasis().to_string();
-            let mut seen: Vec<String> = parser::parse_prompt(&current).into_iter().map(|t| t.normalized).collect();
-            let mut parts: Vec<String> = current.split(',').map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect();
-            let mut added = 0;
-            for t in parser::parse_prompt(&text) {
-                if t.category == parser::TokenCategory::QualityMeta || seen.contains(&t.normalized) {
-                    continue;
-                }
-                seen.push(t.normalized.clone());
-                parts.push(t.text.clone());
-                added += 1;
-            }
-            ui.set_pinned_emphasis(parts.join(", ").into());
-            analyze(&ui, &state);
-            ui.set_status_message(format!("Added {added} tag(s) from the image to Keep & Emphasize.").into());
         });
     }
     {

@@ -10,8 +10,7 @@ A desktop app for **ComfyUI / Stable Diffusion prompts**. Paste a prompt, and it
   - **AI Detail** dropdown: *Faithful* (fix problems only), *Balanced* (fix and fill gaps), or *Rich* (a detailed, descriptive rewrite: hair, outfit materials, pose, setting, light, camera and atmosphere, about 40–60 tags).
 - **Extracts Danbooru tags from an image** with the WD EVA02-Large tagger, which runs locally on the CPU.
   - A **Tagger / AI** switch: AI mode has Gemma 4 12B look at the image and write a full prompt in your checkpoint's style, using the tagger's tags as hints. With it on, Deep Scan reads the image first.
-  - **Add to Keep** copies the image's tags into Keep & Emphasize.
-- **Keep & Emphasize tags always win:** they're added when missing and replace contradicting tags (Keep `large breasts` replaces `gigantic breasts`), in the rule-based output and in the AI's rewrite.
+- **LoRA tags box** (under Keep & Emphasize): its tags (`<lora:…>`, trigger words, the details your LoRA needs) go into every output word for word and are never changed. They replace contradicting tags in the prompt (LoRA tag `large breasts` replaces `gigantic breasts`), in the rule-based output and in the AI's rewrite.
 - **Camera angle and pose pickers** with common prompting and photography terms (Dutch angle, worm's-eye, contrapposto, dynamic pose, …).
 - **Dynamic prompts:** an optional `{a|b|c}` variation view (pose, angle, expression, lighting) for the ComfyUI Dynamic Prompts extension.
 

@@ -683,6 +683,7 @@ export component AppWindow inherits Window {
     // Prompt & emphasis
     in-out property <string> raw_prompt: "";
     in-out property <string> pinned_emphasis: "";
+    in-out property <string> lora_tags: "";      // added to the output word for word
     in-out property <float> emphasis_weight: 1.25;
     in-out property <string> condensed_prompt: "";       // plain text, used for copy
     in-out property <string> substituted_list: "";   // tags put in place of yours
@@ -731,7 +732,6 @@ export component AppWindow inherits Window {
     callback load_image_requested();
     callback remove_image_requested();
     callback image_mode_changed();
-    callback add_image_tags_to_keep();
     callback undo_image_prompt_requested();
     callback download_tagger_requested();
     callback tag_threshold_changed();
@@ -1021,11 +1021,6 @@ export component AppWindow inherits Window {
                                         clicked => { root.image_use_ai = true; root.image_mode_changed(); }
                                     }
                                 }
-                                if root.image_loaded : PillButton {
-                                    text: "Add to Keep";
-                                    enabled: !root.tagger_busy;
-                                    clicked => { root.add_image_tags_to_keep(); }
-                                }
                                 if root.image_loaded && root.tagger_installed && !root.image_use_ai : Text {
                                     text: "Lower = more tags";
                                     font-size: 11px;
@@ -1071,6 +1066,17 @@ export component AppWindow inherits Window {
                         height: 38px;
                         placeholder-text: "Tags already in your prompt to boost, e.g. ass, toned back";
                         text <=> root.pinned_emphasis;
+                        edited => { root.analyze_requested(); }
+                    }
+                    SectionLabel {
+                        text: "LORA TAGS (ADDED WORD FOR WORD, NEVER CHANGED)";
+                        color: M3.primary;
+                    }
+                    LineEdit {
+                        font-size: 12px;
+                        height: 38px;
+                        placeholder-text: "e.g. <lora:mewson:0.8>, mewson, fox girl, large breasts";
+                        text <=> root.lora_tags;
                         edited => { root.analyze_requested(); }
                     }
                 }

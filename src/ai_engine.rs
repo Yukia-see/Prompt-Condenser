@@ -351,13 +351,7 @@ pub fn build_ai_system_and_user_prompt_for(raw_prompt: &str, config: &ScanConfig
     let pinned = if config.pinned_emphasis_raw.trim().is_empty() {
         "none".to_string()
     } else {
-        format!(
-            "{} -- HIGHEST PRIORITY. Every one of these must appear in improved_prompt (weighted {:.2}), and they \
-             override anything in the prompt that contradicts them: e.g. Keep 'large breasts' with 'gigantic breasts' \
-             in the prompt means only 'large breasts'. Never drop, soften or replace them.",
-            config.pinned_emphasis_raw.trim(),
-            config.emphasis_weight
-        )
+        format!("{} (keep them, weighted {:.2})", config.pinned_emphasis_raw.trim(), config.emphasis_weight)
     };
     let quality = config.checkpoint.canonical_quality_tags();
     let quality = if quality.is_empty() { "none (natural language only)".to_string() } else { quality.join(", ") };
@@ -396,6 +390,17 @@ pub fn build_ai_system_and_user_prompt_for(raw_prompt: &str, config: &ScanConfig
             config.target_view.system_prompt_rules()
         ),
         format!("Must keep and emphasize: {pinned}"),
+        if config.lora_tags_raw.trim().is_empty() {
+            "LoRA tags: none".to_string()
+        } else {
+            format!(
+                "LoRA tags (HIGHEST PRIORITY): {}. The app puts these into the final prompt exactly as written, so \
+                 don't repeat them in improved_prompt, but treat them as part of the scene and make sure nothing in \
+                 improved_prompt contradicts them (e.g. LoRA tag 'large breasts' with 'gigantic breasts' in the prompt \
+                 means drop 'gigantic breasts').",
+                config.lora_tags_raw.trim().trim_matches(',')
+            )
+        },
         format!("Cleanup: {cleanup}"),
     ];
     for (list, idx, what) in [
@@ -1302,8 +1307,6 @@ pub fn run_ai_scan(req: &AiScanRequest) -> Result<(AiJsonOutput, String)> {
     })?;
     let mut out = out;
     let needs_negative = !req.config.checkpoint.default_negative().is_empty();
-    // the Keep list wins, whatever the model wrote
-    out.improved_prompt = crate::analyzer::enforce_keep(&out.improved_prompt, &req.config);
     if needs_negative && out.recommended_negative.trim().is_empty() && !out.improved_prompt.trim().is_empty() {
         // The model sometimes skips the negative; a short follow-up asks for just that.
         out.recommended_negative = generate_negative(req, &out.improved_prompt).unwrap_or_default();
@@ -1461,6 +1464,8 @@ mod tests {
 
                 dynamic: false,
 
+                lora_tags_raw: String::new(),
+
                 detail: crate::profiles::DetailLevel::Balanced,
             },
             mode: AiMode::CpuOnly,
@@ -1570,6 +1575,8 @@ mod tests {
 
                 dynamic: false,
 
+                lora_tags_raw: String::new(),
+
                 detail: crate::profiles::DetailLevel::Balanced,
             },
             mode: AiMode::Gpu,
@@ -1621,6 +1628,8 @@ mod tests {
                 pose: 0,
 
                 dynamic: false,
+
+                lora_tags_raw: String::new(),
 
                 detail: crate::profiles::DetailLevel::Balanced,
             },
@@ -1675,7 +1684,7 @@ mod tests {
             let config = ScanConfig {
                 checkpoint: crate::profiles::CheckpointProfile::PonyV6, target_view: crate::profiles::TargetView::None, pinned_emphasis_raw: String::new(),
                 emphasis_weight: 1.25, cleanup_enabled: true, resolve_conflicts_enabled: true, clamp_weights_enabled: true,
-                camera_angle: 0, pose: 0, dynamic: false, detail: crate::profiles::DetailLevel::Balanced,
+                camera_angle: 0, pose: 0, dynamic: false, lora_tags_raw: String::new(), detail: crate::profiles::DetailLevel::Balanced,
             };
             let req = ImageAiRequest {
                 host: "localhost:11434".into(), model: "prompt-condenser-gemma4-12b".into(), mode: AiMode::Gpu,
@@ -1758,6 +1767,7 @@ mod tests {
                         camera_angle: std::env::var("COMPARE_ANGLE").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
                         pose: 0,
                         dynamic: std::env::var("COMPARE_DYNAMIC").is_ok(),
+                        lora_tags_raw: std::env::var("COMPARE_LORA").unwrap_or_default(),
                         detail: match std::env::var("COMPARE_DETAIL").as_deref() { Ok("rich") => crate::profiles::DetailLevel::Rich, Ok("faithful") => crate::profiles::DetailLevel::Faithful, _ => crate::profiles::DetailLevel::Balanced },
                     },
                     mode: AiMode::Gpu,
@@ -1818,6 +1828,7 @@ mod tests {
  camera_angle: 0,
  pose: 0,
  dynamic: false,
+ lora_tags_raw: String::new(),
  detail: crate::profiles::DetailLevel::Balanced,
         };
         let joined = |p: &str, v| prompt_guidance(p, &cfg(v)).join("\n");
@@ -1855,7 +1866,7 @@ mod tests {
         let mut cfg = ScanConfig {
             checkpoint: CheckpointProfile::Anima, target_view: TargetView::None, pinned_emphasis_raw: String::new(),
             emphasis_weight: 1.25, cleanup_enabled: true, resolve_conflicts_enabled: true, clamp_weights_enabled: true,
-            camera_angle: 6, pose: 0, dynamic: true, detail: crate::profiles::DetailLevel::Rich,
+            camera_angle: 6, pose: 0, dynamic: true, lora_tags_raw: String::new(), detail: crate::profiles::DetailLevel::Rich,
         };
         let p = "1girl, solo, smile, kimono, shrine, night";
         let (g, gu) = build_ai_system_and_user_prompt_for(p, &cfg, ModelFamily::Gemma);
