@@ -2,8 +2,8 @@
 # Installs ComfyUI Prompt Condenser for the current user and sets up its AI dependency:
 #   1. Ollama + Vulkan GPU support (ollama, ollama-vulkan) via pacman, service enabled
 #   2. binary -> ~/.local/bin/prompt-condenser, menu entry in ~/.local/share/applications
-#   3. bundled models (models/*.gguf) registered in Ollama as
-#      prompt-condenser-low / prompt-condenser-high
+#   3. optionally downloads the recommended AI model (Gemma 4 12B, uncensored) through
+#      Ollama as prompt-condenser-gemma4-12b (other sizes: "Download Model" in the app)
 #
 # Run from the installer bundle (scripts/build_installer.sh) or from the source tree
 # after `cargo build --release`.
@@ -28,7 +28,7 @@ if [[ "${1:-}" == "--uninstall" ]]; then
   rm -f "$BIN_DIR/prompt-condenser" "$DESKTOP_FILE"
   echo "Removed binary and menu entry."
   if command -v ollama >/dev/null && ollama_up && ask "Also remove the prompt-condenser models from Ollama?"; then
-    ollama rm prompt-condenser-low prompt-condenser-high 2>/dev/null || true
+    ollama rm prompt-condenser-gemma4-e2b-q8 prompt-condenser-gemma4-e4b prompt-condenser-gemma4-12b 2>/dev/null || true
   fi
   echo "Ollama itself was left installed (sudo pacman -R ollama-vulkan ollama to remove it)."
   exit 0
@@ -99,44 +99,19 @@ Categories=Graphics;Utility;
 DESKTOP
 command -v update-desktop-database >/dev/null && update-desktop-database "$(dirname "$DESKTOP_FILE")" >/dev/null 2>&1 || true
 
-# ---------------------------------------------------------------- bundled models -> Ollama
-register() { # register <ollama-name> <gguf path>
-  local name="$1" gguf="$2" modelfile
-  if ollama list 2>/dev/null | awk '{print $1}' | grep -qx "$name:latest"; then
-    echo "    $name already in Ollama"
-    return
-  fi
-  echo "    $name <- $(basename "$gguf")"
-  modelfile="$(mktemp)"
-  # ChatML template for Qwen2.5 (the app sends a system + user message)
-  cat > "$modelfile" <<MODELFILE
-FROM $gguf
-TEMPLATE """{{- if .System }}<|im_start|>system
-{{ .System }}<|im_end|>
-{{ end }}<|im_start|>user
-{{ .Prompt }}<|im_end|>
-<|im_start|>assistant
-"""
-PARAMETER stop <|im_end|>
-PARAMETER stop <|endoftext|>
-MODELFILE
-  ollama create "$name" -f "$modelfile"
-  rm -f "$modelfile"
-}
-
-shopt -s nullglob
-low=("$HERE"/models/*1.5B*.gguf)
-high=("$HERE"/models/*3B*.gguf)
-if (( ${#low[@]} + ${#high[@]} )); then
-  if command -v ollama >/dev/null && ollama_up; then
-    echo "==> Registering bundled models in Ollama"
-    (( ${#low[@]} )) && register prompt-condenser-low "${low[0]}"
-    (( ${#high[@]} )) && register prompt-condenser-high "${high[0]}"
+# ---------------------------------------------------------------- AI model (through Ollama)
+MODEL_NAME=prompt-condenser-gemma4-12b
+MODEL_SRC=hf.co/culturerevolt/gemma-4-12b-heretic-abliterated-GGUF:Q4_K_M
+if command -v ollama >/dev/null && ollama_up; then
+  if ollama list 2>/dev/null | awk '{print $1}' | grep -qx "$MODEL_NAME:latest"; then
+    echo "==> $MODEL_NAME is already in Ollama"
+  elif ask "Download the recommended AI model now (Gemma 4 12B uncensored, ~7.6 GB, needs ~8 GB VRAM)?"; then
+    ollama pull "$MODEL_SRC" && ollama cp "$MODEL_SRC" "$MODEL_NAME" && ollama rm "$MODEL_SRC" >/dev/null
   else
-    echo "==> Ollama isn't running, so bundled models weren't registered. Re-run install.sh once it is."
+    echo "    Skipped. Pick a model in the app and click 'Download Model' (smaller ones: Light ~3 GB, Balanced ~3.5 GB)."
   fi
 else
-  echo "==> No bundled models; use 'Download Model' in the app (Ollama downloads them)."
+  echo "==> Ollama isn't running; download a model later from the app ('Download Model')."
 fi
 
 echo

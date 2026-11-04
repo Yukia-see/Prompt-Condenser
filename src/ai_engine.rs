@@ -1406,7 +1406,7 @@ mod tests {
         let paths: Vec<&str> = log.iter().map(|(p, _)| p.as_str()).collect();
         assert_eq!(paths, ["/api/tags", "/api/generate", "/api/ps", "/api/pull", "/api/copy", "/api/delete"]);
         let copy: serde_json::Value = serde_json::from_str(&log[4].1).unwrap();
-        assert_eq!(copy["destination"], "prompt-condenser-gemma4-e2b");
+        assert_eq!(copy["destination"], AiModelTier::GemmaE2B.ollama_name());
         assert_eq!(copy["source"], AiModelTier::GemmaE2B.hf_ref());
         let generate: serde_json::Value = serde_json::from_str(&log[1].1).unwrap();
         assert_eq!(generate["format"]["properties"]["changes"]["type"], "array");
@@ -1486,7 +1486,6 @@ mod tests {
             Ok("e2b") => AiModelTier::GemmaE2B,
             Ok("e4b") => AiModelTier::GemmaE4B,
             Ok("gemma12") => AiModelTier::Gemma12,
-            Ok("gemma12q6") => AiModelTier::Gemma12Q6,
             _ => AiModelTier::Gemma12,
         };
         let (tx, rx) = std::sync::mpsc::channel::<String>();

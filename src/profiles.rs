@@ -312,56 +312,50 @@ impl AiMode {
 /// under short names. (Qwen2.5 / Qwen3 / Qwen3.5 were tried and lost to Gemma.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AiModelTier {
-    /// Gemma 4 E2B (~2B active), for low-VRAM machines.
+    /// Gemma 4 E2B (~2B active) at Q8: small models lose more to compression, and Q8
+    /// fixed Q4's habit of softening explicit prompts, for under 1 GB more.
     GemmaE2B,
     /// Gemma 4 E4B (~4B active).
     GemmaE4B,
     /// Gemma 4 12B Q4: the recommended default.
     Gemma12,
-    /// Gemma 4 12B Q6_K: slightly more faithful, slower, ~10.7 GB.
-    Gemma12Q6,
 }
 
 impl AiModelTier {
     /// Dropdown order, lightest to best: the app selects the last installed one by default.
-    pub const ALL: [AiModelTier; 4] = [Self::GemmaE2B, Self::GemmaE4B, Self::Gemma12, Self::Gemma12Q6];
+    pub const ALL: [AiModelTier; 3] = [Self::GemmaE2B, Self::GemmaE4B, Self::Gemma12];
 
     pub fn label(&self) -> &'static str {
         match self {
-            Self::GemmaE2B => "Light — Gemma 4 E2B (~4 GB VRAM)",
-            Self::GemmaE4B => "Balanced — Gemma 4 E4B (~6 GB VRAM)",
-            Self::Gemma12 => "Maximum Fast — Gemma 4 12B Q4 (~9 GB VRAM)",
-            Self::Gemma12Q6 => "Maximum Detailed — Gemma 4 12B Q6 (~11 GB VRAM)",
+            Self::GemmaE2B => "Light — Gemma 4 E2B Q8 (~3 GB VRAM)",
+            Self::GemmaE4B => "Balanced — Gemma 4 E4B (~3.5 GB VRAM)",
+            Self::Gemma12 => "Maximum Fast — Gemma 4 12B Q4 (~8 GB VRAM)",
         }
     }
 
     /// Name the model has inside Ollama (set by `install.sh` or the in-app download).
     pub fn ollama_name(&self) -> &'static str {
         match self {
-            Self::GemmaE2B => "prompt-condenser-gemma4-e2b",
+            Self::GemmaE2B => "prompt-condenser-gemma4-e2b-q8",
             Self::GemmaE4B => "prompt-condenser-gemma4-e4b",
             Self::Gemma12 => "prompt-condenser-gemma4-12b",
-            Self::Gemma12Q6 => "prompt-condenser-gemma4-12b-q6",
         }
     }
 
-    /// How long Ollama keeps the model loaded after a scan. The biggest tier is freed
-    /// quickly: on shared-memory GPUs (like the BC-250) it would otherwise starve system RAM.
+    /// How long Ollama keeps the model loaded after a scan, so the next scan starts
+    /// instantly. (All current tiers fit comfortably; shorten this for bigger models on
+    /// shared-memory GPUs, where a loaded model takes system RAM.)
     pub fn keep_alive(&self) -> &'static str {
-        match self {
-            Self::Gemma12Q6 => "2m",
-            _ => "30m",
-        }
+        "30m"
     }
 
     /// Where Ollama downloads it from. The E2B/E4B builds are text-only (no 1 GB image
     /// projector), which keeps their memory use down.
     pub fn hf_ref(&self) -> &'static str {
         match self {
-            Self::GemmaE2B => "hf.co/TrevorJS/gemma-4-E2B-it-uncensored-GGUF:Q4_K_M",
+            Self::GemmaE2B => "hf.co/TrevorJS/gemma-4-E2B-it-uncensored-GGUF:Q8_0",
             Self::GemmaE4B => "hf.co/TrevorJS/gemma-4-E4B-it-uncensored-GGUF:Q4_K_M",
             Self::Gemma12 => "hf.co/culturerevolt/gemma-4-12b-heretic-abliterated-GGUF:Q4_K_M",
-            Self::Gemma12Q6 => "hf.co/culturerevolt/gemma-4-12b-heretic-abliterated-GGUF:Q6_K",
         }
     }
 }
