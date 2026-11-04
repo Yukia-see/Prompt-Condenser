@@ -48,7 +48,10 @@ pub fn build_condensed_output(
                             && t.normalized != "upper body"
                             && t.normalized != "portrait"
                             && t.normalized != "close-up"
+                            && t.normalized != "close up"
                             && t.normalized != "front view"
+                            && t.normalized != "from behind"
+                            && t.normalized != "back view"
                     });
 
                     result_tokens.push(PromptToken {
@@ -349,7 +352,17 @@ fn apply_ai_card(tokens: &mut Vec<PromptToken>, ch: &PromptChange) {
             tokens.retain(|t| !targets.contains(&t.normalized));
             insert(tokens, &ch.suggested_alternative);
         }
-        1 => insert(tokens, &ch.framing_alternative),
+        1 if !ch.framing_alternative.is_empty() => {
+            let new_framing: HashSet<String> = parse_prompt(&ch.framing_alternative).into_iter().map(|t| t.normalized).collect();
+            tokens.retain(|t| {
+                new_framing.contains(&t.normalized)
+                    || !matches!(
+                        t.normalized.as_str(),
+                        "upper body" | "portrait" | "close-up" | "close up" | "front view" | "from behind" | "back view"
+                    )
+            });
+            insert(tokens, &ch.framing_alternative);
+        }
         _ => {}
     }
 }
@@ -383,7 +396,14 @@ pub fn tidy_ai_prompt(text: &str, checkpoint: CheckpointProfile) -> String {
     let mut seen = HashSet::new();
     tokens
         .into_iter()
-        .filter(|t| seen.insert(t.normalized.clone()))
+        .filter(|t| {
+            // with two characters, each side of BREAK may repeat a tag ("smile")
+            if t.normalized == "break" {
+                seen.clear();
+                return true;
+            }
+            seen.insert(t.normalized.clone())
+        })
         .map(|mut t| {
             if t.category == TokenCategory::QualityMeta {
                 t.weight = 1.0; // quality tags don't need weights
@@ -452,7 +472,12 @@ pub fn recommended_negative(config: &ScanConfig, positive: &str) -> String {
     if config.checkpoint.default_negative().is_empty() {
         return String::new();
     }
-    let base = format!("{}, {}", config.checkpoint.default_negative(), config.target_view.negative_tags());
+    let view_negs = config.target_view.negative_tags();
+    let base = if view_negs.is_empty() {
+        config.checkpoint.default_negative().to_string()
+    } else {
+        format!("{}, {}", config.checkpoint.default_negative(), view_negs)
+    };
     merge_negative(&base, positive)
 }
 
@@ -488,8 +513,8 @@ const NEGATIVE_CONFLICTS: &[(&[&str], &[&str])] = &[
 ];
 
 fn contradicts_positive(negative_tag: &str, positive: &HashSet<String>) -> bool {
-    // "people"/"person" would suppress the prompt's own character
-    if matches!(negative_tag, "people" | "person" | "human" | "humans" | "woman" | "girl")
+    // "people"/"person"/"man"/"woman" would suppress the prompt's own character
+    if matches!(negative_tag, "people" | "person" | "human" | "humans" | "woman" | "girl" | "man" | "boy")
         && positive.iter().any(|p| p.ends_with("girl") || p.ends_with("boy") || p.ends_with("girls") || p.ends_with("boys") || p == "solo")
     {
         return true;

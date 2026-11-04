@@ -56,10 +56,9 @@ impl CheckpointProfile {
     pub fn system_prompt_rules(&self) -> &'static str {
         match self {
             Self::Anima => {
-                "Anima supports BOTH concise Danbooru tags AND natural-language descriptive clauses. \
-                 Keep core quality/subject/character tags at the start, followed by clean natural-language \
-                 or hybrid tag descriptions for pose, emphasized body features, and scene. \
-                 Use (feature:weight) for emphasized parts."
+                "Anima uses 'masterpiece, best quality' at the start, followed by clean comma-separated Danbooru tags \
+                 and concise descriptive tag phrases for subject, traits, pose, emphasized body features, clothing, and \
+                 scene (no Pony score_9 tags). Use (feature:weight) up to 1.35 for emphasized parts."
             }
             Self::PonyV6 => {
                 "Pony V6 XL requires 'score_9, score_8_up, score_7_up' at the very start. \
@@ -134,7 +133,7 @@ impl CheckpointProfile {
             "award winning",
             "award-winning",
             "trending on artstation",
-            " trending on pixiv",
+            "trending on pixiv",
             "unreal engine",
             "unreal engine 5",
             "octane render",
@@ -174,9 +173,14 @@ impl CheckpointProfile {
                 || normalized.starts_with("score_7")
                 || normalized.starts_with("score_6"))
         {
+            let suggestion = match self {
+                Self::Flux => "",
+                Self::Illustrious => "masterpiece, best quality, absurdres",
+                _ => "masterpiece, best quality",
+            };
             return Some((
                 "Pony score tags ('score_9...') have no effect or add noise on non-Pony checkpoints.",
-                "masterpiece, best quality",
+                suggestion,
             ));
         }
 
@@ -383,6 +387,20 @@ pub const CAMERA_ANGLES: &[(&str, &str)] = &[
     ("Random angle (dynamic prompt)", "{from above|from below|dutch angle|three-quarter view|from side|straight-on}"),
 ];
 
+/// Camera framing for one character in the Scene Panel (dropdown label, tags). Index 0 = none.
+pub const VIEWS: &[(&str, &str)] = &[
+    ("None (keep the prompt's framing)", ""),
+    ("Close-up / portrait", "portrait, close-up"),
+    ("Upper body", "upper body"),
+    ("Cowboy shot (thighs up)", "cowboy shot"),
+    ("Full body", "full body"),
+    ("Lower body", "lower body"),
+    ("Front view", "front view"),
+    ("From behind", "from behind, back view"),
+    ("Side profile", "from side, profile"),
+    ("Wide shot (small in frame)", "wide shot"),
+];
+
 /// Body positions and poses (prompting + photography). (dropdown label, tags). Index 0 = none.
 pub const POSES: &[(&str, &str)] = &[
     ("None (keep the prompt's pose)", ""),
@@ -459,5 +477,29 @@ impl DetailLevel {
             2 => Self::Rich,
             _ => Self::Balanced,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bloat_tag_detection() {
+        let sd = CheckpointProfile::Sd15;
+        assert!(sd.check_bloat_tag("trending on pixiv").is_some());
+        assert!(sd.check_bloat_tag("trending on artstation").is_some());
+
+        let flux = CheckpointProfile::Flux;
+        let (_, sug) = flux.check_bloat_tag("score_9").expect("Pony score tag on Flux is bloat");
+        assert_eq!(sug, "", "Flux should not suggest quality tags");
+
+        let ill = CheckpointProfile::Illustrious;
+        let (_, sug) = ill.check_bloat_tag("score_9").expect("Pony score tag on Illustrious is bloat");
+        assert_eq!(sug, "masterpiece, best quality, absurdres");
+
+        let pony = CheckpointProfile::PonyV6;
+        assert!(pony.check_bloat_tag("score_9").is_none());
+        assert!(pony.check_bloat_tag("masterpiece").is_some());
     }
 }

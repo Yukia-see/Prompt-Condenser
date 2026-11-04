@@ -84,6 +84,20 @@ pub fn list() -> Result<&'static TagList> {
     Ok(LIST.get_or_init(|| parse(&text)))
 }
 
+/// The tag list if it's already loaded or on disk (never downloads; safe on the UI thread).
+pub fn local() -> Option<&'static TagList> {
+    if let Some(l) = LIST.get() {
+        return Some(l);
+    }
+    let text = std::fs::read_to_string(csv_path()).ok()?;
+    Some(LIST.get_or_init(|| parse(&text)))
+}
+
+/// True for a Danbooru character name ("hatsune miku", "rouge the bat").
+pub fn is_character(tag: &str) -> bool {
+    local().and_then(|l| l.get(tag)).map(|t| t.character).unwrap_or(false)
+}
+
 const STOPWORDS: &[&str] = &[
     "the", "and", "with", "her", "his", "their", "she", "him", "they", "that", "this", "from", "into", "onto",
     "over", "under", "while", "who", "which", "very", "some", "for", "are", "was", "is", "its", "has", "have",

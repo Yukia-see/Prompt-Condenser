@@ -1,13 +1,13 @@
 [package]
 name = "prompt-condenser"
-version = "0.3.4"
+version = "0.4.0"
 edition = "2021"
 description = "ComfyUI Prompt Condenser, Organizer & Framing Conflict Scanner with Cross-Vendor AI"
 
 [dependencies]
 slint = "1.9"
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde_json = { version = "1.0", features = ["preserve_order"] }
 arboard = "3.4"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }
 anyhow = "1.0"

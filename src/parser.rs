@@ -264,6 +264,14 @@ fn is_outer_pair_matching(s: &str, open: char, close: char) -> bool {
     depth == 0
 }
 
+/// Does `text` contain `phrase` as whole words? ("night" is in "night sky" and "at night",
+/// not in "knight"; "close-up" matches "close up".)
+pub fn has_phrase(text: &str, phrase: &str) -> bool {
+    let words = |s: &str| s.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).map(str::to_lowercase).collect::<Vec<_>>();
+    let (hay, needle) = (words(text), words(phrase));
+    !needle.is_empty() && hay.windows(needle.len()).any(|w| w == needle.as_slice())
+}
+
 pub fn categorize_token(raw_text: &str, normalized: &str) -> TokenCategory {
     if normalized == "break" || raw_text.starts_with('<') {
         return TokenCategory::LoraOrSpecial;
@@ -350,7 +358,7 @@ pub fn categorize_token(raw_text: &str, normalized: &str) -> TokenCategory {
         "wide shot",
         "cropped",
     ];
-    if framing_keywords.iter().any(|k| normalized.contains(k)) {
+    if framing_keywords.iter().any(|k| has_phrase(normalized, k)) {
         return TokenCategory::FramingPose;
     }
 
@@ -390,7 +398,8 @@ pub fn categorize_token(raw_text: &str, normalized: &str) -> TokenCategory {
         "physique",
         "silhouette",
     ];
-    if body_keywords.iter().any(|k| normalized.contains(k)) {
+    // whole words only: "ass" isn't in "glasses" or "grass", "back" isn't "background"
+    if body_keywords.iter().any(|k| has_phrase(normalized, k)) {
         return TokenCategory::CharacterBody;
     }
 
@@ -417,7 +426,8 @@ pub fn categorize_token(raw_text: &str, normalized: &str) -> TokenCategory {
         "shadows",
         "rim lighting",
     ];
-    if env_keywords.iter().any(|k| normalized.contains(k)) {
+    // whole words: "night" isn't in "knight" or "nightgown", "street" isn't "streetwear"
+    if env_keywords.iter().any(|k| has_phrase(normalized, k)) {
         return TokenCategory::EnvironmentLighting;
     }
 
@@ -442,6 +452,31 @@ pub fn estimate_clip_tokens(prompt: &str) -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn framing_and_scene_words_match_whole_words() {
+        for tag in ["knight", "nightgown", "streetwear", "flying", "electricity", "broom"] {
+            let c = categorize_token(tag, tag);
+            assert!(c != TokenCategory::EnvironmentLighting && c != TokenCategory::FramingPose, "{tag} -> {c:?}");
+        }
+        for (tag, want) in [("night", TokenCategory::EnvironmentLighting), ("night sky", TokenCategory::EnvironmentLighting),
+            ("sitting on chair", TokenCategory::FramingPose), ("close-up", TokenCategory::FramingPose),
+            ("cinematic lighting", TokenCategory::EnvironmentLighting)]
+        {
+            assert_eq!(categorize_token(tag, tag), want, "{tag}");
+        }
+        assert!(has_phrase("close-up shot", "close up"));
+    }
+
+    #[test]
+    fn body_words_match_whole_words() {
+        for tag in ["glasses", "grass", "classroom", "background", "backlighting", "detailed", "tears"] {
+            assert_ne!(categorize_token(tag, tag), TokenCategory::CharacterBody, "{tag}");
+        }
+        for tag in ["ass", "large breasts", "thick thighs", "long hair", "fox tail", "toned back"] {
+            assert_eq!(categorize_token(tag, tag), TokenCategory::CharacterBody, "{tag}");
+        }
+    }
 
     #[test]
     fn parses_weights_loras_and_nesting() {

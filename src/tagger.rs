@@ -91,9 +91,21 @@ pub fn download(progress: Sender<String>) -> Result<()> {
     Ok(())
 }
 
+/// ONNX Runtime allows one environment per process; the tagger and the person
+/// detector share it. It lives for the whole run, so it outlives every session.
+static ENV: std::sync::OnceLock<ort::environment::Environment> = std::sync::OnceLock::new();
+static ENV_INIT: Mutex<()> = Mutex::new(());
+
+pub(crate) fn ort_env() -> Result<&'static ort::environment::Environment> {
+    let _guard = ENV_INIT.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(env) = ENV.get() {
+        return Ok(env);
+    }
+    let env = ort::init().with_name("prompt-condenser").build()?;
+    Ok(ENV.get_or_init(|| env))
+}
+
 struct Loaded {
-    /// The ONNX Runtime environment must outlive the session.
-    _env: ort::environment::Environment,
     session: Session,
     tags: Vec<(String, TagKind)>,
 }
@@ -122,8 +134,8 @@ fn load_tags(path: &Path) -> Result<Vec<(String, TagKind)>> {
 }
 
 /// WD v3 preprocessing: pad to a white square, resize to 448, BGR, 0-255, NHWC.
-fn preprocess(path: &Path) -> Result<Vec<f32>> {
-    let img = image::open(path).with_context(|| format!("Couldn't open {}", path.display()))?.to_rgba8();
+fn preprocess(img: &image::DynamicImage) -> Result<Vec<f32>> {
+    let img = img.to_rgba8();
     let side = img.width().max(img.height());
     let mut canvas = image::RgbaImage::from_pixel(side, side, image::Rgba([255, 255, 255, 255]));
     image::imageops::overlay(
@@ -142,35 +154,91 @@ fn preprocess(path: &Path) -> Result<Vec<f32>> {
 
 /// Scores every Danbooru tag for the image.
 pub fn tag_image(path: &Path) -> Result<Vec<ScoredTag>> {
+    let img = image::open(path).with_context(|| format!("Couldn't open {}", path.display()))?;
+    tag_dynamic(&img)
+}
+
+/// Scores every Danbooru tag for an image already in memory (e.g. one character's crop).
+pub fn tag_dynamic(img: &image::DynamicImage) -> Result<Vec<ScoredTag>> {
+    Ok(tag_many(&[img])?.remove(0))
+}
+
+/// Tags several images in one run of the model. (Batching measured ~5x slower than
+/// one at a time on this CPU with little free memory, so callers tag one by one.)
+fn tag_many(imgs: &[&image::DynamicImage]) -> Result<Vec<Vec<ScoredTag>>> {
     if !is_installed() {
         return Err(anyhow!("The Danbooru tagger isn't downloaded yet."));
     }
-    let input = preprocess(path)?;
+    let mut input = Vec::with_capacity(imgs.len() * (INPUT_SIZE * INPUT_SIZE * 3) as usize);
+    for img in imgs {
+        input.extend(preprocess(img)?);
+    }
+    with_model(|loaded| {
+        let n = imgs.len();
+        let tensor = Tensor::from_array(([n, INPUT_SIZE as usize, INPUT_SIZE as usize, 3], input.into_boxed_slice()))?;
+        let outputs = loaded.session.run(ort::inputs![tensor])?;
+        let (_, scores) = outputs[0].try_extract_tensor::<f32>()?;
+        let per = loaded.tags.len();
+        Ok((0..n)
+            .map(|i| {
+                loaded
+                    .tags
+                    .iter()
+                    .zip(scores[i * per..(i + 1) * per].iter())
+                    .map(|((name, kind), &score)| ScoredTag { name: name.clone(), kind: *kind, score })
+                    .collect()
+            })
+            .collect())
+    })
+}
+
+fn with_model<T>(f: impl FnOnce(&mut Loaded) -> Result<T>) -> Result<T> {
     let mut guard = MODEL.lock().unwrap_or_else(|e| e.into_inner());
     if guard.is_none() {
         let dir = tagger_dir();
         let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-        let env = ort::init().with_name("prompt-condenser").build()?;
-        let session = Session::builder(&env)?
+        let session = Session::builder(ort_env()?)?
             .with_optimization_level(GraphOptimizationLevel::Level3)
             .map_err(|e| anyhow!("{e}"))?
             .with_intra_threads(threads)
             .map_err(|e| anyhow!("{e}"))?
             .commit_from_file(dir.join("model.onnx"))
             .context("Couldn't load the tagger model")?;
-        *guard = Some(Loaded { _env: env, session, tags: load_tags(&dir.join("selected_tags.csv"))? });
+        *guard = Some(Loaded { session, tags: load_tags(&dir.join("selected_tags.csv"))? });
     }
-    let loaded = guard.as_mut().expect("just loaded");
+    f(guard.as_mut().expect("just loaded"))
+}
 
-    let tensor = Tensor::from_array(([1usize, INPUT_SIZE as usize, INPUT_SIZE as usize, 3], input.into_boxed_slice()))?;
-    let outputs = loaded.session.run(ort::inputs![tensor])?;
-    let (_, scores) = outputs[0].try_extract_tensor::<f32>()?;
-    Ok(loaded
-        .tags
-        .iter()
-        .zip(scores.iter())
-        .map(|((name, kind), &score)| ScoredTag { name: name.clone(), kind: *kind, score })
-        .collect())
+/// Adds what a zoomed-in crop (`detector::upper_crop`) sees better: only confident
+/// (>= 0.55) appearance tags (hair, eyes, traits, body, outfit, expression). Framing,
+/// count and setting tags from the crop are ignored, since zooming in changes those.
+pub fn merge_detail_crop(base: &[ScoredTag], detail: &[ScoredTag]) -> Vec<ScoredTag> {
+    use crate::scene::Slot;
+    let mut out = base.to_vec();
+    for d in detail.iter().filter(|d| d.kind == TagKind::General && d.score >= 0.55) {
+        let prompt = to_prompt_tag(&d.name);
+        let Some(t) = crate::parser::parse_prompt(&prompt).into_iter().next() else { continue };
+        let detail_slot = matches!(
+            crate::scene::slot(&t),
+            // Other = details the keyword lists don't know (accessories, markings);
+            // framing, setting and light have their own slots and stay out
+            Slot::Hair | Slot::Eyes | Slot::Traits | Slot::Body | Slot::Outfit | Slot::Expression | Slot::Other
+        );
+        // zooming in makes the body look bigger, so sizes and proportions come from the
+        // full view only
+        if !detail_slot
+            || crate::two::count_tag(&t.normalized).is_some()
+            || t.normalized == "solo"
+            || crate::analyzer::is_size_tag(&t.normalized)
+        {
+            continue;
+        }
+        match out.iter_mut().find(|b| b.name == d.name) {
+            Some(b) => b.score = b.score.max(d.score),
+            None => out.push(d.clone()),
+        }
+    }
+    out
 }
 
 /// Emoticon tags keep their underscores (`^_^`, `>_<`...).
@@ -201,6 +269,16 @@ pub fn build_prompt(scores: &[ScoredTag], general_threshold: f32) -> TagPrompt {
         scores.iter().filter(|t| t.kind == TagKind::General && t.score >= general_threshold).collect();
     characters.sort_by(|a, b| b.score.total_cmp(&a.score));
     general.sort_by(|a, b| b.score.total_cmp(&a.score));
+    // the tagger scores each size on its own, so "medium breasts" and "large breasts"
+    // can both pass: keep only the most confident one (the list is sorted by score)
+    let mut picked: Vec<&ScoredTag> = Vec::new();
+    for t in general {
+        let n = crate::danbooru::key(&t.name);
+        if !picked.iter().any(|p| crate::analyzer::size_conflict(&crate::danbooru::key(&p.name), &n)) {
+            picked.push(t);
+        }
+    }
+    let general = picked;
     let rating = scores
         .iter()
         .filter(|t| t.kind == TagKind::Rating)
@@ -218,6 +296,31 @@ pub fn build_prompt(scores: &[ScoredTag], general_threshold: f32) -> TagPrompt {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detail_crop_adds_details_but_not_framing() {
+        let t = |name: &str, score| ScoredTag { name: name.into(), kind: TagKind::General, score };
+        let base = vec![t("1girl", 0.9), t("full_body", 0.8), t("thick_eyebrows", 0.2), t("glasses", 0.3)];
+        let detail = vec![
+            t("portrait", 0.9), t("close-up", 0.8), t("upper_body", 0.9), t("solo", 0.9), t("simple_background", 0.7),
+            t("thick_eyebrows", 0.7), t("glasses", 0.5), t("hair_ornament", 0.8),
+        ];
+        let m = merge_detail_crop(&base, &detail);
+        let score = |n: &str| m.iter().find(|x| x.name == n).map(|x| x.score);
+        assert_eq!(score("thick_eyebrows"), Some(0.7));
+        assert_eq!(score("glasses"), Some(0.3)); // below 0.55 in the crop: unchanged
+        assert_eq!(score("hair_ornament"), Some(0.8));
+        for n in ["portrait", "close-up", "upper_body", "simple_background"] {
+            assert_eq!(score(n), None, "{n}");
+        }
+        assert_eq!(score("full_body"), Some(0.8));
+        // no sizes from the zoomed crop
+        let m = merge_detail_crop(&base, &[t("large_breasts", 0.9)]);
+        assert!(m.iter().all(|x| x.name != "large_breasts"));
+        // one size per body part in the prompt: the most confident
+        let p = build_prompt(&[t("medium_breasts", 0.5), t("large_breasts", 0.7), t("long_hair", 0.9), t("very_long_hair", 0.6)], 0.35);
+        assert_eq!(p.prompt, "long hair, large breasts, very long hair");
+    }
 
     #[test]
     fn danbooru_names_become_prompt_tags() {

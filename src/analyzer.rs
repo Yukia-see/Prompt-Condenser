@@ -16,6 +16,8 @@ pub enum ChangeAction {
     AngleChoice,
     /// Tags set by the pose dropdown.
     PoseChoice,
+    /// Two sizes / lengths for the same thing (medium + large breasts).
+    SizeConflict,
 }
 
 impl ChangeAction {
@@ -27,6 +29,7 @@ impl ChangeAction {
             Self::MergedDuplicate => "DUPLICATE",
             Self::WeightClamped => "WEIGHT CLAMPED",
             Self::KeptEmphasized => "KEPT & EMPHASIZED",
+            Self::SizeConflict => "SIZE CONFLICT",
             Self::AiRewrite => "AI SUGGESTION",
             Self::AngleChoice => "CAMERA ANGLE",
             Self::PoseChoice => "POSE",
@@ -69,8 +72,45 @@ pub struct ScanConfig {
     pub arranged: bool,
     /// Add natural-language sentences (only where the checkpoint understands them).
     pub natural: bool,
+    /// The 2 Characters tab: Before is character 1 + the scene, plus a second prompt.
+    pub two_char: bool,
+    /// Character 2's prompt and LoRA box (2 Characters tab only).
+    pub char2_prompt_raw: String,
+    pub char2_lora_tags_raw: String,
+    /// Put BREAK between the two characters (CLIP checkpoints only).
+    pub char_break: bool,
+    /// The Scene box (2 Characters tab): setting, camera, light, mood, interaction.
+    /// Its tags are always shared, never one character's.
+    pub scene_prompt_raw: String,
+    /// Characters 3 and 4 (3 / 4 Characters tabs): (prompt, LoRA box).
+    pub more_chars: Vec<(String, String)>,
     /// How much the deep scan may enrich the prompt.
     pub detail: crate::profiles::DetailLevel,
+}
+
+impl ScanConfig {
+    /// How many characters the tab has (1 on the 1 Character tab).
+    pub fn char_count(&self) -> usize {
+        if self.two_char { 2 + self.more_chars.len() } else { 1 }
+    }
+
+    /// Character `i`'s LoRA box (0-based).
+    pub fn lora_of(&self, i: usize) -> &str {
+        match i {
+            0 => &self.lora_tags_raw,
+            1 => &self.char2_lora_tags_raw,
+            n => self.more_chars.get(n - 2).map(|c| c.1.as_str()).unwrap_or(""),
+        }
+    }
+
+    /// Character `i`'s prompt for characters 2 and up (character 1's is the Before box).
+    pub fn prompt_of(&self, i: usize) -> &str {
+        match i {
+            1 => &self.char2_prompt_raw,
+            n if n >= 2 => self.more_chars.get(n - 2).map(|c| c.0.as_str()).unwrap_or(""),
+            _ => "",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -407,7 +447,7 @@ pub fn analyze_with_rules(tokens: &[PromptToken], config: &ScanConfig) -> RuleAn
         let mut tok = token.clone();
         let is_pinned = pinned_norms
             .iter()
-            .any(|p| tok.normalized == *p || tok.normalized.contains(p.as_str()));
+            .any(|p| tok.normalized == *p || crate::parser::has_phrase(&tok.normalized, p));
 
         // 1. Check exact duplicates (when cleanup is enabled)
         if config.cleanup_enabled
@@ -697,11 +737,101 @@ pub fn analyze_with_rules(tokens: &[PromptToken], config: &ScanConfig) -> RuleAn
         next_change_id += 1;
     }
 
+    // Two sizes for the same body part (or two hair lengths) can't both be right:
+    // keep the one written first, with a card to bring the other back.
+    if config.resolve_conflicts_enabled {
+        let mut kept: Vec<PromptToken> = Vec::new();
+        for t in processed_tokens {
+            match kept.iter().find(|k| size_conflict(&k.normalized, &t.normalized)) {
+                Some(k) => {
+                    changes.push(PromptChange {
+                        id: next_change_id,
+                        original: t.text.clone(),
+                        action: ChangeAction::SizeConflict,
+                        reason: format!("'{}' and '{}' contradict each other; kept '{}', written first.", k.text, t.text, k.text),
+                        suggested_alternative: String::new(),
+                        framing_alternative: String::new(),
+                        mode: 0,
+                    });
+                    next_change_id += 1;
+                }
+                None => kept.push(t),
+            }
+        }
+        processed_tokens = kept;
+
+        // A slender body type next to a big chest / hips: Danbooru's "petite" (and slim,
+        // slender, skinny) comes with a small chest in training, so the model shrinks
+        // "large breasts". "short" keeps a height difference without that pull.
+        let curvy = processed_tokens.iter().any(|t| is_big_body_tag(&t.normalized));
+        if curvy {
+            for t in processed_tokens.iter_mut() {
+                if !SLENDER_TAGS.contains(&t.normalized.as_str()) {
+                    continue;
+                }
+                let original = t.text.clone();
+                let swap = if original == "petite" { "short" } else { "" };
+                changes.push(PromptChange {
+                    id: next_change_id,
+                    original: original.clone(),
+                    action: ChangeAction::SizeConflict,
+                    reason: format!(
+                        "'{original}' means a small, slender body, so the model shrinks the chest / hips you asked for. {}",
+                        if swap.is_empty() { "Removed.".to_string() } else { format!("Replaced with '{swap}' to keep the height.") }
+                    ),
+                    suggested_alternative: swap.to_string(),
+                    framing_alternative: String::new(),
+                    mode: 0,
+                });
+                next_change_id += 1;
+                t.text = swap.to_string();
+                t.raw = swap.to_string();
+                t.normalized = swap.to_string();
+                t.replaced = true;
+            }
+            processed_tokens.retain(|t| !t.normalized.is_empty());
+        }
+    }
+
     RuleAnalysisResult {
         processed_tokens,
         changes,
         active_framing_detected: effective_view,
     }
+}
+
+/// The same body-type fix for text the AI wrote: within one character's tags, a slender
+/// tag next to a big chest / hips goes ("petite" becomes "short").
+pub fn fix_body_type(tokens: Vec<PromptToken>) -> Vec<PromptToken> {
+    if !tokens.iter().any(|t| is_big_body_tag(&t.normalized)) {
+        return tokens;
+    }
+    tokens
+        .into_iter()
+        .filter_map(|mut t| {
+            if !SLENDER_TAGS.contains(&t.normalized.as_str()) {
+                return Some(t);
+            }
+            if t.normalized != "petite" {
+                return None;
+            }
+            t.text = "short".into();
+            t.raw = "short".into();
+            t.normalized = "short".into();
+            Some(t)
+        })
+        .collect()
+}
+
+/// Body-type tags that pull toward a small, slender figure.
+const SLENDER_TAGS: &[&str] = &["petite", "slim", "slender", "skinny", "thin"];
+
+/// Tags asking for a big chest, hips or a curvy figure.
+pub fn is_big_body_tag(n: &str) -> bool {
+    let w: Vec<&str> = n.split_whitespace().collect();
+    let big = w.iter().any(|x| matches!(*x, "large" | "huge" | "gigantic" | "big" | "enormous" | "massive" | "wide" | "thick"));
+    let part = w.last().map(|x| matches!(*x, "breasts" | "ass" | "hips" | "thighs" | "butt")).unwrap_or(false);
+    (big && part) || matches!(n, "curvy" | "voluptuous" | "plump" | "hourglass figure" | "busty")
 }
 
 /// Words that set one attribute of a body part or feature. Two tags about the same thing
@@ -731,6 +861,30 @@ fn head_word(word: &str) -> &str {
 /// different value ("gigantic breasts" vs "large breasts", "black hair" vs "silver hair").
 /// Long clauses (prose) are never treated as conflicts.
 pub fn tags_conflict(keep: &str, tag: &str) -> bool {
+    attribute_conflict(keep, tag, &[SIZE_WORDS, LENGTH_WORDS, COLOR_WORDS])
+}
+
+/// Two sizes or lengths of the same thing: "medium breasts" / "large breasts",
+/// "flat chest" / "huge breasts", "short hair" / "long hair". Colors don't count
+/// (multicolored or streaked hair really has two), and "long hair" + "very long hair"
+/// is how Danbooru tags it, so that pair is fine.
+pub fn size_conflict(a: &str, b: &str) -> bool {
+    attribute_conflict(a, b, &[SIZE_WORDS, LENGTH_WORDS])
+}
+
+/// A body size or proportion tag ("large breasts", "thick thighs", "wide hips"), not
+/// a face detail like "thick eyebrows".
+pub fn is_size_tag(tag: &str) -> bool {
+    const BODY: &[&str] = &[
+        "breasts", "ass", "hips", "thighs", "waist", "figure", "body", "belly", "stomach", "penis", "testicles",
+        "areolae", "nipples", "legs", "arms", "shoulders", "muscles",
+    ];
+    let words: Vec<&str> = tag.split_whitespace().collect();
+    let Some(last) = words.last() else { return false };
+    words.len() <= 3 && BODY.contains(&head_word(last)) && words.iter().any(|w| SIZE_WORDS.contains(w))
+}
+
+fn attribute_conflict(keep: &str, tag: &str, classes: &[&[&str]]) -> bool {
     if keep == tag || tag.contains(keep) || keep.contains(tag) {
         return false;
     }
@@ -743,9 +897,7 @@ pub fn tags_conflict(keep: &str, tag: &str) -> bool {
         return false;
     }
     let (km, tm) = (&kw[..kw.len() - 1], &tw[..tw.len() - 1]);
-    [SIZE_WORDS, LENGTH_WORDS, COLOR_WORDS]
-        .iter()
-        .any(|class| km.iter().any(|w| class.contains(w)) && tm.iter().any(|w| class.contains(w)))
+    classes.iter().any(|class| km.iter().any(|w| class.contains(w)) && tm.iter().any(|w| class.contains(w)))
 }
 
 /// Puts the LoRA box's text into a finished prompt word for word, right after the
@@ -767,8 +919,16 @@ pub fn insert_lora_block(text: &str, config: &ScanConfig, strip_conflicts: bool)
 /// The prompt's tags minus copies of the LoRA box's tags (and, with `strip_conflicts`,
 /// minus tags that contradict them).
 pub fn without_lora_tags(text: &str, config: &ScanConfig, strip_conflicts: bool) -> Vec<PromptToken> {
-    let loras = crate::parser::parse_prompt(&config.lora_tags_raw);
-    crate::parser::parse_prompt(text)
+    let tokens = strip_lora_tokens(crate::parser::parse_prompt(text), &config.lora_tags_raw, strip_conflicts);
+    // AI text gets the same body-type fix the rule cards apply
+    if strip_conflicts { fix_body_type(tokens) } else { tokens }
+}
+
+/// `tokens` minus copies of the tags in `lora_raw` (and, with `strip_conflicts`, minus
+/// tags that contradict them).
+pub fn strip_lora_tokens(tokens: Vec<PromptToken>, lora_raw: &str, strip_conflicts: bool) -> Vec<PromptToken> {
+    let loras = crate::parser::parse_prompt(lora_raw);
+    tokens
         .into_iter()
         .filter(|t| !loras.iter().any(|l| l.normalized == t.normalized))
         .filter(|t| !strip_conflicts || !loras.iter().any(|l| tags_conflict(&l.normalized, &t.normalized)))
@@ -817,7 +977,7 @@ mod tests {
 
             dynamic: false,
 
-            lora_tags_raw: String::new(), arranged: false, natural: false,
+            lora_tags_raw: String::new(), arranged: false, natural: false, two_char: false, char2_prompt_raw: String::new(), char2_lora_tags_raw: String::new(), char_break: false, scene_prompt_raw: String::new(), more_chars: Vec::new(),
 
             detail: crate::profiles::DetailLevel::Balanced,
         }
@@ -933,6 +1093,30 @@ mod tests {
         assert_eq!(finish_prompt("1girl, rain", &config, false, s), "1girl, rain");
         config.arranged = true;
         assert_eq!(finish_prompt("rain, 1girl", &config, false, s), "1girl,\nrain");
+    }
+
+    #[test]
+    fn petite_with_large_breasts_becomes_short() {
+        let config = cfg(TargetView::None);
+        let (res, out) = run("1girl, petite, (large breasts:1.25), wide hips, short hair", &config);
+        assert!(!out.contains("petite") && out.contains("short,") || out.contains("short\n") || out.contains(", short"), "{out}");
+        assert!(out.contains("(large breasts:1.25)"), "{out}");
+        assert!(res.changes.iter().any(|c| c.action == ChangeAction::SizeConflict && c.original == "petite"));
+        // petite alone stays
+        let (_, out) = run("1girl, petite, small breasts", &config);
+        assert!(out.contains("petite"), "{out}");
+    }
+
+    #[test]
+    fn conflicting_sizes_keep_the_first() {
+        let config = cfg(TargetView::None);
+        let (res, out) = run("1girl, medium breasts, long hair, large breasts, very long hair, short hair, blue hair, white hair", &config);
+        assert!(out.contains("medium breasts") && !out.contains("large breasts"), "{out}");
+        assert!(out.contains("long hair") && out.contains("very long hair") && !out.contains("short hair"), "{out}");
+        assert!(out.contains("blue hair") && out.contains("white hair"), "{out}"); // two colors are fine
+        assert_eq!(res.changes.iter().filter(|c| c.action == ChangeAction::SizeConflict).count(), 2);
+        assert!(size_conflict("flat chest", "huge breasts"));
+        assert!(!size_conflict("long hair", "very long hair"));
     }
 
     #[test]

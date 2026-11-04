@@ -2,11 +2,15 @@ mod ai_engine;
 mod analyzer;
 mod condenser;
 mod danbooru;
+mod detector;
 mod dynamic;
 mod parser;
 mod profiles;
 mod scene;
+mod sceneref;
 mod tagger;
+mod two;
+mod twoimg;
 
 use ai_engine::{AiScanRequest, GpuInfo, OllamaModel};
 use analyzer::{ChangeAction, PromptChange, ScanConfig};
@@ -31,6 +35,9 @@ struct AppState {
     changes: Vec<PromptChange>,
     /// AI cards from the last deep scan (opt-in, start as "Keep Original").
     ai_changes: Vec<PromptChange>,
+    /// 2 Characters tab: character 2's tokens, rule cards and AI cards.
+    /// Characters 2..N on the multi-character tabs: their tokens, rule and AI cards.
+    others: Vec<CharCards>,
     /// Scene analysis + full rewrite from the last deep scan (same lifetime as `ai_changes`).
     ai_scene: Option<SceneResult>,
     ai_key: Option<AiKey>,
@@ -51,12 +58,97 @@ struct AppState {
     vision_models: Vec<String>,
     /// Deep Scan was pressed while the AI was still reading the image: scan once it's done.
     scan_after_image: bool,
+    /// 2 Characters tab: the detector + tagger reading of the image, and the AI's split.
+    two_tags: Option<twoimg::TagSplit>,
+    two_ai: Option<twoimg::SplitPrompt>,
+    /// The three boxes from just before an image filled them (for Undo).
+    two_before_image: Option<(Vec<String>, String)>,
+    /// Char 1 / Char 2 reference images: what was read from each (before Identity Only).
+    char_images: [Option<String>; 4],
+    /// The Scene / Pose reference image and what it put into a prompt box.
+    scene_ref: Option<SceneRef>,
+    /// Reference images picked but not read yet (Read reads them: scene first, then 1..4).
+    scene_ref_path: Option<std::path::PathBuf>,
+    char_paths: [Option<std::path::PathBuf>; 4],
+    /// Thumbnails of the character reference images (Scene panel and its bar).
+    char_thumbs: [Option<slint::Image>; 4],
     /// Kept alive for the whole session: on Linux the copied text disappears
     /// when the `Clipboard` that owns it is dropped.
     clipboard: Option<arboard::Clipboard>,
 }
 
 type State = Rc<RefCell<AppState>>;
+
+/// A Scene / Pose reference image: what it showed each character doing and the scene,
+/// who the user gave each tag to, and what went into which box (so it can come out).
+struct SceneRef {
+    actions: Vec<sceneref::Action>,
+    boxes: Vec<BoxSnap>,
+}
+
+/// One prompt box a Scene / Pose reference wrote into.
+#[derive(Clone)]
+struct BoxSnap {
+    /// 0..3 = character 1..4's box (0 = Before), 4 = the shared Scene box.
+    target: usize,
+    /// The box before the tags went in, and right after (to tell if you edited it since).
+    original: String,
+    injected: String,
+    /// The tags it added (not the ones the box already had).
+    added: Vec<String>,
+}
+
+/// One extra character's rule-engine result and AI cards (characters 2..N).
+#[derive(Default, Clone)]
+struct CharCards {
+    base_tokens: Vec<PromptToken>,
+    changes: Vec<PromptChange>,
+    ai_changes: Vec<PromptChange>,
+}
+
+/// A multi-line LoRA box as one comma-separated list ("<lora:a:0.8>\nfox girl" ->
+/// "<lora:a:0.8>, fox girl").
+fn lora_lines(text: &str) -> String {
+    text.lines()
+        .map(|l| l.trim().trim_matches(',').trim())
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// How many characters the current tab has (tab 0 = 1 Character … tab 3 = 4 Characters).
+fn tab_chars(ui: &AppWindow) -> usize {
+    (ui.get_app_tab().clamp(0, 3) + 1) as usize
+}
+
+/// Character `i`'s box (0-based): Before, then Character 2, 3, 4.
+fn char_box(ui: &AppWindow, i: usize) -> String {
+    match i {
+        0 => ui.get_raw_prompt(),
+        1 => ui.get_char2_prompt(),
+        2 => ui.get_char3_prompt(),
+        _ => ui.get_char4_prompt(),
+    }
+    .to_string()
+}
+
+fn set_char_box(ui: &AppWindow, i: usize, text: &str) {
+    match i {
+        0 => ui.set_raw_prompt(text.into()),
+        1 => ui.set_char2_prompt(text.into()),
+        2 => ui.set_char3_prompt(text.into()),
+        _ => ui.set_char4_prompt(text.into()),
+    }
+}
+
+/// Characters 3 and 4 (prompt, LoRA box) on the 3 / 4 Characters tabs.
+fn more_chars(ui: &AppWindow) -> Vec<(String, String)> {
+    let all = [
+        (ui.get_char3_prompt().to_string(), lora_lines(&ui.get_char3_lora_tags())),
+        (ui.get_char4_prompt().to_string(), lora_lines(&ui.get_char4_lora_tags())),
+    ];
+    all.into_iter().take(tab_chars(ui).saturating_sub(2)).collect()
+}
 
 struct SceneResult {
     summary: String,
@@ -138,14 +230,23 @@ fn scan_config(ui: &AppWindow) -> ScanConfig {
         camera_angle: ui.get_angle_index().max(0) as usize,
         pose: ui.get_pose_index().max(0) as usize,
         dynamic: ui.get_dynamic_enabled(),
-        lora_tags_raw: ui.get_lora_tags().to_string(), arranged: ui.get_arranged_enabled(), natural: ui.get_natural_enabled(),
+        lora_tags_raw: lora_lines(&ui.get_lora_tags()), arranged: ui.get_arranged_enabled(), natural: ui.get_natural_enabled(), two_char: ui.get_app_tab() >= 1, char2_prompt_raw: ui.get_char2_prompt().to_string(), char2_lora_tags_raw: lora_lines(&ui.get_char2_lora_tags()), char_break: ui.get_char_break_enabled(), scene_prompt_raw: ui.get_scene_prompt().to_string(), more_chars: more_chars(ui),
         detail: crate::profiles::DetailLevel::from_index(ui.get_detail_index()),
     }
 }
 
 fn ai_key(ui: &AppWindow) -> AiKey {
     (
-        ui.get_raw_prompt().to_string(),
+        // the tab and character 2's prompt count as part of the prompt
+        format!(
+            "{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}",
+            ui.get_app_tab(),
+            ui.get_raw_prompt(),
+            ui.get_scene_prompt(),
+            ui.get_char2_prompt(),
+            ui.get_char3_prompt(),
+            ui.get_char4_prompt()
+        ),
         ui.get_checkpoint_index(),
         ui.get_target_view_index(),
         ui.get_angle_index(),
@@ -157,14 +258,43 @@ fn ai_key(ui: &AppWindow) -> AiKey {
 /// prompt, checkpoint or view they were made for has changed.
 fn analyze(ui: &AppWindow, state: &State) {
     let config = scan_config(ui);
-    let tokens = parser::parse_prompt(&ui.get_raw_prompt());
-    let result = analyzer::analyze_with_rules(&tokens, &config);
+    let prompts = char_prompts(ui, &config);
+    let c1 = with_scene(&prompts[0], &config);
+    let mut result = analyzer::analyze_with_rules(&parser::parse_prompt(&c1), &config);
+    let mut others = Vec::new();
+    if config.two_char {
+        // Every other character on its own: its LoRA box, and the scene's framing from
+        // character 1; the angle / pose pickers belong to character 1's box.
+        for (i, prompt) in prompts.iter().enumerate().skip(1) {
+            let mut ci = config.clone();
+            ci.lora_tags_raw = config.lora_of(i).to_string();
+            ci.camera_angle = 0;
+            ci.pose = 0;
+            if ci.target_view == TargetView::None {
+                ci.target_view = result.active_framing_detected;
+            }
+            let mut r = analyzer::analyze_with_rules(&parser::parse_prompt(prompt), &ci);
+            label_two_char_cards(&mut r, i + 1);
+            for c in &mut r.changes {
+                c.id += two::card_base(i);
+            }
+            others.push(CharCards { base_tokens: r.processed_tokens, changes: r.changes, ai_changes: Vec::new() });
+        }
+        label_two_char_cards(&mut result, 1);
+    }
     let key = ai_key(ui);
     {
         let mut st = state.borrow_mut();
         st.base_tokens = result.processed_tokens;
         st.changes = result.changes;
-        if st.ai_key.as_ref() != Some(&key) {
+        let keep_ai = st.ai_key.as_ref() == Some(&key);
+        for (i, o) in others.iter_mut().enumerate() {
+            if keep_ai {
+                o.ai_changes = st.others.get(i).map(|x| x.ai_changes.clone()).unwrap_or_default();
+            }
+        }
+        st.others = others;
+        if !keep_ai {
             st.ai_changes.clear();
             st.ai_scene = None;
             st.ai_key = None;
@@ -173,9 +303,56 @@ fn analyze(ui: &AppWindow, state: &State) {
     render(ui, state);
 }
 
+/// The prompts to work on, one per character: Before alone on the 1 Character tab, or
+/// Before plus the other characters' boxes (a pasted "… BREAK …" prompt is split when
+/// they're empty).
+fn char_prompts(ui: &AppWindow, config: &ScanConfig) -> Vec<String> {
+    let raw = ui.get_raw_prompt().to_string();
+    if config.two_char {
+        let others: Vec<String> = (1..config.char_count()).map(|i| config.prompt_of(i).to_string()).collect();
+        two::prompts(&raw, &others)
+    } else {
+        vec![raw]
+    }
+}
+
+/// Character 1's prompt with the Scene box after it (the rule engine sees the scene's
+/// framing; `two::combine` moves the scene's tags to the shared part).
+fn with_scene(c1: &str, config: &ScanConfig) -> String {
+    let scene = config.scene_prompt_raw.trim().trim_matches(',').trim();
+    if !config.two_char || scene.is_empty() {
+        return c1.to_string();
+    }
+    let c1 = c1.trim().trim_end_matches(',').trim();
+    if c1.is_empty() { scene.to_string() } else { format!("{c1}, {scene}") }
+}
+
+/// Two characters: "solo" goes (with a card), and every card says whose it is.
+fn label_two_char_cards(r: &mut analyzer::RuleAnalysisResult, n: usize) {
+    for c in &mut r.changes {
+        c.reason = format!("Character {n}: {}", c.reason);
+    }
+    if r.processed_tokens.iter().any(|t| t.normalized == "solo") {
+        r.processed_tokens.retain(|t| t.normalized != "solo");
+        let id = r.changes.iter().map(|c| c.id + 1).max().unwrap_or(0);
+        r.changes.push(PromptChange {
+            id,
+            original: "solo".into(),
+            action: ChangeAction::PositioningConflict,
+            reason: format!("Character {n}: 'solo' removed because several characters are in the scene."),
+            suggested_alternative: String::new(),
+            framing_alternative: String::new(),
+            mode: 0,
+        });
+    }
+}
+
 fn clear_ai_cards(state: &State) {
     let mut st = state.borrow_mut();
     st.ai_changes.clear();
+    for o in &mut st.others {
+        o.ai_changes.clear();
+    }
     st.ai_scene = None;
     st.ai_key = None;
 }
@@ -183,10 +360,39 @@ fn clear_ai_cards(state: &State) {
 /// Rebuilds the After prompt, stats and cards from the current state.
 fn render(ui: &AppWindow, state: &State) {
     let config = scan_config(ui);
-    let raw = ui.get_raw_prompt();
+    let two_char = config.two_char;
+    let mut prompts = char_prompts(ui, &config);
+    prompts[0] = with_scene(&prompts[0], &config);
+    let c1_raw = prompts[0].clone();
+    // what the AI views are compared against: every character on the multi-character tabs
+    let raw = prompts.join(", ");
     let st = state.borrow();
-    let all_changes: Vec<PromptChange> = st.changes.iter().chain(&st.ai_changes).cloned().collect();
-    let mut out = condenser::build_condensed_output(&raw, &st.base_tokens, &all_changes, &config);
+    let changes1: Vec<PromptChange> = st.changes.iter().chain(&st.ai_changes).cloned().collect();
+    let other_changes: Vec<Vec<PromptChange>> =
+        st.others.iter().map(|o| o.changes.iter().chain(&o.ai_changes).cloned().collect()).collect();
+    let all_changes: Vec<PromptChange> = changes1.iter().chain(other_changes.iter().flatten()).cloned().collect();
+    let mut out = condenser::build_condensed_output(&c1_raw, &st.base_tokens, &changes1, &config);
+    // characters 2..N, each condensed on its own
+    let other_outs: Vec<String> = if two_char {
+        (1..prompts.len())
+            .map(|i| {
+                let o = st.others.get(i - 1).cloned().unwrap_or_default();
+                let ch = other_changes.get(i - 1).cloned().unwrap_or_default();
+                condenser::build_condensed_output(&prompts[i], &o.base_tokens, &ch, &config).final_prompt
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let stats_of = |i: usize| {
+        prompts.get(i).filter(|_| two_char).map(|p| {
+            let (t, c) = parser::estimate_clip_tokens(p);
+            format_stats(t, c)
+        })
+    };
+    ui.set_char2_stats(stats_of(1).unwrap_or_default().into());
+    ui.set_char3_stats(stats_of(2).unwrap_or_default().into());
+    ui.set_char4_stats(stats_of(3).unwrap_or_default().into());
     // Every view gets the LoRA box word for word, the natural-language sentence (the
     // Deep Scan's, else a rule-based one) and the arranged layout, when those are on.
     let ai_sentence = st.ai_scene.as_ref().map(|sc| sc.natural_sentence.clone()).filter(|s| !s.is_empty());
@@ -197,13 +403,55 @@ fn render(ui: &AppWindow, state: &State) {
         });
         analyzer::finish_prompt(t, &config, strip, sentence.as_deref())
     };
+    // Several characters: each goes in its own block (see `two::combine`); the
+    // rule-based sentence describes all of them.
+    let combine = |texts: &[String], strip: bool| {
+        let c = two::combine(texts, &config, strip, None);
+        let sentence = ai_sentence.clone().or_else(|| {
+            (config.natural && config.checkpoint.supports_natural_language())
+                .then(|| scene::prompt_sentence_many(&c.chars, &c.shared))
+        });
+        match sentence {
+            Some(s) => two::combine(texts, &config, strip, Some(&s)),
+            None => c,
+        }
+    };
+    // the parts of whichever multi-character text is showing, for the live scene card
+    let mut shown_parts: Option<two::Combined> = None;
+    let rule_texts: Vec<String> = std::iter::once(out.final_prompt.clone()).chain(other_outs.iter().cloned()).collect();
     let rule_prompt = out.final_prompt.clone();
-    out.final_prompt = finish(&out.final_prompt, false);
+    out.final_prompt = if two_char {
+        let c = combine(&rule_texts, false);
+        let text = c.text.clone();
+        shown_parts = Some(c);
+        text
+    } else {
+        finish(&out.final_prompt, false)
+    };
     (out.after_tokens, out.after_chunks) = parser::estimate_clip_tokens(&out.final_prompt);
-    let with_loras = |t: String| finish(&t, true);
+    let with_loras = |t: String| {
+        if two_char {
+            // the AI's shared part stays shared (two::combine_ai); the sentence fallback as in `combine`
+            let c = two::combine_ai(&t, &prompts, &config, None);
+            let sentence = ai_sentence.clone().or_else(|| {
+                (config.natural && config.checkpoint.supports_natural_language())
+                    .then(|| scene::prompt_sentence_many(&c.chars, &c.shared))
+            });
+            match sentence {
+                Some(s) => two::combine_ai(&t, &prompts, &config, Some(&s)),
+                None => c,
+            }
+        } else {
+            two::Combined { text: finish(&t, true), chars: Vec::new(), shared: Vec::new() }
+        }
+    };
 
     // Scene analysis card + optional AI Improved view
     let improved = st.ai_scene.as_ref().map(|sc| sc.improved_prompt.clone()).filter(|p| !p.is_empty()).map(with_loras);
+    let (improved, improved_parts) = match improved {
+        Some(c) => (Some(c.text.clone()), Some(c)),
+        None => (None, None),
+    };
     ui.set_ai_improved_available(improved.is_some());
     if (improved.is_none() && ui.get_after_view() == 1) || (!config.dynamic && ui.get_after_view() == 2) {
         ui.set_after_view(0);
@@ -226,14 +474,35 @@ fn render(ui: &AppWindow, state: &State) {
         let from_ai = st.ai_scene.as_ref().map(|sc| sc.dynamic_prompt.clone()).filter(|p| !p.trim().is_empty());
         match from_ai {
             Some(p) => {
-                let p = with_loras(p);
-                let groups = p.matches('{').count();
+                let c = with_loras(p);
+                let groups = c.text.matches('{').count();
+                let p = c.text.clone();
+                if two_char {
+                    shown_parts = Some(c);
+                }
                 (p, format!("AI variations: {groups} group(s). Needs the Dynamic Prompts extension / node in ComfyUI."))
             }
             None => {
-                // vary the rule output, never the LoRA tags
-                let (p, kinds) = dynamic::make_dynamic(&rule_prompt);
-                let p = finish(&p, false);
+                // vary the rule output, never the LoRA tags (each character on its own)
+                let (p, mut kinds) = dynamic::make_dynamic(&rule_prompt);
+                let p = if two_char {
+                    let mut varied = vec![p];
+                    for t in &rule_texts[1..] {
+                        let (pk, kk) = dynamic::make_dynamic(t);
+                        varied.push(pk);
+                        for k in kk {
+                            if !kinds.contains(&k) {
+                                kinds.push(k);
+                            }
+                        }
+                    }
+                    let c = combine(&varied, false);
+                    let text = c.text.clone();
+                    shown_parts = Some(c);
+                    text
+                } else {
+                    finish(&p, false)
+                };
                 let note = if kinds.is_empty() {
                     "Nothing to vary yet: add a pose, angle, expression or lighting tag (or run a Deep AI Scan).".to_string()
                 } else {
@@ -249,6 +518,9 @@ fn render(ui: &AppWindow, state: &State) {
         (dyn_text, String::new(), t, c)
     } else { match improved.filter(|_| ui.get_after_view() == 1) {
         Some(ai_text) => {
+            if two_char {
+                shown_parts = improved_parts;
+            }
             let dropped = condenser::dropped_tags(&raw, &ai_text, config.checkpoint);
             ui.set_ai_dropped(dropped.join(", ").into());
             let (md, _) = condenser::highlight_against_original(&raw, &ai_text);
@@ -261,11 +533,15 @@ fn render(ui: &AppWindow, state: &State) {
         ui.set_ai_dropped("".into());
     }
     render_negative(ui, &config, &text, st.ai_scene.as_ref().filter(|_| ui.get_after_view() == 1));
-    render_live_scene(ui, &text);
+    match shown_parts.filter(|_| two_char) {
+        Some(c) => set_live_scene(ui, scene::describe_many(&c.chars, &c.shared)),
+        None => render_live_scene(ui, &text),
+    }
     ui.set_condensed_prompt(text.into());
     // The After box is plain selectable text, so the changed tags are listed under it.
     ui.set_substituted_list(condenser::marked_tags(&markdown, condenser::Highlight::Substituted).join(", ").into());
     ui.set_added_list(condenser::marked_tags(&markdown, condenser::Highlight::Added).join(", ").into());
+    ui.set_structure_rows(ModelRc::new(VecModel::from(structure_rows(&out.category_summary))));
     ui.set_category_breakdown(out.category_summary.into());
     ui.set_before_stats(format_stats(out.before_tokens, out.before_chunks).into());
     ui.set_after_stats(format_stats(after_tokens, after_chunks).into());
@@ -281,6 +557,31 @@ fn render(ui: &AppWindow, state: &State) {
     } else {
         model.set_vec(cards);
     }
+}
+
+/// The Organized Structure text ("[Subject] 1girl, solo" per line) as colored rows.
+fn structure_rows(summary: &str) -> Vec<StructureRow> {
+    use parser::TokenCategory as C;
+    let order = [
+        C::QualityMeta,
+        C::SubjectCount,
+        C::PinnedEmphasis,
+        C::FramingPose,
+        C::CharacterBody,
+        C::Attire,
+        C::NaturalLanguageClause,
+        C::EnvironmentLighting,
+        C::LoraOrSpecial,
+    ];
+    summary
+        .lines()
+        .filter_map(|line| {
+            let rest = line.strip_prefix('[')?;
+            let (label, items) = rest.split_once("] ")?;
+            let kind = order.iter().position(|c| c.label() == label).unwrap_or(8) as i32;
+            Some(StructureRow { label: label.to_uppercase().into(), items: items.into(), kind })
+        })
+        .collect()
 }
 
 /// Fills the Recommended Negative panel for the prompt currently shown in After.
@@ -338,7 +639,10 @@ fn render_negative(ui: &AppWindow, config: &ScanConfig, positive: &str, ai: Opti
 
 /// Fills the live scene card from the prompt currently shown in After.
 fn render_live_scene(ui: &AppWindow, prompt: &str) {
-    let d = scene::describe(&parser::parse_prompt(prompt));
+    set_live_scene(ui, scene::describe(&parser::parse_prompt(prompt)));
+}
+
+fn set_live_scene(ui: &AppWindow, d: scene::SceneDescription) {
     let details = d.details.iter().map(|(k, v)| format!("{k}: {v}")).collect::<Vec<_>>().join("\n");
     ui.set_live_headline(d.headline.into());
     ui.set_live_details(details.into());
@@ -359,7 +663,7 @@ fn to_card(ch: &PromptChange) -> ChangeCardItem {
         ChangeAction::FramingSafeSwap | ChangeAction::PositioningConflict => 0,
         ChangeAction::AiRewrite => 3,
         ChangeAction::KeptEmphasized | ChangeAction::AngleChoice | ChangeAction::PoseChoice => 1,
-        ChangeAction::RemovedBloat | ChangeAction::MergedDuplicate | ChangeAction::WeightClamped => 2,
+        ChangeAction::RemovedBloat | ChangeAction::MergedDuplicate | ChangeAction::WeightClamped | ChangeAction::SizeConflict => 2,
     };
     ChangeCardItem {
         id: ch.id as i32,
@@ -496,23 +800,740 @@ fn set_prompt_from_image(ui: &AppWindow, state: &State, prompt: &str) {
 
 /// Reads the loaded image with the method the Tagger / AI switch selects, reusing a
 /// cached result when there is one.
-fn image_extract(ui: &AppWindow, state: &State) {
+/// Shows what the loaded image gives in the current mode. With `run`, reads it when
+/// that hasn't happened yet (the Read Image button); without, only reuses what was
+/// already read, so switching modes never starts a slow run by itself.
+fn image_extract(ui: &AppWindow, state: &State, run: bool) {
     if state.borrow().image_path.is_none() {
         return;
+    }
+    if ui.get_app_tab() >= 1 {
+        return two_image_extract(ui, state, run);
     }
     if ui.get_image_use_ai() {
         let cached = state.borrow().image_ai.clone();
         match cached {
             Some(res) => apply_ai_image(ui, state, &res, None),
-            None => run_ai_image(ui, state),
+            None if run => run_ai_image(ui, state),
+            None => ui.set_image_status("Press Read Image to read it with AI.".into()),
         }
     } else if state.borrow().last_tags.is_some() {
         apply_tags(ui, state, Some(0.0));
-    } else if tagger::is_installed() {
+    } else if !tagger::is_installed() {
+        ui.set_image_status("Download the Danbooru tagger once (1.2 GB) to extract tags.".into());
+    } else if run {
         run_tagger(ui, state);
     } else {
-        ui.set_image_status("Download the Danbooru tagger once (1.2 GB) to extract tags.".into());
+        ui.set_image_status("Press Read Image to read it with the tagger.".into());
     }
+}
+
+/// 2 Characters tab: split the image into Character 1 | Scene | Character 2, from the
+/// cache when this image was read already.
+fn two_image_extract(ui: &AppWindow, state: &State, run: bool) {
+    let use_ai = ui.get_image_use_ai();
+    let (tags, ai) = {
+        let st = state.borrow();
+        (st.two_tags.clone(), st.two_ai.clone())
+    };
+    match (use_ai, tags, ai) {
+        (true, _, Some(ai)) => apply_two(ui, state, &ai, "AI split (cached)".into()),
+        (false, Some(t), _) => {
+            let split = twoimg::rule_split(&t, ui.get_tag_threshold());
+            apply_two(ui, state, &split, two_status(&t, "Tagger split"));
+        }
+        _ if run => run_two_image(ui, state),
+        _ => ui.set_image_status(
+            format!("Press Read Image to split it with {}.", if use_ai { "AI" } else { "the tagger" }).into(),
+        ),
+    }
+}
+
+fn two_status(t: &twoimg::TagSplit, what: &str) -> String {
+    match twoimg::not_found_note(t) {
+        Some(note) => format!("{note}: {what} needs AI mode to separate them"),
+        None if t.overlap > 0.25 => format!("{} characters found (some overlap) • {what}", t.wanted),
+        None => format!("{} characters found • {what}", t.wanted),
+    }
+}
+
+/// Detector + tagger (+ the vision model in AI mode), off the UI thread.
+fn run_two_image(ui: &AppWindow, state: &State) {
+    let Some(path) = state.borrow().image_path.clone() else { return };
+    if let Err(e) = twoimg::check_models() {
+        ui.set_image_status(format!("{e}").into());
+        return;
+    }
+    let ai = (ui.get_image_use_ai() && ui.get_ollama_connected()).then(|| vision_model(ui, state)).flatten();
+    if ui.get_image_use_ai() && ai.is_none() {
+        ui.set_image_status(
+            "AI mode needs Ollama and Maximum Fast (Gemma 4 12B), which can see images. Using the tagger split.".into(),
+        );
+    }
+    let (host, mode, threshold) =
+        (ui.get_ollama_host().to_string(), AiMode::from_index(ui.get_ai_mode_index()), ui.get_tag_threshold());
+    let n = tab_chars(ui);
+    // a cached reading for another number of characters doesn't count
+    let cached = state.borrow().two_tags.clone().filter(|t| t.wanted == n);
+    ui.set_tagger_busy(true);
+    ui.set_image_status(format!("Finding the {n} characters…").into());
+    let weak = ui.as_weak();
+    std::thread::spawn(move || {
+        let started = std::time::Instant::now();
+        let progress = {
+            let weak = weak.clone();
+            move |msg: String| {
+                let _ = weak.upgrade_in_event_loop(move |ui| ui.set_image_status(msg.into()));
+            }
+        };
+        let result = (|| -> anyhow::Result<(twoimg::TagSplit, Option<anyhow::Result<twoimg::SplitPrompt>>)> {
+            if !detector::is_installed() {
+                let (tx, rx) = mpsc::channel::<String>();
+                let p = progress.clone();
+                let printer = std::thread::spawn(move || rx.into_iter().for_each(|m| p(m)));
+                detector::download(&tx)?;
+                drop(tx);
+                let _ = printer.join();
+            }
+            let tags = match cached {
+                Some(t) => t,
+                None => {
+                    progress("Tagging each character…".into());
+                    twoimg::read(&path, n, ai.is_none())?
+                }
+            };
+            let ai_split = ai.map(|model| {
+                progress(format!("AI is checking who is who with {model}…"));
+                ai_engine::split_image(&ai_engine::TwoImageRequest {
+                    host,
+                    model,
+                    mode,
+                    hints: twoimg::rule_split(&tags, threshold),
+                    split: tags.clone(),
+                })
+                .map(|(split, _)| twoimg::settle(split, &tags, threshold))
+            });
+            Ok((tags, ai_split))
+        })();
+        let secs = started.elapsed().as_secs_f32();
+        let _ = weak.upgrade_in_event_loop(move |ui| {
+            ui.set_tagger_busy(false);
+            with_state(|state| match result {
+                Ok((tags, ai_split)) => {
+                    state.borrow_mut().two_tags = Some(tags.clone());
+                    let (split, how) = match ai_split {
+                        Some(Ok(split)) => {
+                            state.borrow_mut().two_ai = Some(split.clone());
+                            (split, "AI split".to_string())
+                        }
+                        Some(Err(e)) => (twoimg::rule_split(&tags, ui.get_tag_threshold()), format!("AI failed ({e:#}), tagger split")),
+                        None => (twoimg::rule_split(&tags, ui.get_tag_threshold()), "Tagger split".to_string()),
+                    };
+                    apply_two(&ui, state, &split, format!("{} • {secs:.0} s", two_status(&tags, &how)));
+                    if std::mem::take(&mut state.borrow_mut().scan_after_image) {
+                        ui.invoke_run_ai_scan_requested();
+                    }
+                }
+                Err(e) => {
+                    state.borrow_mut().scan_after_image = false;
+                    ui.set_image_status(format!("Reading the image failed: {e:#}").into());
+                }
+            });
+        });
+    });
+}
+
+/// Fills Character 1 | Scene | Character 2 (remembering what was there, for Undo).
+/// Remembers every character box and the Scene box once, for Undo.
+fn remember_boxes(ui: &AppWindow, state: &State) {
+    let boxes: Vec<String> = (0..4).map(|i| char_box(ui, i)).collect();
+    let scene = ui.get_scene_prompt().to_string();
+    let had_text = boxes.iter().any(|b| !b.trim().is_empty()) || !scene.trim().is_empty();
+    let mut st = state.borrow_mut();
+    if st.two_before_image.is_none() && had_text {
+        st.two_before_image = Some((boxes, scene));
+        ui.set_image_can_undo(true);
+    }
+}
+
+fn apply_two(ui: &AppWindow, state: &State, split: &twoimg::SplitPrompt, status: String) {
+    remember_boxes(ui, state);
+    for (i, c) in split.chars.iter().enumerate().take(tab_chars(ui)) {
+        set_char_box(ui, i, &identity(ui, c));
+    }
+    // Identity Only: the image supplies the characters, your Scene box stays
+    if !ui.get_image_identity_only() {
+        let cleaned_scene = twoimg::clean_list(&split.scene, true);
+        ui.set_scene_prompt(cleaned_scene.into());
+    }
+    ui.set_image_status(status.into());
+    analyze(ui, state);
+    sync_scene_panel(ui, state);
+}
+
+/// Char 1 Image… / Char 2 Image…: one reference image fills one character's box.
+/// What the background readers need to call the tagger and the vision model.
+#[derive(Clone)]
+struct ReadCtx {
+    /// The vision model in AI mode (when Ollama has one), else the tagger alone.
+    model: Option<String>,
+    host: String,
+    mode: AiMode,
+    threshold: f32,
+    config: ScanConfig,
+}
+
+fn read_ctx(ui: &AppWindow, state: &State) -> ReadCtx {
+    let mut config = scan_config(ui);
+    config.two_char = false;
+    ReadCtx {
+        model: (ui.get_image_use_ai() && ui.get_ollama_connected()).then(|| vision_model(ui, state)).flatten(),
+        host: ui.get_ollama_host().to_string(),
+        mode: AiMode::from_index(ui.get_ai_mode_index()),
+        threshold: ui.get_tag_threshold(),
+        config,
+    }
+}
+
+/// One character's reference image -> its tags (before Identity Only).
+fn read_char_blocking(path: &std::path::Path, ctx: &ReadCtx, progress: &(dyn Fn(String) + Sync)) -> anyhow::Result<(String, &'static str)> {
+    let tags = twoimg::tag_one_fast(path, progress)?;
+    let hints = tagger::build_prompt(&tags, ctx.threshold).prompt;
+    let Some(model) = ctx.model.clone() else { return Ok((hints, "tagger")) };
+    let req = ai_engine::ImageAiRequest {
+        host: ctx.host.clone(),
+        model,
+        mode: ctx.mode,
+        image_path: path.to_path_buf(),
+        config: ctx.config.clone(),
+        tag_hints: hints.clone(),
+    };
+    Ok(match ai_engine::describe_image(&req) {
+        Ok(r) => (r.prompt, "AI"),
+        Err(_) => (hints, "tagger, the AI failed"),
+    })
+}
+
+/// A Scene / Pose reference image -> who does what (`sceneref`), for `n` characters.
+/// One character: the pose-and-scene reading. Several: the person detector finds them
+/// left to right and each one's pose goes to that character (like the image split).
+fn read_scene_blocking(
+    path: &std::path::Path,
+    ctx: &ReadCtx,
+    n: usize,
+    progress: &(dyn Fn(String) + Sync),
+) -> anyhow::Result<(Vec<sceneref::Action>, String)> {
+    if n >= 2 {
+        return read_scene_split(path, ctx, n, progress);
+    }
+    progress("Tagging scene and character pose…".into());
+    let tags = tagger::tag_image(path)?;
+    let hints = scene::filter_scene_and_pose_only(&tagger::build_prompt(&tags, ctx.threshold).prompt, false);
+    let Some(model) = ctx.model.clone() else { return Ok((sceneref::from_single(&hints, false), "tagger".into())) };
+    progress(format!("AI vision analyzing pose with {model}…"));
+    let req = ai_engine::ImageAiRequest {
+        host: ctx.host.clone(),
+        model,
+        mode: ctx.mode,
+        image_path: path.to_path_buf(),
+        config: ctx.config.clone(),
+        tag_hints: hints.clone(),
+    };
+    Ok(match ai_engine::describe_scene_pose(&req) {
+        Ok(r) => (sceneref::from_single(&r.prompt, false), "AI".into()),
+        Err(_) => (sceneref::from_single(&hints, false), "tagger, the AI failed".into()),
+    })
+}
+
+fn read_scene_split(
+    path: &std::path::Path,
+    ctx: &ReadCtx,
+    n: usize,
+    progress: &(dyn Fn(String) + Sync),
+) -> anyhow::Result<(Vec<sceneref::Action>, String)> {
+    if !detector::is_installed() {
+        let (tx, rx) = mpsc::channel::<String>();
+        std::thread::scope(|s| {
+            s.spawn(|| rx.into_iter().for_each(|m| progress(m)));
+            let r = detector::download(&tx);
+            drop(tx);
+            r
+        })?;
+    }
+    progress(format!("Finding the {n} characters in the scene…"));
+    let tags = twoimg::read(path, n, false)?;
+    let hints = twoimg::rule_split(&tags, ctx.threshold);
+    let (split, mut how) = match ctx.model.clone() {
+        Some(model) => {
+            progress(format!("AI is reading who does what with {model}…"));
+            match ai_engine::split_image(&ai_engine::TwoImageRequest {
+                host: ctx.host.clone(),
+                model,
+                mode: ctx.mode,
+                hints: hints.clone(),
+                split: tags.clone(),
+            }) {
+                Ok((s, _)) => (twoimg::settle(s, &tags, ctx.threshold), "AI".to_string()),
+                Err(_) => (hints, "tagger, the AI failed".to_string()),
+            }
+        }
+        None => (hints, "tagger".to_string()),
+    };
+    if let Some(note) = twoimg::not_found_note(&tags) {
+        how.push_str(&format!("; {note}, so character 1 got every pose"));
+    }
+    Ok((sceneref::from_split(&split.chars, &split.scene, false), how))
+}
+
+/// Shows the Read button while reference images wait to be read.
+fn update_pending(ui: &AppWindow, state: &State) {
+    let st = state.borrow();
+    let pending = st.scene_ref_path.is_some() && st.scene_ref.is_none()
+        || (0..4).any(|k| st.char_paths[k].is_some() && st.char_images[k].is_none());
+    ui.set_images_pending(pending);
+}
+
+/// Auto Scene button: scans the scene & poses immediately in fast mode (local tagger + rule split, skipping slow AI).
+fn run_scene_fast_scan(ui: &AppWindow, state: &State) {
+    if !tagger::is_installed() {
+        ui.set_image_status("Download the Danbooru tagger first (the button under From Image).".into());
+        return;
+    }
+    let scene_path = {
+        let st = state.borrow();
+        st.scene_ref_path.clone()
+    };
+    let Some(path) = scene_path else {
+        ui.set_scene_ref_status("No scene reference image loaded yet.".into());
+        return;
+    };
+    let mut ctx = read_ctx(ui, state);
+    ctx.model = None; // FORCE FAST SCAN (Skips slow AI LLM/VLM)
+    let n = tab_chars(ui);
+    ui.set_tagger_busy(true);
+    let weak = ui.as_weak();
+    std::thread::spawn(move || {
+        let started = std::time::Instant::now();
+        let say = status_sender(&weak);
+        say("Fast scanning scene & poses…".into());
+        let scene_result = read_scene_blocking(&path, &ctx, n, &say);
+        let secs = started.elapsed().as_secs_f32();
+        let _ = weak.upgrade_in_event_loop(move |ui| {
+            ui.set_tagger_busy(false);
+            with_state(|state| {
+                match scene_result {
+                    Ok((actions, how)) => {
+                        let found = actions.len();
+                        set_scene_reading(&ui, state, actions);
+                        ui.set_scene_panel_open(true);
+                        ui.set_scene_ref_status(format!("⚡ Auto Scene ({how} • {secs:.1}s): {found} tags detected & assigned.").into());
+                        ui.set_image_status(format!("Scene fast-scanned in {secs:.1}s").into());
+                    }
+                    Err(e) => {
+                        ui.set_scene_ref_status(format!("Scene scan failed: {e:#}").into());
+                    }
+                }
+                update_pending(&ui, state);
+            });
+        });
+    });
+}
+
+/// The Read button with reference images: the Scene / Pose reference first (deep AI analysis
+/// when AI is enabled), then characters 1..4 (who they are).
+fn run_read_queue(ui: &AppWindow, state: &State) {
+    if !tagger::is_installed() {
+        ui.set_image_status("Download the Danbooru tagger first (the button under From Image).".into());
+        return;
+    }
+    let (scene, chars) = {
+        let st = state.borrow();
+        let scene = st.scene_ref_path.clone().filter(|_| st.scene_ref.is_none());
+        let chars: Vec<(usize, std::path::PathBuf)> = (0..tab_chars(ui))
+            .filter_map(|k| st.char_paths[k].clone().filter(|_| st.char_images[k].is_none()).map(|p| (k, p)))
+            .collect();
+        (scene, chars)
+    };
+    let ctx = read_ctx(ui, state);
+    let n = tab_chars(ui);
+    ui.set_tagger_busy(true);
+    let weak = ui.as_weak();
+    std::thread::spawn(move || {
+        let started = std::time::Instant::now();
+        let say = status_sender(&weak);
+        let scene_result = scene.map(|p| {
+            say("Reading the scene & pose reference…".into());
+            read_scene_blocking(&p, &ctx, n, &say)
+        });
+        let char_results: Vec<(usize, anyhow::Result<(String, &'static str)>)> = chars
+            .into_iter()
+            .map(|(k, p)| {
+                say(format!("Reading character {}…", k + 1));
+                (k, read_char_blocking(&p, &ctx, &say))
+            })
+            .collect();
+        let secs = started.elapsed().as_secs_f32();
+        let _ = weak.upgrade_in_event_loop(move |ui| {
+            ui.set_tagger_busy(false);
+            with_state(|state| {
+                let mut done = Vec::new();
+                // the scene goes in first, so the characters are read against it
+                match scene_result {
+                    Some(Ok((actions, how))) => {
+                        let found = actions.len();
+                        set_scene_reading(&ui, state, actions);
+                        ui.set_scene_panel_open(true);
+                        ui.set_scene_ref_status(format!("Auto Scene ({how}): {found} tags placed across characters & scene.").into());
+                        done.push(format!("scene & pose ({how})"));
+                    }
+                    Some(Err(e)) => {
+                        ui.set_scene_ref_status(format!("Reading the scene failed: {e:#}").into());
+                        done.push(format!("scene & pose failed: {e:#}"));
+                    }
+                    None => {}
+                }
+                let mut chars_done = false;
+                for (k, r) in char_results {
+                    match r {
+                        Ok((text, how)) => {
+                            state.borrow_mut().char_images[k] = Some(text);
+                            apply_char_image(&ui, state, k);
+                            chars_done = true;
+                            done.push(format!("character {} ({how})", k + 1));
+                        }
+                        Err(e) => done.push(format!("character {} failed: {e:#}", k + 1)),
+                    }
+                }
+                // a character image rewrote its box: put that character's scene actions back
+                if chars_done {
+                    apply_scene_ref(&ui, state);
+                    sync_scene_panel(&ui, state);
+                }
+                update_pending(&ui, state);
+                ui.set_image_status(format!("Read {} • {secs:.0} s", done.join(", ")).into());
+            });
+        });
+    });
+}
+
+fn apply_char_image(ui: &AppWindow, state: &State, which: usize) {
+    let Some(text) = state.borrow().char_images[which].clone() else { return };
+    // one character: no quality tags, no "solo", no group counts
+    // with a Scene / Pose reference, the character images only say who they are
+    let text = if state.borrow().scene_ref.is_some() && !ui.get_image_identity_only() {
+        scene::filter_identity_only(&text)
+    } else {
+        identity(ui, &text)
+    };
+    let text = twoimg::clean_list(&text, false);
+    remember_boxes(ui, state);
+    set_char_box(ui, which, &text);
+    analyze(ui, state);
+}
+
+fn scene_overrides(ui: &AppWindow) -> sceneref::Overrides {
+    sceneref::Overrides {
+        scene: ui.get_scene_override_setting().to_string(),
+        exclude: ui.get_scene_override_exclude().to_string(),
+        chars: [
+            ui.get_scene_override_c1().to_string(),
+            ui.get_scene_override_c2().to_string(),
+            ui.get_scene_override_c3().to_string(),
+            ui.get_scene_override_c4().to_string(),
+        ],
+    }
+}
+
+/// Stores a new reading and applies its plan across the boxes.
+fn set_scene_reading(ui: &AppWindow, state: &State, actions: Vec<sceneref::Action>) {
+    let mut st = state.borrow_mut();
+    // take out the old reading first, if any
+    let old_boxes = st.scene_ref.take().map(|r| r.boxes).unwrap_or_default();
+    drop(st);
+    restore_boxes(ui, &old_boxes);
+
+    ui.set_scene_override_setting("".into());
+    ui.set_scene_override_c1("".into());
+    ui.set_scene_override_c2("".into());
+    ui.set_scene_override_c3("".into());
+    ui.set_scene_override_c4("".into());
+
+    let mut st = state.borrow_mut();
+    st.scene_ref = Some(SceneRef { actions, boxes: Vec::new() });
+    drop(st);
+    apply_scene_ref(ui, state);
+    sync_scene_panel(ui, state);
+}
+
+/// Computes the plan from the current actions and overrides, and injects into the boxes.
+fn apply_scene_ref(ui: &AppWindow, state: &State) {
+    let n = tab_chars(ui);
+    let (actions, old_boxes) = {
+        let st = state.borrow();
+        let Some(sr) = st.scene_ref.as_ref() else { return };
+        (sr.actions.clone(), sr.boxes.clone())
+    };
+    let ov = scene_overrides(ui);
+    let plan = sceneref::plan(&actions, &ov, n);
+
+    // Box index: 0 = Before / Char 1, 1 = Char 2, 2 = Char 3, 3 = Char 4, 4 = Scene box
+    let targets: Vec<(usize, Vec<String>, bool)> = if n == 1 {
+        // 1 Character tab: both actions and scene tags go to Before
+        let mut all = plan.chars.get(0).cloned().unwrap_or_default();
+        for s in &plan.scene {
+            if !all.contains(s) { all.push(s.clone()); }
+        }
+        vec![(0, all, true)]
+    } else {
+        let mut list = Vec::new();
+        for i in 0..n {
+            let tags = plan.chars.get(i).cloned().unwrap_or_default();
+            list.push((i, tags, true));
+        }
+        list.push((4, plan.scene.clone(), false));
+        list
+    };
+
+    let mut new_snaps = Vec::new();
+    for (target, refs, is_char_act) in targets {
+        let current = if target == 4 { ui.get_scene_prompt().to_string() } else { char_box(ui, target) };
+        let original = match old_boxes.iter().find(|b| b.target == target && b.injected == current) {
+            Some(b) => b.original.clone(),
+            None => current.clone(),
+        };
+        let injected = sceneref::inject(&original, &refs, &|t| {
+            if is_char_act { sceneref::is_action(t) } else { scene::is_scene_or_pose(t) }
+        });
+        if target == 4 {
+            ui.set_scene_prompt(injected.clone().into());
+        } else {
+            set_char_box(ui, target, &injected);
+        }
+        new_snaps.push(BoxSnap { target, original, injected, added: refs });
+    }
+
+    if let Some(sr) = state.borrow_mut().scene_ref.as_mut() {
+        sr.boxes = new_snaps;
+    }
+    analyze(ui, state);
+}
+
+/// Restores boxes from a snapshot: exact match restores original, modified only strips added tags.
+fn restore_boxes(ui: &AppWindow, snaps: &[BoxSnap]) {
+    for b in snaps {
+        let current = if b.target == 4 { ui.get_scene_prompt().to_string() } else { char_box(ui, b.target) };
+        let restored = if current == b.injected {
+            b.original.clone()
+        } else {
+            parser::parse_prompt(&current)
+                .into_iter()
+                .filter(|t| !b.added.iter().any(|x| danbooru::key(x) == t.normalized))
+                .map(|t| t.raw.trim().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        if b.target == 4 {
+            ui.set_scene_prompt(restored.into());
+        } else {
+            set_char_box(ui, b.target, &restored);
+        }
+    }
+}
+
+/// Syncs the horizontal Scene Panel cards in Slint from the current plan.
+fn sync_scene_panel(ui: &AppWindow, state: &State) {
+    let n = tab_chars(ui);
+    let st = state.borrow();
+    let ov = scene_overrides(ui);
+    let plan = st.scene_ref.as_ref().map(|sr| sceneref::plan(&sr.actions, &ov, n));
+
+    let cur_scene = ui.get_scene_prompt().to_string();
+    if !cur_scene.trim().is_empty() && ui.get_scene_override_setting().trim().is_empty() {
+        ui.set_scene_override_setting(cur_scene.into());
+    } else if let Some(ref p) = plan {
+        if ui.get_scene_override_setting().trim().is_empty() && !p.scene.is_empty() {
+            ui.set_scene_override_setting(p.scene.join(", ").into());
+        }
+    }
+
+    let mut items = Vec::new();
+    for i in 0..n {
+        let title = if n == 1 { "Character 1".to_string() } else { format!("Character {}", i + 1) };
+        let cbox = char_box(ui, i);
+        let actions = if !cbox.trim().is_empty() {
+            cbox.clone()
+        } else {
+            plan.as_ref().and_then(|p| p.chars.get(i)).map(|v| v.join(", ")).unwrap_or_default()
+        };
+        let has_actions = !actions.trim().is_empty();
+
+        let pose_group = profiles::group_tags(profiles::POSES);
+        let cbox_tokens = parser::parse_prompt(&cbox);
+        let has_dynamic_pose = cbox_tokens.iter().any(|t| {
+            let n = t.normalized.as_str();
+            n.starts_with('{') && n.ends_with('}') && {
+                let opts: Vec<String> = n.trim_matches(|c| c == '{' || c == '}').split('|').map(|o| o.trim().to_string()).collect();
+                opts.iter().any(|o| pose_group.contains(o))
+            }
+        });
+        let pose_index = if has_dynamic_pose {
+            2 // Dynamic / Random Pose
+        } else {
+            let idx = list_index_in(&cbox, profiles::POSES);
+            if idx > 0 && profiles::POSES[idx].0 != "Random pose (dynamic prompt)" {
+                (idx + 2) as i32
+            } else {
+                0
+            }
+        };
+
+        let view_index = match list_index_in(&cbox, profiles::VIEWS) {
+            0 => 0,
+            i => i + 1,
+        } as i32;
+        let angle_index = match list_index_in(&cbox, profiles::CAMERA_ANGLES) {
+            0 if cbox.contains(profiles::CAMERA_ANGLES[profiles::CAMERA_ANGLES.len() - 1].1) => profiles::CAMERA_ANGLES.len() as i32,
+            0 => 0,
+            i => (i + 1) as i32,
+        };
+        items.push(ScenePanelChar {
+            title: title.into(),
+            actions: actions.into(),
+            has_actions,
+            view_index,
+            angle_index,
+            pose_index,
+        });
+    }
+    ui.set_scene_panel_chars(Rc::new(VecModel::from(items)).into());
+}
+
+/// Puts `new_tags` from one dropdown list (VIEWS / CAMERA_ANGLES) into a character's
+/// prompt, taking out that list's other tags first (and its {a|b} groups), and keeping
+/// everything else, including other dropdowns' tags.
+fn swap_group(current: &str, new_tags: &str, list: &[(&str, &str)]) -> String {
+    let group = profiles::group_tags(list);
+    let chosen: Vec<String> = parser::parse_prompt(new_tags).into_iter().map(|t| t.normalized).collect();
+    let of_group = |t: &parser::PromptToken| {
+        let n = t.normalized.as_str();
+        if n.starts_with('{') && n.ends_with('}') {
+            // a dynamic group of this list's options
+            let opts: Vec<String> = n.trim_matches(|c| c == '{' || c == '}').split('|').map(|o| o.trim().to_string()).collect();
+            return !opts.is_empty() && opts.iter().any(|o| group.contains(o));
+        }
+        group.iter().any(|g| g == n) && !chosen.iter().any(|c| c == n)
+    };
+    let mut kept: Vec<String> = parser::parse_prompt(current)
+        .into_iter()
+        .filter(|t| !of_group(t))
+        .map(|t| t.raw.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .collect();
+    for t in parser::parse_prompt(new_tags) {
+        if !kept.iter().any(|k| danbooru::key(k) == t.normalized) {
+            kept.push(t.raw.trim().to_string());
+        }
+    }
+    kept.join(", ")
+}
+
+/// Which entry of a dropdown list (index into `list`) a prompt already uses: the first
+/// whose tags are all in it, or the entry with the most matching tags. 0 = none.
+fn list_index_in(prompt: &str, list: &[(&str, &str)]) -> usize {
+    let toks: Vec<String> = parser::parse_prompt(prompt).into_iter().map(|t| t.normalized).collect();
+    // First, look for an entry where all tags match (most specific first)
+    let mut best_all: Option<(usize, usize)> = None;
+    for (i, (_, tags)) in list.iter().enumerate().skip(1) {
+        if tags.starts_with('{') {
+            if toks.iter().any(|tok| tok == *tags) {
+                return i;
+            }
+            continue;
+        }
+        let want: Vec<String> = parser::parse_prompt(tags).into_iter().map(|t| t.normalized).collect();
+        if !want.is_empty()
+            && want.iter().all(|w| toks.contains(w))
+            && best_all.map(|(_, count)| want.len() > count).unwrap_or(true)
+        {
+            best_all = Some((i, want.len()));
+        }
+    }
+    if let Some((i, _)) = best_all {
+        return i;
+    }
+    // Otherwise, find the entry with the most matching tags (at least one)
+    let mut best_any: Option<(usize, usize)> = None;
+    for (i, (_, tags)) in list.iter().enumerate().skip(1) {
+        if tags.starts_with('{') {
+            continue;
+        }
+        let want: Vec<String> = parser::parse_prompt(tags).into_iter().map(|t| t.normalized).collect();
+        let matches = want.iter().filter(|w| toks.contains(w)).count();
+        if matches > 0 && best_any.map(|(_, count)| matches > count).unwrap_or(true) {
+            best_any = Some((i, matches));
+        }
+    }
+    best_any.map(|(i, _)| i).unwrap_or(0)
+}
+
+/// A Scene Panel View / Angle dropdown pick for character `idx`. `auto` takes that
+/// list's tags from the Scene / Pose reference.
+fn scene_list_selected(ui: &AppWindow, state: &State, idx: usize, val: &str, list: &[(&str, &str)], what: &str) {
+    if val.starts_with('+') || val.is_empty() {
+        return;
+    }
+    let current = char_box(ui, idx);
+    let tags = if val.starts_with('⚡') {
+        let group = profiles::group_tags(list);
+        let found: Vec<String> = state
+            .borrow()
+            .scene_ref
+            .as_ref()
+            .map(|r| {
+                r.actions
+                    .iter()
+                    .filter(|a| matches!(a.owner, sceneref::Owner::Scene | sceneref::Owner::All) || a.owner == sceneref::Owner::Char(idx))
+                    .filter(|a| group.contains(&danbooru::key(&a.tag)))
+                    .map(|a| a.tag.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if found.is_empty() {
+            ui.set_scene_ref_status(format!("No {what} found in the Scene reference for Character {}.", idx + 1).into());
+            return;
+        }
+        found.join(", ")
+    } else {
+        match list.iter().find(|(l, _)| *l == val) {
+            Some((_, t)) if !t.is_empty() => t.to_string(),
+            _ => return,
+        }
+    };
+    set_char_box(ui, idx, &swap_group(&current, &tags, list));
+    sync_scene_panel(ui, state);
+    analyze(ui, state);
+    ui.set_scene_ref_status(format!("Character {} {what}: {val}", idx + 1).into());
+}
+
+/// Injects or replaces a pose for a character prompt, replacing existing pose tags from the standard poses list.
+fn inject_pose_into_prompt(current: &str, new_pose: &str) -> String {
+    swap_group(current, new_pose, profiles::POSES)
+}
+
+/// Removes the reference image completely.
+fn clear_scene_ref(ui: &AppWindow, state: &State) {
+    state.borrow_mut().scene_ref_path = None;
+    let old = state.borrow_mut().scene_ref.take();
+    if let Some(r) = old {
+        restore_boxes(ui, &r.boxes);
+    }
+    ui.set_scene_ref_loaded(false);
+    ui.set_scene_ref_thumb(slint::Image::default());
+    ui.set_scene_ref_status("".into());
+    ui.set_scene_panel_open(false);
+    sync_scene_panel(ui, state);
+    update_pending(ui, state);
+    analyze(ui, state);
 }
 
 /// The model for reading images: the selected one if it can see, else any installed one that can.
@@ -553,7 +1574,9 @@ fn run_ai_image(ui: &AppWindow, state: &State) {
     std::thread::spawn(move || {
         let started = std::time::Instant::now();
         // the tagger's tags make the AI's reading more reliable
-        let tags = cached_tags.or_else(|| tagger::is_installed().then(|| tagger::tag_image(&path).ok()).flatten());
+        let tags = cached_tags.or_else(|| {
+            tagger::is_installed().then(|| twoimg::tag_one_fast(&path, &status_sender(&weak)).ok()).flatten()
+        });
         let mut req = req;
         if let Some(t) = &tags {
             req.tag_hints = tagger::build_prompt(t, threshold).prompt;
@@ -587,8 +1610,26 @@ fn run_ai_image(ui: &AppWindow, state: &State) {
     });
 }
 
+/// A thread-safe way to show progress in the image status line and scene status.
+fn status_sender(weak: &slint::Weak<AppWindow>) -> impl Fn(String) + Sync {
+    let weak = std::sync::Mutex::new(weak.clone());
+    move |msg: String| {
+        if let Ok(w) = weak.lock() {
+            let _ = w.upgrade_in_event_loop(move |ui| {
+                ui.set_image_status(msg.clone().into());
+                ui.set_scene_ref_status(msg.into());
+            });
+        }
+    }
+}
+
+/// "Identity Only": an image only supplies who the character is and what they wear.
+fn identity(ui: &AppWindow, prompt: &str) -> String {
+    if ui.get_image_identity_only() { scene::filter_identity_only(prompt) } else { prompt.to_string() }
+}
+
 fn apply_ai_image(ui: &AppWindow, state: &State, res: &ai_engine::ImageAiResult, secs: Option<f32>) {
-    set_prompt_from_image(ui, state, &res.prompt);
+    set_prompt_from_image(ui, state, &identity(ui, &res.prompt));
     let timing = secs.map(|s| format!(" • {s:.0} s")).unwrap_or_default();
     ui.set_image_status(format!("AI{timing}: {}", res.description.trim()).into());
 }
@@ -601,7 +1642,7 @@ fn run_tagger(ui: &AppWindow, state: &State) {
     let weak = ui.as_weak();
     std::thread::spawn(move || {
         let started = std::time::Instant::now();
-        let result = tagger::tag_image(&path);
+        let result = twoimg::tag_one_fast(&path, &status_sender(&weak));
         let secs = started.elapsed().as_secs_f32();
         let _ = weak.upgrade_in_event_loop(move |ui| {
             ui.set_tagger_busy(false);
@@ -624,10 +1665,11 @@ fn apply_tags(ui: &AppWindow, state: &State, secs: Option<f32>) {
         let Some(scores) = st.last_tags.as_ref() else { return };
         tagger::build_prompt(scores, ui.get_tag_threshold())
     };
+    let prompt = identity(ui, &built.prompt);
     if secs.is_some() {
-        set_prompt_from_image(ui, state, &built.prompt);
+        set_prompt_from_image(ui, state, &prompt);
     } else {
-        ui.set_raw_prompt(built.prompt.clone().into());
+        ui.set_raw_prompt(prompt.into());
         analyze(ui, state);
     }
     let timing = secs.filter(|s| *s > 0.0).map(|s| format!(" • {s:.1} s")).unwrap_or_default();
@@ -660,6 +1702,16 @@ struct Settings {
     ollama_host: String,
     /// Whole-UI zoom on top of the monitor's scale (1.0 = Slint's normal size).
     ui_zoom: f32,
+    /// Target checkpoint (0 Anima, 1 Pony, 2 Illustrious, 3 SDXL, 4 SD1.5, 5 Flux).
+    checkpoint_index: i32,
+    /// AI execution mode (0 GPU, 1 CPU, 2 AI Off).
+    ai_mode_index: i32,
+    /// Target camera view (0 None, 1 360, 2 Upper Body, etc.).
+    target_view_index: i32,
+    /// Camera angle (0 None, 1 Straight-on, etc.).
+    angle_index: i32,
+    /// Pose (0 None, 1 Standing, etc.).
+    pose_index: i32,
     /// AI detail level (0 Faithful, 1 Balanced, 2 Rich).
     detail_index: i32,
     /// Image reading: false = Danbooru tagger, true = AI.
@@ -670,6 +1722,24 @@ struct Settings {
     lora_tags: String,
     arranged: bool,
     natural: bool,
+    /// 0 = 1 Character, 1 = 2 Characters.
+    app_tab: i32,
+    char2_prompt: String,
+    char2_lora_tags: String,
+    char3_prompt: String,
+    char3_lora_tags: String,
+    char4_prompt: String,
+    char4_lora_tags: String,
+    char_break: bool,
+    scene_prompt: String,
+    image_identity_only: bool,
+    /// THEME dropdown: 0 OLED Pitch Black, 1 M3 Deep Violet, 2 OLED Cyber Emerald,
+    /// 3 M3 Ocean Blue, 4 M3 Crimson Ember, 5 M3 Mocha Gold.
+    theme_index: i32,
+    /// Prompt vs LoRA box split inside each character's card.
+    lora_split_ratios: [f32; 4],
+    /// The Options drawer open or closed.
+    options_expanded: bool,
 }
 
 impl Default for Settings {
@@ -679,6 +1749,11 @@ impl Default for Settings {
             side_width: 320.0,
             cards_strip_height: 250.0,
             ui_zoom: 0.75,
+            checkpoint_index: 0,
+            ai_mode_index: 0,
+            target_view_index: 0,
+            angle_index: 0,
+            pose_index: 0,
             detail_index: 1,
             image_use_ai: false,
             raw_prompt: String::new(),
@@ -686,6 +1761,19 @@ impl Default for Settings {
             lora_tags: String::new(),
             arranged: false,
             natural: false,
+            app_tab: 0,
+            char2_prompt: String::new(),
+            char2_lora_tags: String::new(),
+            char3_prompt: String::new(),
+            char3_lora_tags: String::new(),
+            char4_prompt: String::new(),
+            char4_lora_tags: String::new(),
+            char_break: true,
+            scene_prompt: String::new(),
+            image_identity_only: false,
+            theme_index: 1,
+            lora_split_ratios: [0.7; 4],
+            options_expanded: true,
             ollama_host: "localhost:11434".into(),
         }
     }
@@ -707,6 +1795,11 @@ fn load_settings(ui: &AppWindow) {
     ui.set_side_width(st.side_width.max(160.0));
     ui.set_cards_strip_height(st.cards_strip_height.max(140.0));
     ui.set_ui_zoom(st.ui_zoom.clamp(ZOOM_MIN, ZOOM_MAX));
+    ui.set_checkpoint_index(st.checkpoint_index.clamp(0, 5));
+    ui.set_ai_mode_index(st.ai_mode_index.clamp(0, 2));
+    ui.set_target_view_index(st.target_view_index.clamp(0, 7));
+    ui.set_angle_index(st.angle_index.max(0));
+    ui.set_pose_index(st.pose_index.max(0));
     ui.set_detail_index(st.detail_index.clamp(0, 2));
     ui.set_image_use_ai(st.image_use_ai);
     ui.set_raw_prompt(st.raw_prompt.into());
@@ -714,6 +1807,23 @@ fn load_settings(ui: &AppWindow) {
     ui.set_lora_tags(st.lora_tags.into());
     ui.set_arranged_enabled(st.arranged);
     ui.set_natural_enabled(st.natural);
+    ui.set_app_tab(st.app_tab.clamp(0, 3));
+    ui.set_char2_prompt(st.char2_prompt.into());
+    ui.set_char2_lora_tags(st.char2_lora_tags.into());
+    ui.set_char3_prompt(st.char3_prompt.into());
+    ui.set_char3_lora_tags(st.char3_lora_tags.into());
+    ui.set_char4_prompt(st.char4_prompt.into());
+    ui.set_char4_lora_tags(st.char4_lora_tags.into());
+    ui.set_char_break_enabled(st.char_break);
+    ui.set_scene_prompt(st.scene_prompt.into());
+    ui.set_image_identity_only(st.image_identity_only);
+    ui.set_theme_index(st.theme_index.clamp(0, 5));
+    ui.set_options_expanded(st.options_expanded);
+    let [r1, r2, r3, r4] = st.lora_split_ratios.map(|r| r.clamp(0.2, 0.9));
+    ui.set_lora_split_ratio_c1(r1);
+    ui.set_lora_split_ratio_c2(r2);
+    ui.set_lora_split_ratio_c3(r3);
+    ui.set_lora_split_ratio_c4(r4);
     if !st.ollama_host.trim().is_empty() {
         ui.set_ollama_host(st.ollama_host.into());
     }
@@ -725,6 +1835,11 @@ fn save_settings(ui: &AppWindow) {
         side_width: ui.get_side_width(),
         cards_strip_height: ui.get_cards_strip_height(),
         ui_zoom: ui.get_ui_zoom(),
+        checkpoint_index: ui.get_checkpoint_index(),
+        ai_mode_index: ui.get_ai_mode_index(),
+        target_view_index: ui.get_target_view_index(),
+        angle_index: ui.get_angle_index(),
+        pose_index: ui.get_pose_index(),
         detail_index: ui.get_detail_index(),
         image_use_ai: ui.get_image_use_ai(),
         raw_prompt: ui.get_raw_prompt().to_string(),
@@ -732,6 +1847,24 @@ fn save_settings(ui: &AppWindow) {
         lora_tags: ui.get_lora_tags().to_string(),
         arranged: ui.get_arranged_enabled(),
         natural: ui.get_natural_enabled(),
+        app_tab: ui.get_app_tab(),
+        char2_prompt: ui.get_char2_prompt().to_string(),
+        char2_lora_tags: ui.get_char2_lora_tags().to_string(),
+        char3_prompt: ui.get_char3_prompt().to_string(),
+        char3_lora_tags: ui.get_char3_lora_tags().to_string(),
+        char4_prompt: ui.get_char4_prompt().to_string(),
+        char4_lora_tags: ui.get_char4_lora_tags().to_string(),
+        char_break: ui.get_char_break_enabled(),
+        scene_prompt: ui.get_scene_prompt().to_string(),
+        image_identity_only: ui.get_image_identity_only(),
+        theme_index: ui.get_theme_index(),
+        options_expanded: ui.get_options_expanded(),
+        lora_split_ratios: [
+            ui.get_lora_split_ratio_c1(),
+            ui.get_lora_split_ratio_c2(),
+            ui.get_lora_split_ratio_c3(),
+            ui.get_lora_split_ratio_c4(),
+        ],
         ollama_host: ui.get_ollama_host().to_string(),
     };
     if let Some(path) = settings_path() {
@@ -787,6 +1920,26 @@ fn main() -> Result<(), slint::PlatformError> {
     ui.set_pose_labels(ModelRc::new(VecModel::from(
         profiles::POSES.iter().map(|(l, _)| SharedString::from(*l)).collect::<Vec<_>>(),
     )));
+    let mut scene_poses = vec![
+        SharedString::from("+ Add Pose ▾"),
+        SharedString::from("⚡ Auto (from Scene Ref)"),
+        SharedString::from("🎲 Dynamic / Random Pose"),
+    ];
+    for (lbl, _) in profiles::POSES.iter().skip(1) {
+        if *lbl != "Random pose (dynamic prompt)" {
+            scene_poses.push(SharedString::from(*lbl));
+        }
+    }
+    ui.set_scene_pose_labels(ModelRc::new(VecModel::from(scene_poses)));
+    // Scene Panel View / Angle: "+ Add …", "⚡ Auto (from Scene Ref)", then the list from index 1
+    for (list, add, set) in [
+        (profiles::VIEWS, "+ Add View ▾", AppWindow::set_scene_view_labels as fn(&AppWindow, ModelRc<SharedString>)),
+        (profiles::CAMERA_ANGLES, "+ Add Angle ▾", AppWindow::set_scene_angle_labels),
+    ] {
+        let mut labels = vec![SharedString::from(add), SharedString::from("⚡ Auto (from Scene Ref)")];
+        labels.extend(list.iter().skip(1).map(|(l, _)| SharedString::from(*l)));
+        set(&ui, ModelRc::new(VecModel::from(labels)));
+    }
     let state: State = Rc::new(RefCell::new(AppState::default()));
 
     ui.set_change_cards(ModelRc::from(state.borrow().cards_model.clone()));
@@ -844,6 +1997,7 @@ fn main() -> Result<(), slint::PlatformError> {
                     .changes
                     .iter_mut()
                     .chain(st.ai_changes.iter_mut())
+                    .chain(st.others.iter_mut().flat_map(|o| o.changes.iter_mut().chain(o.ai_changes.iter_mut())))
                     .find(|c| c.id as i32 == card_id)
                 {
                     ch.mode = mode.clamp(0, 2) as u8;
@@ -966,10 +2120,36 @@ fn main() -> Result<(), slint::PlatformError> {
                 st.image_path = Some(path);
                 st.last_tags = None;
                 st.image_ai = None;
+                st.two_tags = None;
+                st.two_ai = None;
+                st.two_before_image = None;
+                st.char_images = [None, None, None, None];
+                st.char_paths = [None, None, None, None];
                 st.prompt_before_image = None; // Undo goes back to the prompt from before this image
             }
             ui.set_image_can_undo(false);
-            image_extract(&ui, &state);
+            // nothing is read until Read Image is pressed
+            ui.set_image_status(
+                if tagger::is_installed() {
+                    "Image loaded. Press Read Image (pick Tagger or AI first)."
+                } else {
+                    "Image loaded. Download the Danbooru tagger once (1.2 GB) to read it."
+                }
+                .into(),
+            );
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_read_image_requested(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            // reference images first (scene, then characters); otherwise the loaded image
+            if ui.get_images_pending() {
+                run_read_queue(&ui, &state);
+            } else {
+                image_extract(&ui, &state, true);
+            }
         });
     }
     {
@@ -982,6 +2162,8 @@ fn main() -> Result<(), slint::PlatformError> {
                 st.image_path = None;
                 st.last_tags = None;
                 st.image_ai = None;
+                st.two_tags = None;
+                st.two_ai = None;
             }
             ui.set_image_loaded(false);
             ui.set_image_thumb(slint::Image::default());
@@ -989,12 +2171,335 @@ fn main() -> Result<(), slint::PlatformError> {
             ui.set_status_message("Image removed. Your prompt is unchanged (Undo still restores the one from before).".into());
         });
     }
+    // --- Theme: saved as soon as it changes ---
+    {
+        let weak = ui.as_weak();
+        ui.on_theme_changed(move || {
+            if let Some(ui) = weak.upgrade() {
+                save_settings(&ui);
+            }
+        });
+    }
+
+    // --- Scene / Pose reference image ---
+    {
+        let weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_load_scene_ref_requested(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            let Some(path) = rfd::FileDialog::new()
+                .set_title("Pick a reference image for the pose and the scene")
+                .add_filter("Images", &["png", "jpg", "jpeg", "webp"])
+                .pick_file()
+            else {
+                return;
+            };
+            if let Ok(img) = slint::Image::load_from_path(&path) {
+                ui.set_scene_ref_thumb(img);
+            }
+            ui.set_scene_ref_loaded(true);
+            // a new reference replaces the old one: its tags come out now, the new
+            // one's go in on Read
+            let old_boxes = {
+                let mut st = state.borrow_mut();
+                st.scene_ref_path = Some(path);
+                st.scene_ref.take().map(|r| r.boxes).unwrap_or_default()
+            };
+            restore_boxes(&ui, &old_boxes);
+            analyze(&ui, &state);
+            ui.set_scene_ref_status("Scene image loaded. Click '⚡ Auto Scene (Fast)' or '🧠 Read (AI)'.".into());
+            update_pending(&ui, &state);
+            sync_scene_panel(&ui, &state);
+            ui.set_scene_panel_open(true);
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_remove_scene_ref_requested(move || {
+            if let Some(ui) = weak.upgrade() {
+                clear_scene_ref(&ui, &state);
+            }
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_char_image_requested(move |which| {
+            let Some(ui) = weak.upgrade() else { return };
+            let which = (which.max(0) as usize).min(tab_chars(&ui) - 1);
+            let Some(path) = rfd::FileDialog::new()
+                .set_title(&format!("Pick a reference image for character {}", which + 1))
+                .add_filter("Images", &["png", "jpg", "jpeg", "webp"])
+                .pick_file()
+            else {
+                return;
+            };
+            if let Ok(img) = slint::Image::load_from_path(&path) {
+                match which {
+                    0 => { ui.set_char1_image_thumb(img.clone()); ui.set_char1_image_loaded(true); }
+                    1 => { ui.set_char2_image_thumb(img.clone()); ui.set_char2_image_loaded(true); }
+                    2 => { ui.set_char3_image_thumb(img.clone()); ui.set_char3_image_loaded(true); }
+                    _ => { ui.set_char4_image_thumb(img.clone()); ui.set_char4_image_loaded(true); }
+                }
+                state.borrow_mut().char_thumbs[which] = Some(img);
+            }
+            {
+                let mut st = state.borrow_mut();
+                st.char_paths[which] = Some(path);
+                st.char_images[which] = None;
+            }
+            update_pending(&ui, &state);
+            ui.set_image_status(format!("Character {} image loaded. Click Read when ready.", which + 1).into());
+        });
+    }
+    // --- Scene Panel callbacks: Auto Scene, Add Action, Overrides ---
+    {
+        let weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_auto_scene_requested(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            // no scene image yet: pick one, then scan it right away (one click, not two)
+            if state.borrow().scene_ref_path.is_none() {
+                ui.invoke_load_scene_ref_requested();
+                if state.borrow().scene_ref_path.is_none() {
+                    return; // the picker was cancelled
+                }
+            }
+            run_scene_fast_scan(&ui, &state);
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_scene_overrides_changed(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            let setting = ui.get_scene_override_setting().to_string();
+            let cleaned = twoimg::clean_list(&setting, true);
+            ui.set_scene_prompt(cleaned.into());
+            apply_scene_ref(&ui, &state);
+            analyze(&ui, &state);
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_scene_view_selected({
+            let weak = weak.clone();
+            let state = state.clone();
+            move |which, val| {
+                if let Some(ui) = weak.upgrade() {
+                    scene_list_selected(&ui, &state, which.max(0) as usize, &val, profiles::VIEWS, "view");
+                }
+            }
+        });
+        ui.on_scene_angle_selected({
+            let weak = weak.clone();
+            let state = state.clone();
+            move |which, val| {
+                if let Some(ui) = weak.upgrade() {
+                    scene_list_selected(&ui, &state, which.max(0) as usize, &val, profiles::CAMERA_ANGLES, "camera angle");
+                }
+            }
+        });
+        ui.on_scene_pose_selected(move |which, val| {
+            let Some(ui) = weak.upgrade() else { return };
+            let idx = which.max(0) as usize;
+            let val_str = val.to_string();
+
+            if val_str == "+ Add Pose ▾" || val_str.is_empty() {
+                return;
+            }
+
+            let current = char_box(&ui, idx);
+
+            let new_prompt = if val_str == "⚡ Auto (from Scene Ref)" {
+                let group = profiles::group_tags(profiles::POSES);
+                let detected: Vec<String> = {
+                    let st = state.borrow();
+                    if let Some(scene) = st.scene_ref.as_ref() {
+                        scene.actions.iter()
+                            .filter(|a| matches!(a.owner, sceneref::Owner::Char(c) if c == idx) || matches!(a.owner, sceneref::Owner::All))
+                            .filter(|a| group.contains(&danbooru::key(&a.tag)))
+                            .map(|a| a.tag.clone())
+                            .collect()
+                    } else {
+                        Vec::new()
+                    }
+                };
+                if detected.is_empty() {
+                    ui.set_scene_ref_status(format!("No pose detected in Scene reference for Character {}.", idx + 1).into());
+                    return;
+                }
+                inject_pose_into_prompt(&current, &detected.join(", "))
+            } else if val_str == "🎲 Dynamic / Random Pose" {
+                inject_pose_into_prompt(&current, "{standing|sitting|leaning against wall|dynamic pose|looking back|arms up}")
+            } else {
+                let pose_tag = profiles::POSES.iter()
+                    .find(|(lbl, _)| *lbl == val_str)
+                    .map(|(_, tags)| *tags)
+                    .unwrap_or(&val_str);
+                if pose_tag.is_empty() {
+                    return;
+                }
+                inject_pose_into_prompt(&current, pose_tag)
+            };
+
+            set_char_box(&ui, idx, &new_prompt);
+            sync_scene_panel(&ui, &state);
+            analyze(&ui, &state);
+            ui.set_scene_ref_status(format!("Character {} pose: {}", idx + 1, val_str).into());
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_scene_action_add_requested(move |which| {
+            let Some(ui) = weak.upgrade() else { return };
+            let idx = which.max(0) as usize;
+            let current = char_box(&ui, idx);
+
+            // 1. Check if a scene reference detected poses for this character
+            let group = profiles::group_tags(profiles::POSES);
+            let detected: Vec<String> = {
+                let st = state.borrow();
+                if let Some(scene) = st.scene_ref.as_ref() {
+                    scene.actions.iter()
+                        .filter(|a| matches!(a.owner, sceneref::Owner::Char(c) if c == idx) || matches!(a.owner, sceneref::Owner::All))
+                        .filter(|a| group.contains(&danbooru::key(&a.tag)))
+                        .map(|a| a.tag.clone())
+                        .collect()
+                } else {
+                    Vec::new()
+                }
+            };
+
+            let new_prompt = if !detected.is_empty() {
+                inject_pose_into_prompt(&current, &detected.join(", "))
+            } else {
+                inject_pose_into_prompt(&current, "standing")
+            };
+
+            set_char_box(&ui, idx, &new_prompt);
+            sync_scene_panel(&ui, &state);
+            analyze(&ui, &state);
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_scene_char_clear_requested(move |which| {
+            let Some(ui) = weak.upgrade() else { return };
+            let idx = which.max(0) as usize;
+            set_char_box(&ui, idx, "");
+            let changed = {
+                let mut st = state.borrow_mut();
+                if let Some(r) = st.scene_ref.as_mut() {
+                    sceneref::clear_char_actions(&mut r.actions, idx);
+                    true
+                } else {
+                    false
+                }
+            };
+            if changed {
+                apply_scene_ref(&ui, &state);
+            }
+            sync_scene_panel(&ui, &state);
+            analyze(&ui, &state);
+            ui.set_scene_ref_status(format!("Character {} cleared.", idx + 1).into());
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_scene_char_text_edited(move |which, text| {
+            let Some(ui) = weak.upgrade() else { return };
+            let idx = which.max(0) as usize;
+            set_char_box(&ui, idx, &text);
+            analyze(&ui, &state);
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_scene_action_move_requested(move |from, to| {
+            let Some(ui) = weak.upgrade() else { return };
+            let from = from.max(0) as usize;
+            let to = to.max(0) as usize;
+            let changed = {
+                let mut st = state.borrow_mut();
+                if let Some(r) = st.scene_ref.as_mut() {
+                    sceneref::move_char_actions(&mut r.actions, from, to);
+                    true
+                } else {
+                    false
+                }
+            };
+            if changed {
+                apply_scene_ref(&ui, &state);
+                sync_scene_panel(&ui, &state);
+                ui.set_scene_ref_status(format!("Moved pose from Character {} to Character {}.", from + 1, to + 1).into());
+            }
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_remove_char_image_requested(move |which| {
+            let Some(ui) = weak.upgrade() else { return };
+            let idx = (which.max(0) as usize).min(3);
+            {
+                let mut st = state.borrow_mut();
+                st.char_paths[idx] = None;
+                st.char_images[idx] = None;
+                st.char_thumbs[idx] = None;
+            }
+            match idx {
+                0 => { ui.set_char1_image_loaded(false); ui.set_char1_image_thumb(slint::Image::default()); }
+                1 => { ui.set_char2_image_loaded(false); ui.set_char2_image_thumb(slint::Image::default()); }
+                2 => { ui.set_char3_image_loaded(false); ui.set_char3_image_thumb(slint::Image::default()); }
+                _ => { ui.set_char4_image_loaded(false); ui.set_char4_image_thumb(slint::Image::default()); }
+            }
+            update_pending(&ui, &state);
+            ui.set_status_message(format!("Character {} reference image removed.", idx + 1).into());
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_clear_char_requested(move |which| {
+            let Some(ui) = weak.upgrade() else { return };
+            let idx = (which.max(0) as usize).min(3);
+            match idx {
+                0 => { ui.set_raw_prompt("".into()); ui.set_lora_tags("".into()); }
+                1 => { ui.set_char2_prompt("".into()); ui.set_char2_lora_tags("".into()); }
+                2 => { ui.set_char3_prompt("".into()); ui.set_char3_lora_tags("".into()); }
+                _ => { ui.set_char4_prompt("".into()); ui.set_char4_lora_tags("".into()); }
+            }
+            analyze(&ui, &state);
+            ui.set_status_message(format!("Character {} cleared.", idx + 1).into());
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_identity_changed(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            // re-filter what was already read, no models run again
+            image_extract(&ui, &state, false);
+            for which in 0..tab_chars(&ui) {
+                if state.borrow().char_images[which].is_some() {
+                    apply_char_image(&ui, &state, which);
+                }
+            }
+        });
+    }
     {
         let weak = ui.as_weak();
         let state = state.clone();
         ui.on_image_mode_changed(move || {
             if let Some(ui) = weak.upgrade() {
-                image_extract(&ui, &state);
+                image_extract(&ui, &state, false);
             }
         });
     }
@@ -1003,6 +2508,12 @@ fn main() -> Result<(), slint::PlatformError> {
         let state = state.clone();
         ui.on_tag_threshold_changed(move || {
             let Some(ui) = weak.upgrade() else { return };
+            if ui.get_app_tab() >= 1 {
+                if !ui.get_image_use_ai() && state.borrow().two_tags.is_some() {
+                    two_image_extract(&ui, &state, false);
+                }
+                return;
+            }
             let has_tags = state.borrow().last_tags.is_some();
             if has_tags && !ui.get_image_use_ai() {
                 apply_tags(&ui, &state, None);
@@ -1046,6 +2557,17 @@ fn main() -> Result<(), slint::PlatformError> {
         let state = state.clone();
         ui.on_undo_image_prompt_requested(move || {
             let Some(ui) = weak.upgrade() else { return };
+            let two = state.borrow_mut().two_before_image.take();
+            if let Some((boxes, scene)) = two {
+                for (i, b) in boxes.iter().enumerate() {
+                    set_char_box(&ui, i, b);
+                }
+                ui.set_scene_prompt(scene.into());
+                ui.set_image_can_undo(false);
+                analyze(&ui, &state);
+                ui.set_status_message("Restored your previous prompts.".into());
+                return;
+            }
             let previous = state.borrow_mut().prompt_before_image.take();
             if let Some(text) = previous {
                 ui.set_raw_prompt(text.into());
@@ -1154,10 +2676,15 @@ fn main() -> Result<(), slint::PlatformError> {
                     ui.set_status_message("Deep scan starts as soon as the AI has read the image…".into());
                     return;
                 }
-                let unread = state.borrow().image_ai.is_none();
+                let two_tab = ui.get_app_tab() >= 1;
+                let unread = if two_tab { state.borrow().two_ai.is_none() } else { state.borrow().image_ai.is_none() };
                 if unread && vision_model(&ui, &state).is_some() {
                     state.borrow_mut().scan_after_image = true;
-                    run_ai_image(&ui, &state);
+                    if two_tab {
+                        run_two_image(&ui, &state);
+                    } else {
+                        run_ai_image(&ui, &state);
+                    }
                     ui.set_status_message("Reading the image with AI first, then running the deep scan…".into());
                     return;
                 }
@@ -1171,9 +2698,22 @@ fn main() -> Result<(), slint::PlatformError> {
                 ui.set_status_message("Pick an installed AI model first.".into());
                 return;
             };
+            let mut config = scan_config(&ui);
+            let prompts = char_prompts(&ui, &config);
+            let c1 = prompts[0].clone();
+            if config.two_char {
+                // a pasted "… BREAK …" prompt was split: the scan sees the parts
+                config.char2_prompt_raw = prompts.get(1).cloned().unwrap_or_default();
+                for (i, p) in prompts.iter().enumerate().skip(2) {
+                    if let Some(slot) = config.more_chars.get_mut(i - 2) {
+                        slot.0 = p.clone();
+                    }
+                }
+            }
+            let scanned_key = ai_key(&ui);
             let req = AiScanRequest {
-                raw_prompt: raw.clone(),
-                config: scan_config(&ui),
+                raw_prompt: c1,
+                config,
                 mode: AiMode::from_index(ui.get_ai_mode_index()),
                 host: ui.get_ollama_host().to_string(),
                 model: choice.name.clone(),
@@ -1201,18 +2741,39 @@ fn main() -> Result<(), slint::PlatformError> {
                             Ok((ai_out, placement)) => {
                                 ui.set_run_badge(format!("Last scan: {placement}").into());
                                 let where_ran = format!("ran on {placement}");
-                                if ui.get_raw_prompt().as_str() != raw {
+                                if ai_key(&ui) != scanned_key {
                                     ui.set_status_message("Prompt changed during the AI scan — result discarded. Run it again.".into());
                                     return;
                                 }
                                 analyze(&ui, state);
                                 let found = {
                                     let mut st = state.borrow_mut();
-                                    let tokens = parser::parse_prompt(&raw);
-                                    st.ai_changes = ai_engine::convert_ai_changes(&ai_out.changes, &tokens, &st.changes);
+                                    let tokens = ai_engine::request_tokens(&req);
+                                    let rules: Vec<PromptChange> =
+                                        st.changes.iter().chain(st.others.iter().flat_map(|o| o.changes.iter())).cloned().collect();
+                                    let cards = ai_engine::convert_ai_changes(&ai_out.changes, &tokens, &rules);
+                                    // on the 2 Characters tab, a card about character 2's tags goes with character 2
+                                    let norms = |p: &str| parser::parse_prompt(p).into_iter().map(|t| t.normalized).collect::<Vec<_>>();
+                                    // on the multi-character tabs, a card about one character's tags goes with that character
+                                    let n = req.config.char_count();
+                                    let mut boxes = vec![norms(&with_scene(&req.raw_prompt, &req.config))];
+                                    boxes.extend((1..n).map(|i| norms(req.config.prompt_of(i))));
+                                    let mut lists: Vec<Vec<PromptChange>> = vec![Vec::new(); n];
+                                    for c in cards {
+                                        let t = norms(&c.original);
+                                        let owner = (1..n)
+                                            .find(|&i| !t.is_empty() && t.iter().all(|x| boxes[i].contains(x)) && !t.iter().all(|x| boxes[0].contains(x)))
+                                            .unwrap_or(0);
+                                        lists[owner].push(c);
+                                    }
+                                    let mut lists = lists.into_iter();
+                                    st.ai_changes = lists.next().unwrap_or_default();
+                                    for (o, l) in st.others.iter_mut().zip(lists) {
+                                        o.ai_changes = l;
+                                    }
                                     st.ai_scene = SceneResult::from_ai(&ai_out, scan_config(&ui).checkpoint);
                                     st.ai_key = Some(ai_key(&ui));
-                                    st.ai_changes.len()
+                                    st.ai_changes.len() + st.others.iter().map(|o| o.ai_changes.len()).sum::<usize>()
                                 };
                                 let has_rewrite = state.borrow().ai_scene.as_ref().map(|s| !s.improved_prompt.is_empty()).unwrap_or(false);
                                 if has_rewrite {
@@ -1306,4 +2867,43 @@ thread_local! {
     /// The UI-thread `State`, reachable from `upgrade_in_event_loop` closures
     /// (those must be `Send`, so they can't capture the `Rc` directly).
     static STATE: RefCell<Option<State>> = const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+mod scene_panel_tests {
+    use super::*;
+
+    #[test]
+    fn view_and_angle_swap_only_their_own_tags() {
+        let p = "1girl, red hair, upper body, from above, high angle, standing";
+        let v = swap_group(p, "full body", profiles::VIEWS);
+        assert_eq!(v, "1girl, red hair, from above, high angle, standing, full body");
+        let a = swap_group(&v, "dutch angle, tilted frame", profiles::CAMERA_ANGLES);
+        assert_eq!(a, "1girl, red hair, standing, full body, dutch angle, tilted frame");
+        assert_eq!(list_index_in(&a, profiles::VIEWS), 4);
+        assert_eq!(list_index_in(&a, profiles::CAMERA_ANGLES), 6);
+        // a dynamic angle group is replaced by a fixed angle
+        let d = swap_group("1girl, {from above|from below}", "from side, profile", profiles::CAMERA_ANGLES);
+        assert_eq!(d, "1girl, from side, profile");
+    }
+
+    #[test]
+    fn single_tag_view_and_angle_detection() {
+        // "close-up" alone matches Close-up / portrait (index 1)
+        assert_eq!(list_index_in("1girl, close-up, smile", profiles::VIEWS), 1);
+        // "dutch angle" alone matches Dutch angle (index 6)
+        assert_eq!(list_index_in("1girl, dutch angle, sword", profiles::CAMERA_ANGLES), 6);
+        // "peace sign" alone matches Peace sign (index 8)
+        let peace_idx = profiles::POSES.iter().position(|(l, _)| l.starts_with("Peace sign")).unwrap();
+        assert_eq!(list_index_in("1girl, peace sign, school uniform", profiles::POSES), peace_idx);
+    }
+
+    #[test]
+    fn pose_injection_preserves_other_dynamic_groups() {
+        let p = "1girl, {red dress|blue dress}, standing";
+        let new_p = inject_pose_into_prompt(p, "sitting");
+        assert!(new_p.contains("{red dress|blue dress}"), "Dynamic outfit was erased! {new_p}");
+        assert!(new_p.contains("sitting"));
+        assert!(!new_p.contains("standing"));
+    }
 }

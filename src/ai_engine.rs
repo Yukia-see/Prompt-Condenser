@@ -148,6 +148,18 @@ pub fn prompt_guidance(raw_prompt: &str, config: &ScanConfig) -> Vec<String> {
     let norms: Vec<&str> = tokens.iter().map(|t| t.normalized.as_str()).collect();
     let has = |w: &str| norms.iter().any(|n| *n == w);
     let mut g = Vec::new();
+    if config.two_char {
+        let n = config.char_count();
+        g.push(format!(
+            "{} CHARACTERS: the prompt is split into SCENE and CHARACTER 1 to CHARACTER {n}. Keep every hair, eye, \
+             body, outfit, expression and pose tag with the character it belongs to; never move a feature from one to \
+             another. SCENE and any camera, setting, lighting or style tags are shared. Rearrange freely: a scene tag \
+             written under a character belongs with the shared tags, and a character's feature written under SCENE \
+             belongs to that character.",
+            ["", "", "TWO", "THREE", "FOUR"][n.min(4)]
+        ),
+        );
+    }
 
     // Who is in it
     let person_counts: Vec<&str> = norms
@@ -163,11 +175,11 @@ pub fn prompt_guidance(raw_prompt: &str, config: &ScanConfig) -> Vec<String> {
         || person_counts.iter().any(|n| !n.starts_with('1'))
         || has("multiple girls")
         || has("multiple boys");
-    if scenery {
+    if scenery && !config.two_char {
         g.push("This is a scenery / no-people image. Never add characters or body tags; the framing and body-part rules \
                 don't apply. Improve composition, depth (foreground / background), atmosphere, weather, time of day and \
                 lighting instead.".into());
-    } else if multi {
+    } else if multi && !config.two_char {
         g.push(format!(
             "There are several characters ({}). Keep the count exactly. Keep each character's traits attached to the \
              right person and don't merge or swap them; prefer interaction or placement tags (e.g. side by side, facing \
@@ -213,19 +225,33 @@ pub fn prompt_guidance(raw_prompt: &str, config: &ScanConfig) -> Vec<String> {
                 camera angle; don't soften, censor or drop them.".into());
     }
 
-    // Length: expand short prompts, condense long ones
+    // Length: expand short prompts, condense long ones, as far as the detail level allows
+    use crate::profiles::{CheckpointProfile, DetailLevel};
     let (clip_tokens, _) = estimate_clip_tokens(raw_prompt);
-    if tokens.len() < 10 {
+    // CLIP reads 75-token chunks, and BREAK gives each character its own chunk(s);
+    // Anima (an LLM text encoder) and Flux (T5) have no such limit
+    let max_clip_tokens = 75 * if config.two_char { config.char_count() } else { 1 };
+    let clip = !matches!(config.checkpoint, CheckpointProfile::Anima | CheckpointProfile::Flux);
+    if tokens.len() < 10 && config.detail == DetailLevel::Balanced && !config.two_char {
         g.push(format!(
             "The prompt is short ({} tags). Expand it into a complete scene (about 20-35 tags) with details that fit what's \
              there; add them as changes with action 'add'.",
             tokens.len()
         ));
-    } else if clip_tokens > 75 {
-        g.push(format!(
-            "The prompt is long (about {clip_tokens} CLIP tokens). Condensing comes first: merge redundant tags and drop \
-             filler so improved_prompt fits in about 75 tokens if possible, before adding anything new."
-        ));
+    } else if clip && clip_tokens > max_clip_tokens && config.detail != DetailLevel::Rich {
+        g.push(if config.two_char {
+            format!(
+                "The prompt is long (about {clip_tokens} CLIP tokens for {} characters). Condensing comes first: merge \
+                 redundant tags and drop filler so each character fits in about 75 tokens if possible, before adding \
+                 anything new.",
+                config.char_count()
+            )
+        } else {
+            format!(
+                "The prompt is long (about {clip_tokens} CLIP tokens). Condensing comes first: merge redundant tags and \
+                 drop filler so improved_prompt fits in about 75 tokens if possible, before adding anything new."
+            )
+        });
     }
 
     // What the scene already has vs what's missing
@@ -234,7 +260,10 @@ pub fn prompt_guidance(raw_prompt: &str, config: &ScanConfig) -> Vec<String> {
         .details
         .iter()
         .map(|(k, _)| k.as_str())
-        .filter(|k| matches!(*k, "Setting" | "Light / time" | "Expression" | "Camera" | "Style"))
+        .filter(|k| {
+            matches!(*k, "Setting" | "Light / time" | "Expression" | "Camera" | "Style")
+                && !(*k == "Camera" && (config.camera_angle > 0 || config.target_view != crate::profiles::TargetView::None))
+        })
         .collect();
     if !present.is_empty() {
         g.push(format!(
@@ -242,28 +271,43 @@ pub fn prompt_guidance(raw_prompt: &str, config: &ScanConfig) -> Vec<String> {
             present.join(", ").to_lowercase()
         ));
     }
-    if !scene.missing.is_empty() && !scenery {
-        g.push(format!(
-            "Not specified yet: {}. Fill these in with details that match the rest of the scene.",
-            scene.missing.join(", ")
-        ));
-    } else if scenery && scene.missing.contains(&"lighting / time of day") {
+    let missing: Vec<&str> = scene
+        .missing
+        .into_iter()
+        .filter(|&m| !(m == "camera framing" && (config.target_view != crate::profiles::TargetView::None || config.camera_angle > 0)))
+        .collect();
+    if !missing.is_empty() && !scenery {
+        g.push(if config.detail == DetailLevel::Faithful {
+            format!(
+                "Not specified yet: {}. Point these out in issues; FAITHFUL allows filling only the most important one.",
+                missing.join(", ")
+            )
+        } else {
+            format!("Not specified yet: {}. Fill these in with details that match the rest of the scene.", missing.join(", "))
+        });
+    } else if scenery && missing.contains(&"lighting / time of day") {
         g.push("No lighting or time of day yet: add one that suits the place.".into());
     }
 
     // What the rule engine already found
-    let rules = crate::analyzer::analyze_with_rules(&tokens, config);
-    let conflicts: Vec<String> = rules
-        .changes
-        .iter()
-        .filter(|c| matches!(c.action, crate::analyzer::ChangeAction::FramingSafeSwap | crate::analyzer::ChangeAction::PositioningConflict))
-        .map(|c| c.original.clone())
-        .collect();
-    if !conflicts.is_empty() {
-        g.push(format!(
-            "The rule checker already found framing conflicts with: {}. improved_prompt must resolve these too.",
-            conflicts.join(", ")
-        ));
+    if config.resolve_conflicts_enabled {
+        let rules = crate::analyzer::analyze_with_rules(&tokens, config);
+        let mut conflicts: Vec<String> = Vec::new();
+        for c in rules.changes {
+            if matches!(
+                c.action,
+                crate::analyzer::ChangeAction::FramingSafeSwap | crate::analyzer::ChangeAction::PositioningConflict
+            ) && !conflicts.contains(&c.original)
+            {
+                conflicts.push(c.original);
+            }
+        }
+        if !conflicts.is_empty() {
+            g.push(format!(
+                "The rule checker already found framing conflicts with: {}. improved_prompt must resolve these too.",
+                conflicts.join(", ")
+            ));
+        }
     }
     g
 }
@@ -353,11 +397,23 @@ pub fn build_ai_system_and_user_prompt_for(raw_prompt: &str, config: &ScanConfig
     };
     let pinned = if config.pinned_emphasis_raw.trim().is_empty() {
         "none".to_string()
-    } else {
+    } else if config.checkpoint.uses_explicit_weights() {
         format!("{} (keep them, weighted {:.2})", config.pinned_emphasis_raw.trim(), config.emphasis_weight)
+    } else {
+        format!("{} (keep them prominent in the description)", config.pinned_emphasis_raw.trim())
     };
-    let quality = config.checkpoint.canonical_quality_tags();
-    let quality = if quality.is_empty() { "none (natural language only)".to_string() } else { quality.join(", ") };
+    let quality_tags = config.checkpoint.canonical_quality_tags();
+    let quality_line = if quality_tags.is_empty() {
+        "Quality tags for this checkpoint: none (natural language only). Drop quality filler (masterpiece, best quality, \
+         8k, 4k, uhd, ultra detailed, hyperdetailed, highly detailed, best resolution, octane render...)."
+            .to_string()
+    } else {
+        format!(
+            "Quality tags for this checkpoint: {}. Use exactly these; drop other quality filler (8k, 4k, uhd, ultra \
+             detailed, hyperdetailed, highly detailed, best resolution, octane render...).",
+            quality_tags.join(", ")
+        )
+    };
     let weights = if config.checkpoint.uses_explicit_weights() {
         format!("Use (tag:weight) syntax sparingly; never above {:.2}.", config.checkpoint.max_safe_weight())
     } else {
@@ -366,12 +422,19 @@ pub fn build_ai_system_and_user_prompt_for(raw_prompt: &str, config: &ScanConfig
     let negative_rule = if config.checkpoint.default_negative().is_empty() {
         "leave this empty: this checkpoint ignores negative prompts.".to_string()
     } else {
+        let view_negs = config.target_view.negative_tags();
+        let view_hint = if view_negs.is_empty() {
+            String::new()
+        } else {
+            format!(", plus '{view_negs}' for the target framing")
+        };
         format!(
             "REQUIRED, never empty. Write 12-30 comma-separated negative tags that protect improved_prompt: start from \
-             this checkpoint's usual negatives ({}), then add tags for what would pull the image away from THIS scene \
-             (wrong framing or camera angle, unwanted extra people, elements that clash with the setting, time of day or \
-             mood: name the OPPOSITE of what this scene has). Write each as a plain tag naming the unwanted thing itself, \
-             never 'no X', 'wrong X' or 'lack of X'. Never include anything improved_prompt asks for.",
+             this checkpoint's usual negatives ({}{view_hint}), then add concrete Danbooru tags for what would pull the \
+             image away from THIS scene (e.g. 'full body, lower body' for an upper-body shot, 'crowd, multiple girls' \
+             when solo, 'indoors' when outdoors, 'daytime, bright sunlight' for a night scene: name the OPPOSITE of \
+             what this scene has). Write each as a real tag naming the unwanted thing itself, never 'no X', 'wrong X', \
+             'unwanted X' or 'lack of X'. Never include anything improved_prompt asks for.",
             config.checkpoint.default_negative()
         )
     };
@@ -382,18 +445,53 @@ pub fn build_ai_system_and_user_prompt_for(raw_prompt: &str, config: &ScanConfig
                  is trying to create, then make the prompt produce that scene better on their checkpoint.";
     let mut context = vec![
         format!("Checkpoint: {}. {}", config.checkpoint.display_name(), config.checkpoint.system_prompt_rules()),
+        if config.two_char {
+            let n = config.char_count();
+            format!(
+                "This prompt has {} characters. Write improved_prompt (and dynamic_prompt) in this order: quality tags, \
+                 the character count (e.g. {}) and tags about them together (holding hands, facing each other...); then \
+                 the single word BREAK; then ALL of character 1's own tags; then BREAK; then ALL of character 2's own \
+                 tags{}; then BREAK; then the shared camera, setting, lighting and style. Never use 'solo'. Never give \
+                 one character another one's feature.",
+                ["", "", "TWO", "THREE", "FOUR"][n.min(4)],
+                ["", "", "2girls / 1girl, 1boy", "3girls / 2girls, 1boy", "4girls / 2girls, 2boys"][n.min(4)],
+                (3..=n).map(|k| format!("; then BREAK; then ALL of character {k}'s own tags")).collect::<String>(),
+            )
+        } else {
+            String::new()
+        },
         weights,
-        format!(
-            "Quality tags for this checkpoint: {quality}. Use exactly these; drop other quality filler (8k, 4k, uhd, ultra \
-             detailed, hyperdetailed, highly detailed, best resolution, octane render...)."
-        ),
+        quality_line,
         format!(
             "Target camera view: {}. {} (This is a menu label, not a tag: write normal tags like 'upper body'.)",
             config.target_view.display_name(),
             config.target_view.system_prompt_rules()
         ),
         format!("Must keep and emphasize: {pinned}"),
-        if config.lora_tags_raw.trim().is_empty() {
+        if config.two_char {
+            let n = config.char_count();
+            let mut loras = Vec::new();
+            if !config.lora_tags_raw.trim().is_empty() {
+                loras.push(format!("Character 1's LoRA: {}", config.lora_tags_raw.trim().trim_matches(',')));
+            }
+            for i in 1..n {
+                let l = config.lora_of(i).trim().trim_matches(',');
+                if !l.is_empty() {
+                    loras.push(format!("Character {}'s LoRA: {l}", i + 1));
+                }
+            }
+            if loras.is_empty() {
+                "LoRA tags: none".to_string()
+            } else {
+                format!(
+                    "LoRA tags (HIGHEST PRIORITY — {}): the app puts each character's LoRA into the final prompt \
+                     automatically, so don't repeat them in improved_prompt, and make sure that character's tags never \
+                     contradict their LoRA (e.g. LoRA tag 'large breasts' with 'gigantic breasts' on that character \
+                     means drop 'gigantic breasts').",
+                    loras.join("; ")
+                )
+            }
+        } else if config.lora_tags_raw.trim().is_empty() {
             "LoRA tags: none".to_string()
         } else {
             format!(
@@ -418,7 +516,15 @@ pub fn build_ai_system_and_user_prompt_for(raw_prompt: &str, config: &ScanConfig
         }
     }
     if small {
-        context.truncate(4);
+        // shorter for small models, but never at the cost of the user's own choices
+        // (LoRA tags, Keep list, angle / pose picks): only generic lines go
+        let generic_view = config.target_view == crate::profiles::TargetView::None;
+        context.retain(|c| {
+            !c.starts_with("Cleanup:")
+                && c != "LoRA tags: none"
+                && c != "Must keep and emphasize: none"
+                && !(generic_view && c.starts_with("Target camera view:"))
+        });
     }
 
     let mut steps = vec![
@@ -439,7 +545,10 @@ pub fn build_ai_system_and_user_prompt_for(raw_prompt: &str, config: &ScanConfig
     ];
     if wants_sentence(config) {
         steps.push(
-            "natural_sentence: 1-2 short natural-language sentences, added after the tags, that get across what tags \
+            "natural_sentence: 1-2 short natural-language sentences, added after the tags (with several characters: \
+             say clearly which one has which features and who does what, naming them by position; never describe anyone in a \
+             way their tags contradict, e.g. no 'petite' or 'slender' for a character with large breasts, and mention \
+             the body proportions their tags stress), that get across what tags \
              can't: who does what to whom, how characters interact, which character has which features when there are \
              several, the composition and the mood. Don't just list the tags again, don't add anything new to the \
              scene, and leave quality words (masterpiece, high quality...) to the tags."
@@ -463,7 +572,16 @@ pub fn build_ai_system_and_user_prompt_for(raw_prompt: &str, config: &ScanConfig
          framing_safe_swap, 'framing_alternative' is a camera change that would let the user keep the original tag."
     ));
 
-    let mut guidance = prompt_guidance(raw_prompt, config);
+    let all_boxes;
+    let guidance_text = if config.two_char {
+        let mut parts = vec![raw_prompt.trim().to_string(), config.scene_prompt_raw.trim().to_string()];
+        parts.extend((1..config.char_count()).map(|i| config.prompt_of(i).trim().to_string()));
+        all_boxes = parts.into_iter().filter(|p| !p.is_empty()).collect::<Vec<_>>().join(", ");
+        all_boxes.as_str()
+    } else {
+        raw_prompt
+    };
+    let mut guidance = prompt_guidance(guidance_text, config);
     if small {
         guidance.truncate(3);
     }
@@ -481,34 +599,94 @@ pub fn build_ai_system_and_user_prompt_for(raw_prompt: &str, config: &ScanConfig
     if !small {
         rules.insert(2, "Be specific and concrete rather than generic ('good lighting' is useless).".into());
         rules.insert(4, "A tag that is already in the prompt is not missing; never suggest adding it again.".into());
-        rules.insert(5, "Every difference between the original and improved_prompt should appear in changes.".into());
+        rules.insert(
+            5,
+            format!("The most important differences between the original and improved_prompt appear in changes (at most {max_changes})."),
+        );
         rules.insert(6, "Keep issues and reasons short (under 20 words each).".into());
     }
 
+    context.retain(|c| !c.is_empty());
     // ---- format per family
     let bullets = |v: &[String]| v.iter().map(|l| format!("- {l}")).collect::<Vec<_>>().join("\n");
     let numbered = |v: &[String]| v.iter().enumerate().map(|(i, l)| format!("{}. {l}", i + 1)).collect::<Vec<_>>().join("\n");
     let system_prompt = match family {
         ModelFamily::Gemma => {
-            let natural_example = if wants_sentence(config) {
-                ",\n  \"natural_sentence\": \"A lone astronaut gazes up at a sky he will never reach, dwarfed by endless dunes.\""
+            // the example shows the layout the model has to follow (one character, or several with BREAK)
+            let ex_chars = [
+                ("1boy, astronaut, white spacesuit, standing", "an astronaut"),
+                ("1girl, robot girl, silver armor, waving", "a robot girl"),
+                ("1boy, alien boy, green skin, sitting", "an alien boy"),
+                ("1girl, cat girl, orange fur, jumping", "a cat girl"),
+            ];
+            let q_prefix = if quality_tags.is_empty() {
+                String::new()
             } else {
-                ""
+                format!("{}, ", quality_tags.join(", "))
+            };
+            let (ex_summary, ex_subject, ex_prompt, ex_sentence) = if config.two_char {
+                let n = config.char_count();
+                let count = ["", "", "1boy, 1girl", "2boys, 1girl", "2boys, 2girls"][n.min(4)];
+                let who = ex_chars[..n].iter().map(|c| c.1).collect::<Vec<_>>();
+                (
+                    format!("{} stand side by side on a red desert dune at dusk.", who.join(" and ")),
+                    ex_chars[..n].iter().map(|c| c.0).collect::<Vec<_>>().join("; "),
+                    format!(
+                        "{q_prefix}{count}, side by side, BREAK, {}, BREAK, full body, from below, red desert, \
+                         sand dunes, dusk, rim lighting",
+                        ex_chars[..n].iter().map(|c| c.0).collect::<Vec<_>>().join(", BREAK, ")
+                    ),
+                    format!("On the left {} waves at the others while the last one looks away, all lit by the dying sun.", who[0]),
+                )
+            } else {
+                (
+                    "A lone astronaut stands on a red desert dune at dusk.".to_string(),
+                    "1boy, astronaut, white spacesuit".to_string(),
+                    format!(
+                        "{q_prefix}1boy, solo, astronaut, white spacesuit, standing, full body, from below, \
+                         red desert, sand dunes, dusk, rim lighting"
+                    ),
+                    "A lone astronaut gazes up at a sky he will never reach, dwarfed by endless dunes.".to_string(),
+                )
+            };
+            let natural_example = if wants_sentence(config) {
+                format!(",\n  \"natural_sentence\": \"{ex_sentence}\"")
+            } else {
+                String::new()
             };
             let dynamic_example = if config.dynamic {
-                ",\n  \"dynamic_prompt\": \"masterpiece, best quality, 1boy, solo, astronaut, white spacesuit, {standing|kneeling|walking}, full body, {from below|from side}, red desert, sand dunes, {dusk|night|dawn}, rim lighting\""
+                if config.two_char {
+                    let n = config.char_count();
+                    let count = ["", "", "1boy, 1girl", "2boys, 1girl", "2boys, 2girls"][n.min(4)];
+                    let mut char_dyn = Vec::new();
+                    for (i, c) in ex_chars[..n].iter().enumerate() {
+                        let pose_opt = if i == 0 { "{standing|kneeling|walking}" } else { "{standing|sitting}" };
+                        char_dyn.push(format!("{}, {pose_opt}", c.0.trim_end_matches(", standing")));
+                    }
+                    format!(
+                        ",\n  \"dynamic_prompt\": \"{q_prefix}{count}, side by side, BREAK, {}, BREAK, full body, {{from below|from side}}, red desert, sand dunes, {{dusk|night|dawn}}, rim lighting\"",
+                        char_dyn.join(", BREAK, ")
+                    )
+                } else {
+                    format!(
+                        ",\n  \"dynamic_prompt\": \"{q_prefix}1boy, solo, astronaut, white spacesuit, {{standing|kneeling|walking}}, full body, {{from below|from side}}, red desert, sand dunes, {{dusk|night|dawn}}, rim lighting\""
+                    )
+                }
             } else {
+                String::new()
+            };
+            let ex_negative = if config.checkpoint.default_negative().is_empty() {
                 ""
+            } else {
+                "worst quality, low quality, crowd, daytime"
             };
             format!(
                 "# Role\n{intro}\n\n## Context\n{}\n\n## Task (fill these JSON fields, in this order)\n{}\n\n{}## Rules\n{}\n\n\
                  ## Output format\nOne JSON object. Format example from an UNRELATED scene: copy its structure, never its content.\n\
-                 ```json\n{{\n  \"scene_summary\": \"A lone astronaut stands on a red desert dune at dusk.\",\n  \
-                 \"scene_breakdown\": {{\"subject\": \"1boy, astronaut, white spacesuit\", \"pose\": \"standing\", \"framing\": \
+                 ```json\n{{\n  \"scene_summary\": \"{ex_summary}\",\n  \
+                 \"scene_breakdown\": {{\"subject\": \"{ex_subject}\", \"pose\": \"standing\", \"framing\": \
                  \"full body, from below\", \"setting\": \"red desert dunes\", \"lighting\": \"dusk, rim lighting\", \"mood\": \
-                 \"lonely, epic\"}},\n  \"issues\": [\"no time of day\"],\n  \"improved_prompt\": \"masterpiece, best quality, \
-                 1boy, solo, astronaut, white spacesuit, standing, full body, from below, red desert, sand dunes, dusk, rim \
-                 lighting\"{natural_example}{dynamic_example},\n  \"recommended_negative\": \"worst quality, low quality, crowd, daytime\",\n  \
+                 \"lonely, epic\"}},\n  \"issues\": [\"no time of day\"],\n  \"improved_prompt\": \"{ex_prompt}\"{natural_example}{dynamic_example},\n  \"recommended_negative\": \"{ex_negative}\",\n  \
                  \"changes\": [{{\"original\": \"\", \"action\": \"add\", \"reason\": \"adds time of day\", \
                  \"suggested_alternative\": \"dusk, rim lighting\", \"framing_alternative\": \"\"}}]\n}}\n```",
                 bullets(&context),
@@ -526,6 +704,31 @@ pub fn build_ai_system_and_user_prompt_for(raw_prompt: &str, config: &ScanConfig
         ),
     };
 
+    let two;
+    let raw_prompt = if config.two_char {
+        let n = config.char_count();
+        let place = |i: usize| match (n, i) {
+            (2, 0) | (3, 0) => "on the left",
+            (2, _) | (3, 2) => "on the right",
+            (3, _) => "in the middle",
+            (_, 0) => "far left",
+            (_, 1) => "second from the left",
+            (_, 2) => "second from the right",
+            _ => "far right",
+        };
+        let mut sections = vec![format!(
+            "SCENE (shared by all: setting, camera, lighting, mood, what they do together):\n{}",
+            config.scene_prompt_raw.trim()
+        )];
+        sections.push(format!("CHARACTER 1 ({}):\n{}", place(0), raw_prompt.trim()));
+        for i in 1..n {
+            sections.push(format!("CHARACTER {} ({}):\n{}", i + 1, place(i), config.prompt_of(i).trim()));
+        }
+        two = sections.join("\n\n");
+        two.as_str()
+    } else {
+        raw_prompt
+    };
     let user_prompt = match family {
         ModelFamily::Gemma => format!(
             "Analyze and improve this ComfyUI prompt. Reply with the JSON object only.\n\nPROMPT:\n\"\"\"\n{}\n\"\"\"",
@@ -549,11 +752,12 @@ fn improved_prompt_step(config: &ScanConfig) -> String {
                 subject, character, LoRA tag (<lora:...>) and the user's core ideas. Fix every issue. Body-part tags that \
                 break the framing become framing-safe equivalents (e.g. 'ass' with upper body -> 'curvy, hourglass \
                 figure, narrow waist, arched back').";
-    let prose = !config.checkpoint.uses_explicit_weights() || config.checkpoint.supports_natural_language();
+    let prose = !config.checkpoint.uses_explicit_weights() && !config.two_char;
     match config.detail {
         DetailLevel::Faithful => format!(
             "{base} DETAIL LEVEL = FAITHFUL: keep the user's tags and wording; only fix what's wrong (conflicts, filler, \
-             syntax, weights). Add at most 3 tags, and only to fill an obvious gap such as missing lighting."
+             syntax, weights). {add_limit}, and only to fill an obvious gap such as missing lighting.",
+            add_limit = if prose { "Add at most 1-2 descriptive details" } else { "Add at most 3 tags" }
         ),
         DetailLevel::Balanced => format!(
             "{base} Fill gaps: if there's no lighting, background/setting or expression, add specific ones that fit THIS \
@@ -574,8 +778,7 @@ fn improved_prompt_step(config: &ScanConfig) -> String {
              {length} Every added detail must fit the scene's setting, time of day and mood and must never contradict \
              the user's tags.",
             length = if prose {
-                "Aim for 40-60 tags, or 3-5 vivid sentences for natural-language checkpoints (subject, appearance, action, \
-                 setting, light, style, in that order)."
+                "Aim for 3-5 vivid sentences (subject, appearance, action, setting, light, style, in that order)."
             } else {
                 "Aim for 40-60 tags, most important first, so it stays within about three 75-token chunks."
             }
@@ -583,7 +786,8 @@ fn improved_prompt_step(config: &ScanConfig) -> String {
     }
 }
 
-/// The generic-format instructions (used where no model is known yet).
+/// The generic-format instructions (tests).
+#[cfg(test)]
 pub fn build_ai_system_and_user_prompt(raw_prompt: &str, config: &ScanConfig) -> (String, String) {
     build_ai_system_and_user_prompt_for(raw_prompt, config, ModelFamily::Generic)
 }
@@ -726,7 +930,11 @@ pub fn convert_ai_changes(
     let mut out = Vec::new();
     for item in ai_items {
         let action = item.action.to_lowercase();
-        let targets: Vec<String> = parse_prompt(&item.original).into_iter().map(|t| t.normalized).collect();
+        let targets: Vec<String> = if action == "add" && matches!(item.original.trim().to_lowercase().as_str(), "none" | "n/a" | "null") {
+            Vec::new()
+        } else {
+            parse_prompt(&item.original).into_iter().map(|t| t.normalized).collect()
+        };
         let suggestion: Vec<String> =
             parse_prompt(&item.suggested_alternative).into_iter().map(|t| t.normalized).collect();
 
@@ -746,7 +954,7 @@ pub fn convert_ai_changes(
             if item.suggested_alternative.trim() == item.original.trim() && item.framing_alternative.trim().is_empty() {
                 continue;
             }
-            if suggestion == targets && !item.suggested_alternative.contains(':') {
+            if suggestion == targets && !item.suggested_alternative.contains(':') && !item.original.contains(':') {
                 continue; // same tag back, no weight change
             }
         }
@@ -829,6 +1037,14 @@ pub struct ImageAiResult {
     pub prompt: String,
 }
 
+/// What a vision model should capture about each character, so the prompt recreates
+/// them 1-to-1.
+const CHARACTER_CHECKLIST: &str = "Capture each character exactly: hair (length, color, bangs or parting, \
+     ahoge, braids, ornaments); face (eye color, eyebrows such as thick eyebrows, glasses, earrings, makeup, marks); \
+     body (stature such as tall or petite, build, chest size); every visible garment layer by layer with its color \
+     and material, plus accessories; orientation (facing the viewer, facing to the side, from behind), gaze (looking \
+     at viewer, looking at another, looking away) and placement (foreground, background).";
+
 /// Vision models gain nothing from huge images but get much slower: anything over
 /// 1024 px on its longest side is scaled down and sent as JPEG.
 fn shrink_for_vision(path: &std::path::Path) -> Result<Vec<u8>> {
@@ -847,18 +1063,25 @@ fn shrink_for_vision(path: &std::path::Path) -> Result<Vec<u8>> {
 
 fn image_system_prompt(config: &ScanConfig, tag_hints: &str) -> String {
     let style = if config.checkpoint.uses_explicit_weights() {
+        let quality = config.checkpoint.canonical_quality_tags().join(", ");
+        let quality_prefix = if quality.is_empty() {
+            String::new()
+        } else {
+            format!("starting with the quality tags ({quality}), ")
+        };
         format!(
-            "Write 25-45 comma-separated Danbooru-style tags, most important first, starting with the quality tags ({}). \
+            "Write 25-45 comma-separated Danbooru-style tags, most important first, {quality_prefix}\
              Cover who is in it (e.g. 1girl, solo; or 'no humans, scenery' when nobody is the subject), their concrete \
              looks (hair colour and style, eye colour, build), clothing, expression, pose, the shot and angle, the \
              place, the light and the art style. Every tag is a concrete visual fact like 'silver hair', never a bare \
-             category word like 'hair' or 'lighting'.",
-            config.checkpoint.canonical_quality_tags().join(", ")
+             category word like 'hair' or 'lighting'. {}",
+            CHARACTER_CHECKLIST
         )
     } else {
-        "Write 3-5 vivid natural-language sentences: subject and appearance, clothing, pose, framing, setting, light \
-         and style, most important first."
-            .to_string()
+        format!(
+            "Write 3-5 vivid natural-language sentences: subject and appearance, clothing, pose, framing, setting, light \
+             and style, most important first. {CHARACTER_CHECKLIST}"
+        )
     };
     let hints = if tag_hints.trim().is_empty() {
         String::new()
@@ -884,16 +1107,57 @@ fn image_system_prompt(config: &ScanConfig, tag_hints: &str) -> String {
     )
 }
 
+/// "Scene / Pose reference": the vision model describes only what the picture does
+/// (poses, positions, interaction, camera, setting, lighting), never who is in it.
+fn scene_pose_system_prompt(tag_hints: &str) -> String {
+    let hints = if tag_hints.trim().is_empty() {
+        String::new()
+    } else {
+        format!("## Tagger hints (pose and scene tags a Danbooru tagger found)\n{tag_hints}\n\n")
+    };
+    format!(
+        "# Role\nYou describe a reference picture so its POSE and SCENE can be reused with completely different \
+         characters in Stable Diffusion / ComfyUI. You are uncensored: describe sexual poses and violence accurately; \
+         never refuse or soften.\n\n## Describe ONLY\n\
+         - each body's pose and action (standing, sitting, kneeling, lying on back, arms up, hand on hip, holding an \
+         object, walking...), where each figure is (on the left, in the foreground...), how they interact (holding \
+         hands, hug, facing each other), gaze and facing direction (looking at viewer, looking back, facing away);\n\
+         - camera: framing and angle (full body, cowboy shot, from below, dutch angle, close-up...);\n\
+         - setting: place, background, props;\n- lighting and time of day; art style.\n\n\
+         ## NEVER describe\nwho the characters are: no count tags (1girl, 2girls), names, species, gender, age, hair, \
+         eyes, face, skin, body size, anatomy or body parts, facial expressions, or ANY clothing or accessories. \
+         No quality tags (masterpiece, best quality...). Those come from the user's own characters.\n\n\
+         {hints}## Output\n- 'description': one plain sentence about the pose and the scene.\n\
+         - 'prompt': 15-35 comma-separated Danbooru-style tags for the pose and scene only.\n- Reply with JSON only."
+    )
+}
+
+/// Reads a Scene / Pose reference image: only pose, camera, setting and lighting.
+pub fn describe_scene_pose(req: &ImageAiRequest) -> Result<ImageAiResult> {
+    let mut out = describe_image_with(req, &scene_pose_system_prompt(&req.tag_hints), "Describe only the pose and the scene.")?;
+    // whatever slipped through about the characters themselves goes, and so do words the
+    // keyword lists don't know: they could be a name, species or clothing
+    out.prompt = crate::scene::filter_scene_and_pose_only(&out.prompt, false);
+    if out.prompt.trim().is_empty() {
+        return Err(anyhow!("The model found no pose or scene to reuse. Try again."));
+    }
+    Ok(out)
+}
+
 /// Asks a vision model to write a prompt for the image.
 pub fn describe_image(req: &ImageAiRequest) -> Result<ImageAiResult> {
+    describe_image_with(req, &image_system_prompt(&req.config, &req.tag_hints), "Write the prompt for this image.")
+}
+
+fn describe_image_with(req: &ImageAiRequest, system: &str, ask: &str) -> Result<ImageAiResult> {
     use base64::Engine as _;
     let base = base_url(&req.host)?;
     let image = base64::engine::general_purpose::STANDARD.encode(shrink_for_vision(&req.image_path)?);
     let text = json!({ "type": "string" });
     let body = json!({
         "model": req.model,
-        "system": image_system_prompt(&req.config, &req.tag_hints),
-        "prompt": "Write the prompt for this image.",
+        "system": system,
+        "prompt": ask,
         "images": [image],
         "format": { "type": "object", "properties": { "description": text, "prompt": text }, "required": ["description", "prompt"] },
         "stream": false,
@@ -922,15 +1186,188 @@ pub fn describe_image(req: &ImageAiRequest) -> Result<ImageAiResult> {
     let cleaned: Vec<String> = crate::condenser::tidy_ai_prompt(&out.prompt, req.config.checkpoint)
         .split(", ")
         .map(str::to_string)
-        .filter(|t| { let l = t.to_lowercase(); !l.is_empty() && !name.contains(&l) && !junk.contains(&l.as_str()) })
+        .filter(|t| {
+            let l = t.to_lowercase();
+            !l.is_empty() && l != name && !junk.contains(&l.as_str())
+        })
         .collect();
     // "solo" contradicts a group
     let group = cleaned.iter().any(|t| {
         let l = t.to_lowercase();
         l.starts_with("multiple ") || (l.len() > 1 && l.as_bytes()[0].is_ascii_digit() && l.as_bytes()[0] > b'1' && (l.ends_with("girls") || l.ends_with("boys") || l.ends_with("others")))
     });
-    out.prompt = cleaned.into_iter().filter(|t| !(group && t.eq_ignore_ascii_case("solo"))).collect::<Vec<_>>().join(", ");
+    // one size per body part: the first one the model wrote wins
+    let mut kept: Vec<String> = Vec::new();
+    for t in cleaned.into_iter().filter(|t| !(group && t.eq_ignore_ascii_case("solo"))) {
+        let n = crate::danbooru::key(&t);
+        if !kept.iter().any(|k| crate::analyzer::size_conflict(&crate::danbooru::key(k), &n)) {
+            kept.push(t);
+        }
+    }
+    out.prompt = kept.join(", ");
     Ok(out)
+}
+
+// ============================================================================
+// Two-character image: the vision model checks and fixes the detector + tagger split
+// ============================================================================
+
+pub struct TwoImageRequest {
+    pub host: String,
+    pub model: String,
+    pub mode: AiMode,
+    pub split: crate::twoimg::TagSplit,
+    /// The tag-only split, given to the model as hints.
+    pub hints: crate::twoimg::SplitPrompt,
+}
+
+pub fn split_image(req: &TwoImageRequest) -> Result<(crate::twoimg::SplitPrompt, String)> {
+    use crate::twoimg::{encode, BOX_COLORS};
+    let n = req.split.wanted.clamp(2, 4);
+    let words = ["", "", "two", "three", "four"];
+    let base = base_url(&req.host)?;
+    let mut images = vec![encode(&crate::twoimg::marked(&req.split), 1024)?];
+    let layout = match &req.split.chars {
+        Some(chars) => {
+            for (crop, _) in chars {
+                images.push(encode(crop, 768)?);
+            }
+            let boxes = (0..n).map(|i| format!("CHARACTER {} inside a {} box", i + 1, BOX_COLORS[i].1)).collect::<Vec<_>>().join(", ");
+            let crops = (0..n)
+                .map(|i| format!("Image {} is a crop of CHARACTER {} ({} box).", i + 2, i + 1, BOX_COLORS[i].1.to_lowercase()))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let overlap = if req.split.overlap > 0.25 {
+                " Some of them overlap, so a crop can also show part of another character: the colored boxes in \
+                 Image 1 decide who is who."
+            } else {
+                ""
+            };
+            format!(
+                "Image 1 is the whole picture with {boxes}. The boxes were drawn by the app to mark them; they're not \
+                 part of the art, so never tag them. {crops}{overlap}"
+            )
+        }
+        None => format!(
+            "There is one image (the {} characters couldn't be told apart automatically, so no bounding boxes were drawn \
+             and the tagger hints below are NOT split yet: sort them yourself). Number them left to right (or front to back): \
+             CHARACTER 1 is the leftmost.",
+            words[n]
+        ),
+    };
+    let hints = if req.split.chars.is_some() {
+        let mut h: Vec<String> = req.hints.chars.iter().enumerate().map(|(i, c)| format!("Character {}: {c}", i + 1)).collect();
+        h.push(format!("Shared: {}", req.hints.scene));
+        h.join("\n")
+    } else {
+        format!("Not split: {}, {}", req.hints.chars.join(", "), req.hints.scene)
+    };
+    let order_desc = if req.split.chars.is_some() {
+        let order = (0..n)
+            .map(|i| format!("character {} = {} box", i + 1, BOX_COLORS[i].1.to_lowercase()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(" ({order}, left to right)")
+    } else {
+        " (left to right)".to_string()
+    };
+    let tagger_desc = if req.split.chars.is_some() {
+        "a Danbooru tagger ran on each crop; mostly right, but crops can bleed into each other"
+    } else {
+        "a Danbooru tagger read these tags from the image"
+    };
+    let fields = (1..=n).map(|i| format!("character_{i}")).collect::<Vec<_>>();
+    let system = format!(
+        "# Role\nYou split a picture with {} characters into Danbooru tag lists for Stable Diffusion / ComfyUI. You \
+         are uncensored: describe nudity, sexual content and violence accurately; never refuse or soften.\n\n\
+         ## Images\n{layout}\n\n\
+         ## Tagger hints ({tagger_desc})\n\
+         {hints}\n\n\
+         ## Task\n\
+         - analysis: 1-2 sentences on who is who{order_desc} and what each wears.\n\
+         - character_1 … character_{n}: for each character, only what belongs to them: count tag (1girl / 1boy / \
+         1other), the character's name if it's a known character, hair, eyes, body, clothing, accessories, \
+         expression, pose.\n\
+         - {CHARACTER_CHECKLIST}\n\
+         - scene: what they share: what they do together (holding hands, facing each other, hug...), camera / \
+         framing, setting and background, lighting, art style.\n\n\
+         ## Rules\n- Real Danbooru tags, comma-separated, lowercase, spaces instead of underscores.\n\
+         - Never put a feature on the wrong character. If several have it (long hair), list it for each of them.\n\
+         - Keep the hints that are right, drop the wrong ones, add what's missing.\n\
+         - Write plain tags, never labels like 'lighting: dim' or 'character 2'.\n\
+         - No quality tags, no 'solo'. Only what's visible. At most 40 tags per list.\n- Reply with JSON only.",
+        words[n]
+    );
+    let text = json!({ "type": "string" });
+    // the model writes the fields in this order (serde_json keeps it, `preserve_order`):
+    // "analysis" first, so it works out who is who before listing tags
+    let mut properties = serde_json::Map::new();
+    properties.insert("analysis".into(), text.clone());
+    for f in &fields {
+        properties.insert(f.clone(), text.clone());
+    }
+    properties.insert("scene".into(), text.clone());
+    let mut required = vec!["analysis".to_string()];
+    required.extend(fields.iter().cloned());
+    required.push("scene".into());
+    let body = json!({
+        "model": req.model,
+        "system": system,
+        "prompt": format!("Split this picture into {} and scene.", fields.join(", ")),
+        "images": images,
+        "format": { "type": "object", "properties": properties, "required": required },
+        "stream": false,
+        "keep_alive": "30m",
+        "options": {
+            "temperature": 0.0,
+            "seed": 7,
+            "repeat_penalty": 1.15,
+            "num_predict": 1500 * n as i32,
+            "num_ctx": 12288 + 2048 * n as i32,
+            "num_gpu": if req.mode == AiMode::CpuOnly { Some(0) } else { None::<i32> },
+        },
+    });
+    // a model stuck repeating a tag gets stopped by Ollama; a second try usually works
+    let mut last_err = anyhow!("The model's reply was unreadable. Try again.");
+    let mut body = body;
+    for attempt in 0..2u32 {
+        body["options"]["seed"] = json!(7 + attempt);
+        // a retry after a repetition loop needs a little randomness to get out of it
+        body["options"]["temperature"] = json!(if attempt == 0 { 0.0 } else { 0.3 });
+        match split_once(&base, &body, n) {
+            Ok(r) => return Ok(r),
+            Err(e) if e.to_string().starts_with("Couldn't reach") => return Err(e),
+            Err(e) => last_err = e,
+        }
+    }
+    Err(last_err)
+}
+
+fn split_once(base: &str, body: &serde_json::Value, n: usize) -> Result<(crate::twoimg::SplitPrompt, String)> {
+    use crate::twoimg::clean_list;
+    let resp = client(Some(Duration::from_secs(300)))?
+        .post(format!("{base}/api/generate"))
+        .json(body)
+        .send()
+        .map_err(|e| if e.is_timeout() { anyhow!("The model took over 5 minutes to read the image") } else { anyhow!("Couldn't reach Ollama at {base}") })?;
+    let gen: GenerateResponse = check(resp, "Reading the image")?.json()?;
+    let raw = gen.response.trim();
+    let body = &raw[raw.find('{').unwrap_or(0)..];
+    // a long reply can hit the output limit: keep what was fully written
+    let v: serde_json::Value = serde_json::from_str(body)
+        // flat object of strings: close the open string (dropping its half-written last tag) and the object
+        .or_else(|_| serde_json::from_str(&format!("{}\"}}", body.rsplit_once(',').map(|(a, _)| a).unwrap_or(body))))
+        .or_else(|_| serde_json::from_str(&format!("{body}\"}}")))
+        .map_err(|_| anyhow!("The model's reply was unreadable. Try again."))?;
+    let get = |k: &str| v.get(k).and_then(serde_json::Value::as_str).unwrap_or("").trim().to_string();
+    let out = crate::twoimg::SplitPrompt {
+        chars: (1..=n).map(|i| clean_list(&get(&format!("character_{i}")), false)).collect(),
+        scene: clean_list(&get("scene"), true),
+    };
+    if out.chars.iter().all(|c| c.is_empty()) {
+        return Err(anyhow!("The model didn't describe the characters. Try again."));
+    }
+    Ok((out, get("analysis")))
 }
 
 // ============================================================================
@@ -962,9 +1399,9 @@ pub struct TranslateResult {
 
 fn translate_system_prompt(req: &TranslateRequest, candidates: &str) -> String {
     let natural = if req.checkpoint.supports_natural_language() {
-        "natural: 1-2 plain, vivid sentences describing the same scene, for natural-language checkpoints."
+        "- natural: 1-2 plain, vivid sentences describing the same scene, for natural-language checkpoints.\n"
     } else {
-        "natural: an empty string."
+        ""
     };
     format!(
         "# Role\nYou translate descriptions into Danbooru tags, the vocabulary anime / Stable Diffusion checkpoints \
@@ -979,8 +1416,8 @@ fn translate_system_prompt(req: &TranslateRequest, candidates: &str) -> String {
          never 'woman', 'man' or 'person'.\n\
          - Keep character and series names that are Danbooru tags, and keep <lora:...> tags unchanged.\n\
          - Don't add anything that wasn't described, and no quality tags.\n\n\
-         ## Fields\n- tags: the comma-separated tags, most important first.\n\
-         - mapping: each phrase of the user's text and the tags it became.\n- {natural}\n\n\
+         ## Fields\n- mapping: each phrase of the user's text and the tags it became.\n\
+         - tags: the comma-separated tags, most important first.\n{natural}\n\
          ## Candidate Danbooru tags (usage count)\n{candidates}\n\nReply with JSON only."
     )
 }
@@ -1001,19 +1438,31 @@ pub fn danbooru_translate(req: &TranslateRequest) -> Result<TranslateResult> {
         .unwrap_or_else(|| "(not available)".into());
     let base = base_url(&req.host)?;
     let text = json!({ "type": "string" });
+    let supports_natural = req.checkpoint.supports_natural_language();
+    let mut properties = json!({
+        "mapping": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": { "from": text, "to": text },
+                "required": ["from", "to"]
+            }
+        },
+        "tags": text,
+    });
+    let mut required = vec!["mapping".to_string(), "tags".to_string()];
+    if supports_natural {
+        properties.as_object_mut().unwrap().insert("natural".into(), text.clone());
+        required.push("natural".into());
+    }
     let body = json!({
         "model": req.model,
         "system": translate_system_prompt(req, &candidates),
         "prompt": req.text,
         "format": {
             "type": "object",
-            "properties": {
-                "mapping": { "type": "array", "items": { "type": "object",
-                    "properties": { "from": text, "to": text }, "required": ["from", "to"] } },
-                "tags": text,
-                "natural": text,
-            },
-            "required": ["mapping", "tags", "natural"],
+            "properties": properties,
+            "required": required,
         },
         "stream": false,
         "think": false,
@@ -1336,6 +1785,8 @@ struct GenerateOptions {
     /// 0 = keep every layer on the CPU. Omitted = Ollama offloads to the GPU.
     #[serde(skip_serializing_if = "Option::is_none")]
     num_gpu: Option<i32>,
+    /// Fixed per attempt, so the same prompt gives the same scan (a retry uses the next one).
+    seed: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1361,7 +1812,7 @@ pub struct AiScanRequest {
     pub think: bool,
 }
 
-fn changes_schema(needs_negative: bool, dynamic: bool, natural: bool) -> serde_json::Value {
+fn changes_schema(needs_negative: bool, dynamic: bool, natural: bool, max_issues: usize, max_changes: usize) -> serde_json::Value {
     let text = json!({ "type": "string" });
     let negative = if needs_negative { json!({ "type": "string", "minLength": 40 }) } else { text.clone() };
     let mut required = vec!["scene_summary", "scene_breakdown", "issues", "improved_prompt"];
@@ -1385,14 +1836,14 @@ fn changes_schema(needs_negative: bool, dynamic: bool, natural: bool) -> serde_j
                 },
                 "required": ["subject", "pose", "framing", "setting", "lighting", "mood"]
             },
-            "issues": { "type": "array", "maxItems": 8, "items": text },
+            "issues": { "type": "array", "maxItems": max_issues, "items": text },
             "improved_prompt": text,
             "natural_sentence": text,
             "dynamic_prompt": text,
             "recommended_negative": negative,
             "changes": {
                 "type": "array",
-                "maxItems": 12,
+                "maxItems": max_changes,
                 "items": {
                     "type": "object",
                     "properties": {
@@ -1408,14 +1859,19 @@ fn changes_schema(needs_negative: bool, dynamic: bool, natural: bool) -> serde_j
         },
         "required": required
     });
+    let props = schema["properties"].as_object_mut().expect("object");
     if !natural {
-        // only asked for where it's wanted, so the model doesn't spend time on it
-        schema["properties"].as_object_mut().expect("object").remove("natural_sentence");
+        props.remove("natural_sentence");
+    }
+    if !dynamic {
+        props.remove("dynamic_prompt");
     }
     schema
 }
 
-fn generate_body<'a>(req: &'a AiScanRequest, system: &'a str, prompt: &'a str) -> GenerateRequest<'a> {
+fn generate_body<'a>(req: &'a AiScanRequest, system: &'a str, prompt: &'a str, seed: u32) -> GenerateRequest<'a> {
+    let family = ModelFamily::detect(&req.model);
+    let (max_issues, max_changes) = family.max_issues_changes();
     GenerateRequest {
         model: &req.model,
         system,
@@ -1424,11 +1880,14 @@ fn generate_body<'a>(req: &'a AiScanRequest, system: &'a str, prompt: &'a str) -
             !req.config.checkpoint.default_negative().is_empty(),
             req.config.dynamic,
             wants_sentence(&req.config),
+            max_issues,
+            max_changes,
         ),
         stream: false,
         keep_alive: &req.keep_alive,
         think: Some(req.think),
         options: GenerateOptions {
+            seed,
             temperature: ModelFamily::detect(&req.model).temperature(),
             // reasoning tokens count against this too
             num_predict: if req.think {
@@ -1457,11 +1916,12 @@ pub fn run_ai_scan(req: &AiScanRequest) -> Result<(AiJsonOutput, String)> {
     // thinking can take several minutes on modest GPUs
     let http = client(Some(Duration::from_secs(if req.think { 900 } else { 300 })))?;
     let mut send_think = true;
+    let mut seed = 42u32;
 
     // A scan must come back complete: scene analysis, negative prompt and usable cards.
     // Whatever is missing is asked for again (up to 2 more scans), keeping the good
     // parts of each attempt.
-    let mut best = scan_once(req, &http, &base, &system, &prompt, &mut send_think)?;
+    let mut best = scan_once(req, &http, &base, &system, &prompt, &mut send_think, &mut seed)?;
     let needs_negative = !req.config.checkpoint.default_negative().is_empty();
     if needs_negative && best.recommended_negative.trim().is_empty() && !best.improved_prompt.trim().is_empty() {
         // The model sometimes skips the negative; a short follow-up asks for just that.
@@ -1470,7 +1930,7 @@ pub fn run_ai_scan(req: &AiScanRequest) -> Result<(AiJsonOutput, String)> {
     let mut rescans = 0;
     while !scan_problems(&best, req).is_empty() && rescans < 2 {
         rescans += 1;
-        let Ok(next) = scan_once(req, &http, &base, &system, &prompt, &mut send_think) else { continue };
+        let Ok(next) = scan_once(req, &http, &base, &system, &prompt, &mut send_think, &mut seed) else { continue };
         merge_scan(&mut best, next, req);
     }
     best.recommended_negative = clean_negative(&best.recommended_negative);
@@ -1493,9 +1953,11 @@ fn scan_once(
     system: &str,
     prompt: &str,
     send_think: &mut bool,
+    seed: &mut u32,
 ) -> Result<AiJsonOutput> {
     for _attempt in 0..3 {
-        let mut body = generate_body(req, system, prompt);
+        let mut body = generate_body(req, system, prompt, *seed);
+        *seed += 1;
         if !*send_think {
             body.think = None;
         }
@@ -1543,19 +2005,56 @@ fn negative_ok(o: &AiJsonOutput, req: &AiScanRequest) -> bool {
 
 /// The rewrite plus cards that would actually show up: when the improved prompt differs
 /// from the user's, at least one AI card must survive `convert_ai_changes`.
+/// The user's tags the scan was about (every character on the 2-4 Characters tabs).
+pub fn request_tokens(req: &AiScanRequest) -> Vec<crate::parser::PromptToken> {
+    let mut t = crate::parser::parse_prompt(&req.raw_prompt);
+    if req.config.two_char {
+        t.extend(crate::parser::parse_prompt(&req.config.scene_prompt_raw));
+        for i in 1..req.config.char_count() {
+            t.extend(crate::parser::parse_prompt(req.config.prompt_of(i)));
+        }
+    }
+    t
+}
+
 fn cards_ok(o: &AiJsonOutput, req: &AiScanRequest) -> bool {
     if o.improved_prompt.trim().is_empty() {
         return false;
     }
-    let tokens = crate::parser::parse_prompt(&req.raw_prompt);
+    let tokens = request_tokens(req);
     let before: std::collections::HashSet<String> = tokens.iter().map(|t| t.normalized.clone()).collect();
     let after: std::collections::HashSet<String> =
         crate::parser::parse_prompt(&o.improved_prompt).into_iter().map(|t| t.normalized).collect();
     if before == after {
         return true; // nothing to change, so no cards needed
     }
-    let rules = crate::analyzer::analyze_with_rules(&tokens, &req.config).changes;
-    !convert_ai_changes(&o.changes, &tokens, &rules).is_empty()
+    let rules = if req.config.two_char {
+        let mut r = Vec::new();
+        let add_for = |prompt: &str, r: &mut Vec<PromptChange>| {
+            let t = crate::parser::parse_prompt(prompt);
+            r.extend(crate::analyzer::analyze_with_rules(&t, &req.config).changes);
+        };
+        add_for(&req.raw_prompt, &mut r);
+        add_for(&req.config.scene_prompt_raw, &mut r);
+        for i in 1..req.config.char_count() {
+            add_for(req.config.prompt_of(i), &mut r);
+        }
+        r
+    } else {
+        crate::analyzer::analyze_with_rules(&tokens, &req.config).changes
+    };
+    if !convert_ai_changes(&o.changes, &tokens, &rules).is_empty() {
+        return true;
+    }
+    // If the improved prompt has edits and all edits are already handled by existing rule cards,
+    // the scan is valid and we do not trigger wasteful re-scans.
+    let covered: std::collections::HashSet<String> = rules
+        .iter()
+        .flat_map(|c| crate::parser::parse_prompt(&c.original))
+        .map(|t| t.normalized)
+        .collect();
+    let diff = before.symmetric_difference(&after).collect::<Vec<_>>();
+    !diff.is_empty() && diff.iter().all(|t| covered.contains(*t))
 }
 
 fn dynamic_ok(o: &AiJsonOutput, req: &AiScanRequest) -> bool {
@@ -1609,11 +2108,18 @@ fn generate_negative(req: &AiScanRequest, positive: &str) -> Result<String> {
         "You write negative prompts for {} (ComfyUI). Reply with JSON only.",
         req.config.checkpoint.display_name()
     );
+    let view_negs = req.config.target_view.negative_tags();
+    let view_hint = if view_negs.is_empty() {
+        String::new()
+    } else {
+        format!(", plus '{view_negs}' for the target framing")
+    };
     let prompt = format!(
         "Positive prompt:\n{positive}\n\nWrite a negative prompt of 12-30 comma-separated tags: start from these usual \
-         negatives ({}), then add plain tags for things that would spoil THIS scene (wrong camera angle, unwanted extra \
-         people, the opposite of its setting, time of day or mood), each a plain tag naming the unwanted thing. \
-         Never 'no X' or 'wrong X'; never anything the positive prompt asks for.",
+         negatives ({}{view_hint}), then add concrete Danbooru tags for things that would spoil THIS scene (e.g. 'full body, lower body' \
+         for an upper body shot, 'crowd, multiple girls' when solo, the opposite of its setting, time of day or mood), \
+         each a real Danbooru tag naming the unwanted thing. Never 'no X', 'wrong X' or 'unwanted X'; never anything \
+         the positive prompt asks for.",
         req.config.checkpoint.default_negative()
     );
     let body = json!({
@@ -1750,7 +2256,7 @@ mod tests {
 
                 dynamic: false,
 
-                lora_tags_raw: String::new(), arranged: false, natural: false,
+                lora_tags_raw: String::new(), arranged: false, natural: false, two_char: false, char2_prompt_raw: String::new(), char2_lora_tags_raw: String::new(), char_break: false, scene_prompt_raw: String::new(), more_chars: Vec::new(),
 
                 detail: crate::profiles::DetailLevel::Balanced,
             },
@@ -1760,10 +2266,10 @@ mod tests {
             keep_alive: "30m".into(),
             think: false,
         };
-        let v = serde_json::to_value(generate_body(&req, "s", "p")).unwrap();
+        let v = serde_json::to_value(generate_body(&req, "s", "p", 42)).unwrap();
         assert_eq!(v["options"]["num_gpu"], 0);
         req.mode = AiMode::Gpu;
-        let v = serde_json::to_value(generate_body(&req, "s", "p")).unwrap();
+        let v = serde_json::to_value(generate_body(&req, "s", "p", 42)).unwrap();
         assert!(v["options"].get("num_gpu").is_none());
         assert_eq!(v["format"]["type"], "object");
     }
@@ -1861,7 +2367,7 @@ mod tests {
 
                 dynamic: false,
 
-                lora_tags_raw: String::new(), arranged: false, natural: false,
+                lora_tags_raw: String::new(), arranged: false, natural: false, two_char: false, char2_prompt_raw: String::new(), char2_lora_tags_raw: String::new(), char_break: false, scene_prompt_raw: String::new(), more_chars: Vec::new(),
 
                 detail: crate::profiles::DetailLevel::Balanced,
             },
@@ -1920,7 +2426,7 @@ mod tests {
 
                 dynamic: false,
 
-                lora_tags_raw: String::new(), arranged: false, natural: false,
+                lora_tags_raw: String::new(), arranged: false, natural: false, two_char: false, char2_prompt_raw: String::new(), char2_lora_tags_raw: String::new(), char_break: false, scene_prompt_raw: String::new(), more_chars: Vec::new(),
 
                 detail: crate::profiles::DetailLevel::Balanced,
             },
@@ -1971,7 +2477,7 @@ mod tests {
             config: ScanConfig {
                 checkpoint: crate::profiles::CheckpointProfile::PonyV6, target_view: crate::profiles::TargetView::None, pinned_emphasis_raw: String::new(),
                 emphasis_weight: 1.25, cleanup_enabled: true, resolve_conflicts_enabled: true, clamp_weights_enabled: true,
-                camera_angle: 0, pose: 0, dynamic: false, lora_tags_raw: String::new(), arranged: false, natural: false,
+                camera_angle: 0, pose: 0, dynamic: false, lora_tags_raw: String::new(), arranged: false, natural: false, two_char: false, char2_prompt_raw: String::new(), char2_lora_tags_raw: String::new(), char_break: false, scene_prompt_raw: String::new(), more_chars: Vec::new(),
                 detail: crate::profiles::DetailLevel::Balanced,
             },
             mode: AiMode::Gpu, host: String::new(), model: String::new(), keep_alive: "30m".into(), think: false,
@@ -2030,7 +2536,7 @@ mod tests {
             let config = ScanConfig {
                 checkpoint: crate::profiles::CheckpointProfile::PonyV6, target_view: crate::profiles::TargetView::None, pinned_emphasis_raw: String::new(),
                 emphasis_weight: 1.25, cleanup_enabled: true, resolve_conflicts_enabled: true, clamp_weights_enabled: true,
-                camera_angle: 0, pose: 0, dynamic: false, lora_tags_raw: String::new(), arranged: false, natural: false, detail: crate::profiles::DetailLevel::Balanced,
+                camera_angle: 0, pose: 0, dynamic: false, lora_tags_raw: String::new(), arranged: false, natural: false, two_char: false, char2_prompt_raw: String::new(), char2_lora_tags_raw: String::new(), char_break: false, scene_prompt_raw: String::new(), more_chars: Vec::new(), detail: crate::profiles::DetailLevel::Balanced,
             };
             let req = ImageAiRequest {
                 host: "localhost:11434".into(), model: "prompt-condenser-gemma4-12b".into(), mode: AiMode::Gpu,
@@ -2113,7 +2619,7 @@ mod tests {
                         camera_angle: std::env::var("COMPARE_ANGLE").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
                         pose: 0,
                         dynamic: std::env::var("COMPARE_DYNAMIC").is_ok(),
-                        lora_tags_raw: std::env::var("COMPARE_LORA").unwrap_or_default(), arranged: false, natural: std::env::var("COMPARE_NATURAL").is_ok(),
+                        lora_tags_raw: std::env::var("COMPARE_LORA").unwrap_or_default(), arranged: false, natural: std::env::var("COMPARE_NATURAL").is_ok(), two_char: false, char2_prompt_raw: String::new(), char2_lora_tags_raw: String::new(), char_break: false, scene_prompt_raw: String::new(), more_chars: Vec::new(),
                         detail: match std::env::var("COMPARE_DETAIL").as_deref() { Ok("rich") => crate::profiles::DetailLevel::Rich, Ok("faithful") => crate::profiles::DetailLevel::Faithful, _ => crate::profiles::DetailLevel::Balanced },
                     },
                     mode: AiMode::Gpu,
@@ -2166,6 +2672,71 @@ mod tests {
     }
 
     #[test]
+    fn instructions_do_their_job() {
+        use crate::profiles::{CheckpointProfile, DetailLevel, TargetView};
+        let base = || ScanConfig {
+            checkpoint: CheckpointProfile::PonyV6, target_view: TargetView::None, pinned_emphasis_raw: String::new(),
+            emphasis_weight: 1.25, cleanup_enabled: true, resolve_conflicts_enabled: true, clamp_weights_enabled: true,
+            camera_angle: 0, pose: 0, dynamic: false, lora_tags_raw: String::new(), arranged: false, natural: false,
+            two_char: false, char2_prompt_raw: String::new(), char2_lora_tags_raw: String::new(), char_break: false,
+            scene_prompt_raw: String::new(), more_chars: Vec::new(), detail: DetailLevel::Balanced,
+        };
+        // image -> prompt: the quality tags are where the prompt says they are
+        let sys = image_system_prompt(&base(), "");
+        assert!(sys.contains("starting with the quality tags (score_9"), "{sys}");
+        // the model writes the Deep Scan fields in the instructed order
+        let schema = changes_schema(true, false, false, 8, 12).to_string();
+        let at = |k: &str| schema.find(&format!("\"{k}\"")).unwrap();
+        assert!(at("scene_summary") < at("improved_prompt") && at("improved_prompt") < at("changes"), "{schema}");
+        assert!(!schema.contains("dynamic_prompt"));
+        assert!(!schema.contains("natural_sentence"));
+        // small models limit issues and changes
+        let small_schema = changes_schema(false, true, true, 4, 6).to_string();
+        assert!(small_schema.contains("\"maxItems\":4") && small_schema.contains("\"maxItems\":6"));
+        // the Light model keeps the user's own choices
+        let mut c = base();
+        c.lora_tags_raw = "<lora:fox:0.8>".into();
+        c.pinned_emphasis_raw = "red scarf".into();
+        c.pose = 2;
+        let (small, _) = build_ai_system_and_user_prompt_for("1girl, smile", &c, ModelFamily::Small);
+        assert!(small.contains("<lora:fox:0.8>") && small.contains("red scarf") && small.contains("pose"), "{small}");
+        assert!(!small.contains("Cleanup:"));
+        // Faithful never gets told to expand
+        let mut c = base();
+        c.detail = DetailLevel::Faithful;
+        let g = prompt_guidance("1girl, smile, red dress", &c).join("\n");
+        assert!(!g.contains("Expand it") && !g.contains("Fill these in"), "{g}");
+        // Rich isn't told to squeeze into 75 tokens
+        c.detail = DetailLevel::Rich;
+        let long = (0..40).map(|i| format!("tag{i} word")).collect::<Vec<_>>().join(", ");
+        assert!(!prompt_guidance(&long, &c).join("\n").contains("75 tokens"));
+        // the 75-token note only exists for CLIP checkpoints: not for Anima or Flux
+        let long = (0..60).map(|i| format!("tag{i} word")).collect::<Vec<_>>().join(", ");
+        let mut c = base();
+        c.checkpoint = CheckpointProfile::Anima;
+        assert!(!prompt_guidance(&long, &c).join("\n").contains("The prompt is long"), "Anima has no 75-token limit");
+        c.checkpoint = CheckpointProfile::Flux;
+        assert!(!prompt_guidance(&long, &c).join("\n").contains("The prompt is long"));
+        c.checkpoint = CheckpointProfile::PonyV6;
+        assert!(prompt_guidance(&long, &c).join("\n").contains("75 tokens"));
+        c.two_char = true;
+        c.char2_prompt_raw = "1girl, blue hair".into();
+        // two characters get 75 tokens each: 120 tokens is fine, 240 is long
+        assert!(!prompt_guidance(&long, &c).join("\n").contains("The prompt is long"));
+        let longer = (0..120).map(|i| format!("tag{i} word")).collect::<Vec<_>>().join(", ");
+        assert!(prompt_guidance(&longer, &c).join("\n").contains("for 2 characters"));
+        // multi-character: the notes read the Scene box too, and the example has BREAK, not solo
+        let mut c = base();
+        c.two_char = true;
+        c.scene_prompt_raw = "park, sunset, upper body".into();
+        c.char2_prompt_raw = "1girl, blue hair".into();
+        let (sys, _) = build_ai_system_and_user_prompt_for("1girl, red hair", &c, ModelFamily::Gemma);
+        assert!(!sys.contains("Not specified yet: camera framing, setting"), "{sys}");
+        assert!(sys.contains("BREAK, \\\n") || sys.contains("standing, BREAK"), "example should show BREAK");
+        assert!(sys.contains("Character 1's LoRA") || c.lora_tags_raw.is_empty());
+    }
+
+    #[test]
     fn guidance_adapts_to_the_prompt() {
         use crate::profiles::{CheckpointProfile, TargetView};
         let cfg = |view| ScanConfig {
@@ -2174,7 +2745,7 @@ mod tests {
  camera_angle: 0,
  pose: 0,
  dynamic: false,
- lora_tags_raw: String::new(), arranged: false, natural: false,
+ lora_tags_raw: String::new(), arranged: false, natural: false, two_char: false, char2_prompt_raw: String::new(), char2_lora_tags_raw: String::new(), char_break: false, scene_prompt_raw: String::new(), more_chars: Vec::new(),
  detail: crate::profiles::DetailLevel::Balanced,
         };
         let joined = |p: &str, v| prompt_guidance(p, &cfg(v)).join("\n");
@@ -2212,7 +2783,7 @@ mod tests {
         let mut cfg = ScanConfig {
             checkpoint: CheckpointProfile::Anima, target_view: TargetView::None, pinned_emphasis_raw: String::new(),
             emphasis_weight: 1.25, cleanup_enabled: true, resolve_conflicts_enabled: true, clamp_weights_enabled: true,
-            camera_angle: 6, pose: 0, dynamic: true, lora_tags_raw: String::new(), arranged: false, natural: false, detail: crate::profiles::DetailLevel::Rich,
+            camera_angle: 6, pose: 0, dynamic: true, lora_tags_raw: String::new(), arranged: false, natural: false, two_char: false, char2_prompt_raw: String::new(), char2_lora_tags_raw: String::new(), char_break: false, scene_prompt_raw: String::new(), more_chars: Vec::new(), detail: crate::profiles::DetailLevel::Rich,
         };
         let p = "1girl, solo, smile, kimono, shrine, night";
         let (g, gu) = build_ai_system_and_user_prompt_for(p, &cfg, ModelFamily::Gemma);
