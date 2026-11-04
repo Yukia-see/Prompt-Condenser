@@ -1,7 +1,7 @@
 # Maintainer: Yukia See
 # Build with: scripts/build_arch_package.sh [--install]
 pkgname=prompt-condenser
-pkgver=0.3.2
+pkgver=0.3.3
 pkgrel=1
 url="https://github.com/Yukia-see/Prompt-Condenser"
 pkgdesc="ComfyUI prompt condenser, framing-conflict scanner and Danbooru tagger (Slint UI, Ollama AI)"
