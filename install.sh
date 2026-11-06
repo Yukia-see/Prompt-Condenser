@@ -100,13 +100,13 @@ DESKTOP
 command -v update-desktop-database >/dev/null && update-desktop-database "$(dirname "$DESKTOP_FILE")" >/dev/null 2>&1 || true
 
 # ---------------------------------------------------------------- AI model (through Ollama)
-MODEL_NAME=prompt-condenser-gemma4-12b
-MODEL_SRC=hf.co/culturerevolt/gemma-4-12b-heretic-abliterated-GGUF:Q4_K_M
+MODEL_NAME=richardyoung/llama-3.1-8b-instruct-abliterated
+MODEL_SRC=richardyoung/llama-3.1-8b-instruct-abliterated:latest
 if command -v ollama >/dev/null && ollama_up; then
   if ollama list 2>/dev/null | awk '{print $1}' | grep -qx "$MODEL_NAME:latest"; then
     echo "==> $MODEL_NAME is already in Ollama"
-  elif ask "Download the recommended AI model now (Gemma 4 12B uncensored, ~7.6 GB, needs ~8 GB VRAM)?"; then
-    ollama pull "$MODEL_SRC" && ollama cp "$MODEL_SRC" "$MODEL_NAME" && ollama rm "$MODEL_SRC" >/dev/null
+  elif ask "Download the recommended AI model now (Llama 3.1 8B Abliterated, ~4.9 GB, needs ~5 GB VRAM)?"; then
+    ollama pull "$MODEL_SRC"
   else
     echo "    Skipped. Pick a model in the app and click 'Download Model' (smaller ones: Light ~3 GB, Balanced ~3.5 GB)."
   fi

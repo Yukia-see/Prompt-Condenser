@@ -175,7 +175,7 @@ impl TagList {
                 .filter(|t| !t.character)
                 .filter(|t| t.name.split(|c: char| !c.is_alphanumeric()).any(|tw| tw == w || tw == stem || tw.strip_suffix('s') == Some(stem)))
                 .collect();
-            hits.sort_by(|a, b| b.count.cmp(&a.count));
+            hits.sort_by_key(|a| std::cmp::Reverse(a.count));
             for t in hits.into_iter().take(per_word) {
                 if seen.insert(t.name.clone()) {
                     out.push(t);

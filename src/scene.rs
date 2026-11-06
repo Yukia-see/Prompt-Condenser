@@ -48,6 +48,8 @@ const EXPRESSION: &[&str] = &[
     "smile", "smirk", "grin", "blush", "open mouth", "closed mouth", "crying", "tears", "angry", "frown", "pout",
     "expressionless", "surprised", "happy", "sad", "laughing", "tongue out", "closed eyes", "one eye closed", "wink",
     "seductive", "embarrassed", "serious", "sleepy", "nervous", "ahegao", "parted lips", ":d", ":o", ":3",
+    // -ing forms the AI and users write ("whole word" matching won't find "wink" in "winking")
+    "winking", "pouting", "smirking", "blushing", "smiling", "grinning", "frowning", "sulking", "pouting",
 ];
 const CAMERA: &[&str] = &[
     "upper body", "cowboy shot", "full body", "portrait", "close-up", "close up", "headshot", "lower body",
@@ -68,6 +70,13 @@ const SETTING: &[&str] = &[
     "forest", "beach", "ocean", "sea", "sky", "shrine", "temple", "castle", "park", "garden", "field", "mountain",
     "river", "lake", "rooftop", "cafe", "library", "bathroom", "pool", "snow", "rain", "desert", "space", "cherry blossoms",
     "school", "train", "car", "bed", "window", "stage", "ruins", "village", "alley", "water", "flower", "tree",
+    "couch", "sofa", "chair", "armchair", "table", "desk", "bookshelf", "bookcase", "door", "wall", "curtain", "curtains",
+    "lamp", "lantern", "plant", "potted plant", "carpet", "rug", "shelf", "furniture", "mirror", "balcony", "bench",
+    "patio", "veranda", "porch", "hallway", "corridor", "ceiling", "floor", "tatami", "fence", "stairs", "staircase",
+    "counter", "bar", "window sill", "pillow", "cushion", "futon", "clock", "poster", "painting", "signboard",
+    "street lamp", "cloud", "clouds", "grass", "leaves", "bridge", "tower", "building", "skyscraper", "shop", "store",
+    "restaurant", "hospital", "laboratory", "auditorium", "computer", "monitor", "screen", "keyboard", "laptop",
+    "whiteboard", "chalkboard", "blackboard", "gym", "gymnasium", "dojo", "stadium", "arena", "living room",
 ];
 const OUTFIT: &[&str] = &[
     "dress", "kimono", "yukata", "uniform", "shirt", "skirt", "bikini", "swimsuit", "armor", "jacket", "coat",
@@ -109,6 +118,11 @@ const POSE: &[&str] = &[
     "hand on hip", "hands on hips", "head tilt", "tilted head", "crouching", "reaching", "arms crossed",
     "crossed legs", "legs crossed", "hands to face", "hands on own face", "hand on own face", "covering face",
     "hand up", "hands up", "arm up", "outstretched arm", "clenched hand", "clenched hands",
+    "reclining", "lounging", "relaxing", "praying", "bowing", "crying", "laughing", "singing", "talking",
+    "floating", "swimming", "riding", "touching", "caressing", "pulling", "pushing", "carrying", "lifting",
+    "straddling", "on knees", "on side", "lying on side", "arms behind back", "arms behind head", "hands behind back",
+    "hands behind head", "hands in pockets", "hand in pocket",
+    "gazing", "staring", "glancing",
 ];
 
 /// A hair tag ("long hair", "hairband"), but not furniture ("chair", "armchair").
@@ -128,14 +142,14 @@ fn has_word(text: &str, words: &[&str]) -> bool {
 /// Checks whether a tag describes character identity, body traits, or clothing
 /// rather than scene environment or camera/style.
 pub fn is_character_like(n: &str) -> bool {
-    if CAMERA.iter().any(|c| *c == n) || n.ends_with(" shot") || n.ends_with(" angle") || n.ends_with(" view") {
+    if CAMERA.contains(&n) || n.ends_with(" shot") || n.ends_with(" angle") || n.ends_with(" view") {
         return false;
     }
     (SUBJECT.contains(&n) && n != "no humans" && n != "scenery")
         || has_word(n, IDENTITY)
         || has_word(n, OUTFIT)
         || has_word(n, TRAITS)
-        || has_word(n, &["girl", "boy", "guy", "woman", "man", "female", "male", "person", "human", "character"])
+        || has_word(n, &["girl", "boy", "guy", "woman", "man", "female", "male", "person", "human", "character", "lady", "gentleman", "dude", "chibi", "doll", "figure", "model"])
         || is_hair(n)
         || n.contains("eyes")
         || n.contains("skin")

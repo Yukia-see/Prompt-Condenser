@@ -24,7 +24,7 @@ use std::sync::mpsc;
 slint::include_modules!();
 
 /// What an AI scan was run against; its cards are dropped once any of these change.
-type AiKey = (String, i32, i32, i32, i32); // (prompt, checkpoint, view, camera angle, pose)
+type AiKey = (String, i32, i32, i32, i32, i32); // (prompt, checkpoint, view, camera angle, pose, proportion)
 
 /// UI-thread-only state behind the Slint properties.
 #[derive(Default)]
@@ -229,6 +229,7 @@ fn scan_config(ui: &AppWindow) -> ScanConfig {
         clamp_weights_enabled: ui.get_clamp_weights_enabled(),
         camera_angle: ui.get_angle_index().max(0) as usize,
         pose: ui.get_pose_index().max(0) as usize,
+        proportion: ui.get_proportion_index().max(0) as usize,
         dynamic: ui.get_dynamic_enabled(),
         lora_tags_raw: lora_lines(&ui.get_lora_tags()), arranged: ui.get_arranged_enabled(), natural: ui.get_natural_enabled(), two_char: ui.get_app_tab() >= 1, char2_prompt_raw: ui.get_char2_prompt().to_string(), char2_lora_tags_raw: lora_lines(&ui.get_char2_lora_tags()), char_break: ui.get_char_break_enabled(), scene_prompt_raw: ui.get_scene_prompt().to_string(), more_chars: more_chars(ui),
         detail: crate::profiles::DetailLevel::from_index(ui.get_detail_index()),
@@ -251,6 +252,7 @@ fn ai_key(ui: &AppWindow) -> AiKey {
         ui.get_target_view_index(),
         ui.get_angle_index(),
         ui.get_pose_index(),
+        ui.get_proportion_index(),
     )
 }
 
@@ -421,12 +423,12 @@ fn render(ui: &AppWindow, state: &State) {
     let rule_texts: Vec<String> = std::iter::once(out.final_prompt.clone()).chain(other_outs.iter().cloned()).collect();
     let rule_prompt = out.final_prompt.clone();
     out.final_prompt = if two_char {
-        let c = combine(&rule_texts, false);
+        let c = combine(&rule_texts, true);
         let text = c.text.clone();
         shown_parts = Some(c);
         text
     } else {
-        finish(&out.final_prompt, false)
+        finish(&out.final_prompt, true)
     };
     (out.after_tokens, out.after_chunks) = parser::estimate_clip_tokens(&out.final_prompt);
     let with_loras = |t: String| {
@@ -453,8 +455,12 @@ fn render(ui: &AppWindow, state: &State) {
         None => (None, None),
     };
     ui.set_ai_improved_available(improved.is_some());
-    if (improved.is_none() && ui.get_after_view() == 1) || (!config.dynamic && ui.get_after_view() == 2) {
-        ui.set_after_view(0);
+    if (improved.is_none() && (ui.get_after_view() == 1 || ui.get_after_view() == 4)) || (!config.dynamic && ui.get_after_view() == 2) {
+        if ui.get_after_view() == 4 {
+            ui.set_after_view(3);
+        } else {
+            ui.set_after_view(0);
+        }
     }
     match &st.ai_scene {
         Some(sc) => {
@@ -496,12 +502,12 @@ fn render(ui: &AppWindow, state: &State) {
                             }
                         }
                     }
-                    let c = combine(&varied, false);
+                    let c = combine(&varied, true);
                     let text = c.text.clone();
                     shown_parts = Some(c);
                     text
                 } else {
-                    finish(&p, false)
+                    finish(&p, true)
                 };
                 let note = if kinds.is_empty() {
                     "Nothing to vary yet: add a pose, angle, expression or lighting tag (or run a Deep AI Scan).".to_string()
@@ -516,6 +522,23 @@ fn render(ui: &AppWindow, state: &State) {
     let (text, markdown, after_tokens, after_chunks) = if let Some((dyn_text, _)) = dynamic_text {
         let (t, c) = parser::estimate_clip_tokens(&dyn_text);
         (dyn_text, String::new(), t, c)
+    } else if ui.get_after_view() == 3 {
+        let blocks_text = if two_char {
+            two::combine_section_blocks(&rule_texts, &config, true, ai_sentence.as_deref())
+        } else {
+            two::combine_section_blocks(std::slice::from_ref(&rule_prompt), &config, true, ai_sentence.as_deref())
+        };
+        let (t, c) = parser::estimate_clip_tokens(&blocks_text);
+        (blocks_text, String::new(), t, c)
+    } else if ui.get_after_view() == 4 {
+        let ai_raw = st.ai_scene.as_ref().map(|sc| sc.improved_prompt.clone()).unwrap_or_default();
+        let blocks_text = if two_char {
+            two::combine_section_blocks_ai(&ai_raw, &prompts, &config, ai_sentence.as_deref())
+        } else {
+            two::combine_section_blocks(&[ai_raw], &config, true, ai_sentence.as_deref())
+        };
+        let (t, c) = parser::estimate_clip_tokens(&blocks_text);
+        (blocks_text, String::new(), t, c)
     } else { match improved.filter(|_| ui.get_after_view() == 1) {
         Some(ai_text) => {
             if two_char {
@@ -532,7 +555,7 @@ fn render(ui: &AppWindow, state: &State) {
     if ui.get_after_view() != 1 {
         ui.set_ai_dropped("".into());
     }
-    render_negative(ui, &config, &text, st.ai_scene.as_ref().filter(|_| ui.get_after_view() == 1));
+    render_negative(ui, &config, &text, st.ai_scene.as_ref().filter(|_| ui.get_after_view() == 1 || ui.get_after_view() == 4));
     match shown_parts.filter(|_| two_char) {
         Some(c) => set_live_scene(ui, scene::describe_many(&c.chars, &c.shared)),
         None => render_live_scene(ui, &text),
@@ -660,10 +683,21 @@ fn format_stats(tokens: usize, chunks: usize) -> String {
 
 fn to_card(ch: &PromptChange) -> ChangeCardItem {
     let badge_kind = match ch.action {
-        ChangeAction::FramingSafeSwap | ChangeAction::PositioningConflict => 0,
+        ChangeAction::FramingSafeSwap
+        | ChangeAction::PositioningConflict
+        | ChangeAction::PoseConflict
+        | ChangeAction::AnatomyConflict => 0,
         ChangeAction::AiRewrite => 3,
-        ChangeAction::KeptEmphasized | ChangeAction::AngleChoice | ChangeAction::PoseChoice => 1,
-        ChangeAction::RemovedBloat | ChangeAction::MergedDuplicate | ChangeAction::WeightClamped | ChangeAction::SizeConflict => 2,
+        ChangeAction::KeptEmphasized
+        | ChangeAction::AngleChoice
+        | ChangeAction::PoseChoice
+        | ChangeAction::Recommendation
+        | ChangeAction::ProportionChoice => 1,
+        ChangeAction::RemovedBloat
+        | ChangeAction::MergedDuplicate
+        | ChangeAction::WeightClamped
+        | ChangeAction::SizeConflict
+        | ChangeAction::StyleConflict => 2,
     };
     ChangeCardItem {
         id: ch.id as i32,
@@ -706,16 +740,24 @@ fn build_model_choices(installed: &[OllamaModel]) -> Vec<ModelChoice> {
         .iter()
         .map(|m| m.name.clone())
         .collect();
+    let is_tier_match = |m: &str, t: AiModelTier| {
+        ai_engine::same_model(m, t.ollama_name())
+            || (t == AiModelTier::Best && (m.contains("12b") || m.contains("gemma-4-abliterated")))
+    };
     let mut choices: Vec<ModelChoice> = AiModelTier::ALL
         .iter()
         .map(|t| ModelChoice {
             name: t.ollama_name().to_string(),
             tier: Some(*t),
-            installed: installed.iter().any(|m| ai_engine::same_model(m, t.ollama_name())),
+            installed: installed.iter().any(|m| is_tier_match(m, *t)),
         })
         .collect();
     for m in &installed {
-        if !AiModelTier::ALL.iter().any(|t| ai_engine::same_model(m, t.ollama_name())) {
+        // Hide Moondream from the text prompt model dropdown (it is a vision encoder used behind the scenes)
+        if m.to_lowercase().contains("moondream") {
+            continue;
+        }
+        if !AiModelTier::ALL.iter().any(|t| is_tier_match(m, *t)) {
             choices.push(ModelChoice { name: m.clone(), tier: None, installed: true });
         }
     }
@@ -748,9 +790,38 @@ fn update_download_flag(ui: &AppWindow, state: &State) {
     ui.set_model_needs_download(needs);
 }
 
+/// Redoes the vision encoder by invalidating all cached image and reference analysis
+/// and re-running the vision model against loaded images.
+fn refresh_vision_encoder(ui: &AppWindow, state: &State) {
+    if ui.get_tagger_busy() {
+        return;
+    }
+    {
+        let mut st = state.borrow_mut();
+        st.image_ai = None;
+        st.two_ai = None;
+        st.char_images = [None, None, None, None];
+        st.last_tags = None;
+        st.two_tags = None;
+    }
+    let enc_name = vision_model(ui, state).unwrap_or_else(|| "vision encoder".into());
+    ui.set_image_status(format!("↻ Redoing Vision Encoder ({enc_name})…").into());
+
+    if ui.get_images_pending() || ui.get_scene_ref_loaded() || ui.get_char1_image_loaded() {
+        run_read_queue(ui, state);
+    } else if state.borrow().image_path.is_some() {
+        if ui.get_app_tab() >= 1 {
+            run_two_image(ui, state);
+        } else {
+            run_ai_image(ui, state);
+        }
+    }
+}
+
 /// Asks Ollama for its models (off the UI thread) and refreshes the dropdown.
 /// `quiet` is for background retries: no "Connecting..." flicker.
-fn connect_ollama(ui: &AppWindow, quiet: bool) {
+/// `redo_vision`: if true and images are loaded, automatically re-runs the vision encoder.
+fn connect_ollama(ui: &AppWindow, quiet: bool, redo_vision: bool) {
     let host = ui.get_ollama_host().to_string();
     ui.set_ollama_busy(true);
     if !quiet {
@@ -768,6 +839,19 @@ fn connect_ollama(ui: &AppWindow, quiet: bool) {
                     set_model_choices(&ui, state, build_model_choices(&models));
                     ui.set_ollama_connected(true);
                     ui.set_ollama_status(format!("Connected to {base} — {n} model(s)").into());
+
+                    if redo_vision {
+                        let has_image = state.borrow().image_path.is_some()
+                            || state.borrow().scene_ref_path.is_some()
+                            || state.borrow().char_paths.iter().any(|p| p.is_some())
+                            || ui.get_image_loaded()
+                            || ui.get_scene_ref_loaded()
+                            || ui.get_char1_image_loaded();
+                        if has_image && !ui.get_tagger_busy() {
+                            ui.set_image_use_ai(true);
+                            refresh_vision_encoder(&ui, state);
+                        }
+                    }
                 }
                 Err(_) => {
                     set_model_choices(&ui, state, build_model_choices(&[]));
@@ -811,18 +895,28 @@ fn image_extract(ui: &AppWindow, state: &State, run: bool) {
         return two_image_extract(ui, state, run);
     }
     if ui.get_image_use_ai() {
-        let cached = state.borrow().image_ai.clone();
-        match cached {
-            Some(res) => apply_ai_image(ui, state, &res, None),
-            None if run => run_ai_image(ui, state),
-            None => ui.set_image_status("Press Read Image to read it with AI.".into()),
+        if run {
+            // Explicit run/redo: clear AI cache and re-run with Vision Encoder
+            state.borrow_mut().image_ai = None;
+            run_ai_image(ui, state);
+        } else {
+            let cached = state.borrow().image_ai.clone();
+            match cached {
+                Some(res) => apply_ai_image(ui, state, &res, None),
+                None => ui.set_image_status("Press Read Image to read it with AI.".into()),
+            }
+        }
+    } else if run {
+        state.borrow_mut().last_tags = None;
+        if !tagger::is_installed() {
+            ui.set_image_status("Download the Danbooru tagger once (1.2 GB) to extract tags.".into());
+        } else {
+            run_tagger(ui, state);
         }
     } else if state.borrow().last_tags.is_some() {
         apply_tags(ui, state, Some(0.0));
     } else if !tagger::is_installed() {
         ui.set_image_status("Download the Danbooru tagger once (1.2 GB) to extract tags.".into());
-    } else if run {
-        run_tagger(ui, state);
     } else {
         ui.set_image_status("Press Read Image to read it with the tagger.".into());
     }
@@ -832,6 +926,15 @@ fn image_extract(ui: &AppWindow, state: &State, run: bool) {
 /// cache when this image was read already.
 fn two_image_extract(ui: &AppWindow, state: &State, run: bool) {
     let use_ai = ui.get_image_use_ai();
+    if run {
+        if use_ai {
+            state.borrow_mut().two_ai = None;
+        } else {
+            state.borrow_mut().two_tags = None;
+        }
+        run_two_image(ui, state);
+        return;
+    }
     let (tags, ai) = {
         let st = state.borrow();
         (st.two_tags.clone(), st.two_ai.clone())
@@ -842,7 +945,6 @@ fn two_image_extract(ui: &AppWindow, state: &State, run: bool) {
             let split = twoimg::rule_split(&t, ui.get_tag_threshold());
             apply_two(ui, state, &split, two_status(&t, "Tagger split"));
         }
-        _ if run => run_two_image(ui, state),
         _ => ui.set_image_status(
             format!("Press Read Image to split it with {}.", if use_ai { "AI" } else { "the tagger" }).into(),
         ),
@@ -864,14 +966,20 @@ fn run_two_image(ui: &AppWindow, state: &State) {
         ui.set_image_status(format!("{e}").into());
         return;
     }
-    let ai = (ui.get_image_use_ai() && ui.get_ollama_connected()).then(|| vision_model(ui, state)).flatten();
-    if ui.get_image_use_ai() && ai.is_none() {
+    let ai_on = ui.get_image_use_ai() && ui.get_ollama_connected();
+    let text_model = ai_on.then(|| default_text_model(ui, state));
+    let vision_encoder = ai_on.then(|| vision_model(ui, state)).flatten();
+    if ui.get_image_use_ai() && text_model.is_none() {
         ui.set_image_status(
-            "AI mode needs Ollama and Maximum Fast (Gemma 4 12B), which can see images. Using the tagger split.".into(),
+            "AI mode needs Ollama and a configured model. Using the tagger split.".into(),
         );
     }
     let (host, mode, threshold) =
         (ui.get_ollama_host().to_string(), AiMode::from_index(ui.get_ai_mode_index()), ui.get_tag_threshold());
+    let has_vision = text_model.as_ref().is_some_and(|m| {
+        state.borrow().vision_models.iter().any(|v| ai_engine::same_model(v, m))
+    });
+    let second_pass = ui.get_image_second_pass() && has_vision;
     let n = tab_chars(ui);
     // a cached reading for another number of characters doesn't count
     let cached = state.borrow().two_tags.clone().filter(|t| t.wanted == n);
@@ -890,7 +998,7 @@ fn run_two_image(ui: &AppWindow, state: &State) {
             if !detector::is_installed() {
                 let (tx, rx) = mpsc::channel::<String>();
                 let p = progress.clone();
-                let printer = std::thread::spawn(move || rx.into_iter().for_each(|m| p(m)));
+                let printer = std::thread::spawn(move || rx.into_iter().for_each(p));
                 detector::download(&tx)?;
                 drop(tx);
                 let _ = printer.join();
@@ -899,17 +1007,29 @@ fn run_two_image(ui: &AppWindow, state: &State) {
                 Some(t) => t,
                 None => {
                     progress("Tagging each character…".into());
-                    twoimg::read(&path, n, ai.is_none())?
+                    twoimg::read(&path, n, !ai_on)?
                 }
             };
-            let ai_split = ai.map(|model| {
-                progress(format!("AI is checking who is who with {model}…"));
+            let ai_split = text_model.map(|model| {
+                let status_name = match &vision_encoder {
+                    Some(enc) if !ai_engine::same_model(enc, &model) => {
+                        if second_pass {
+                            format!("{enc} + {model} (2nd Pass Vision)")
+                        } else {
+                            format!("{enc} → {model}")
+                        }
+                    }
+                    _ => model.clone(),
+                };
+                progress(format!("AI is checking who is who with {status_name}…"));
                 ai_engine::split_image(&ai_engine::TwoImageRequest {
                     host,
                     model,
+                    vision_encoder,
                     mode,
                     hints: twoimg::rule_split(&tags, threshold),
                     split: tags.clone(),
+                    second_pass_vision: second_pass,
                 })
                 .map(|(split, _)| twoimg::settle(split, &tags, threshold))
             });
@@ -963,7 +1083,10 @@ fn apply_two(ui: &AppWindow, state: &State, split: &twoimg::SplitPrompt, status:
     }
     // Identity Only: the image supplies the characters, your Scene box stays
     if !ui.get_image_identity_only() {
-        let cleaned_scene = twoimg::clean_list(&split.scene, true);
+        let current_scene = ui.get_scene_prompt().to_string();
+        let other_prompts: Vec<String> = (0..tab_chars(ui)).map(|i| char_box(ui, i)).collect();
+        let scene_tags: Vec<String> = split.scene.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+        let cleaned_scene = sceneref::update_shared_scene_prompt(&current_scene, &scene_tags, &other_prompts);
         ui.set_scene_prompt(cleaned_scene.into());
     }
     ui.set_image_status(status.into());
@@ -975,23 +1098,34 @@ fn apply_two(ui: &AppWindow, state: &State, split: &twoimg::SplitPrompt, status:
 /// What the background readers need to call the tagger and the vision model.
 #[derive(Clone)]
 struct ReadCtx {
-    /// The vision model in AI mode (when Ollama has one), else the tagger alone.
+    /// The target text model (from dropdown / default tier).
     model: Option<String>,
+    /// The vision encoder (defaults to Moondream).
+    vision_encoder: Option<String>,
     host: String,
     mode: AiMode,
     threshold: f32,
     config: ScanConfig,
+    second_pass: bool,
 }
 
 fn read_ctx(ui: &AppWindow, state: &State) -> ReadCtx {
     let mut config = scan_config(ui);
     config.two_char = false;
+    let ai_on = ui.get_image_use_ai() && ui.get_ollama_connected();
+    let text_model = ai_on.then(|| default_text_model(ui, state));
+    let has_vision = text_model.as_ref().is_some_and(|m| {
+        state.borrow().vision_models.iter().any(|v| ai_engine::same_model(v, m))
+    });
+    let second_pass = ui.get_image_second_pass() && has_vision;
     ReadCtx {
-        model: (ui.get_image_use_ai() && ui.get_ollama_connected()).then(|| vision_model(ui, state)).flatten(),
+        model: text_model,
+        vision_encoder: ai_on.then(|| vision_model(ui, state)).flatten(),
         host: ui.get_ollama_host().to_string(),
         mode: AiMode::from_index(ui.get_ai_mode_index()),
         threshold: ui.get_tag_threshold(),
         config,
+        second_pass,
     }
 }
 
@@ -1003,10 +1137,12 @@ fn read_char_blocking(path: &std::path::Path, ctx: &ReadCtx, progress: &(dyn Fn(
     let req = ai_engine::ImageAiRequest {
         host: ctx.host.clone(),
         model,
+        vision_encoder: ctx.vision_encoder.clone(),
         mode: ctx.mode,
         image_path: path.to_path_buf(),
         config: ctx.config.clone(),
         tag_hints: hints.clone(),
+        second_pass_vision: ctx.second_pass,
     };
     Ok(match ai_engine::describe_image(&req) {
         Ok(r) => (r.prompt, "AI"),
@@ -1030,14 +1166,27 @@ fn read_scene_blocking(
     let tags = tagger::tag_image(path)?;
     let hints = scene::filter_scene_and_pose_only(&tagger::build_prompt(&tags, ctx.threshold).prompt, false);
     let Some(model) = ctx.model.clone() else { return Ok((sceneref::from_single(&hints, false), "tagger".into())) };
-    progress(format!("AI vision analyzing pose with {model}…"));
+    let status_name = if let Some(ref enc) = ctx.vision_encoder {
+        if ai_engine::same_model(enc, &model) {
+            enc.clone()
+        } else if ctx.second_pass {
+            format!("{enc} + {model} (2nd Pass Vision)")
+        } else {
+            format!("{enc} → {model}")
+        }
+    } else {
+        model.clone()
+    };
+    progress(format!("AI vision analyzing pose with {status_name}…"));
     let req = ai_engine::ImageAiRequest {
         host: ctx.host.clone(),
         model,
+        vision_encoder: ctx.vision_encoder.clone(),
         mode: ctx.mode,
         image_path: path.to_path_buf(),
         config: ctx.config.clone(),
         tag_hints: hints.clone(),
+        second_pass_vision: ctx.second_pass,
     };
     Ok(match ai_engine::describe_scene_pose(&req) {
         Ok(r) => (sceneref::from_single(&r.prompt, false), "AI".into()),
@@ -1054,7 +1203,7 @@ fn read_scene_split(
     if !detector::is_installed() {
         let (tx, rx) = mpsc::channel::<String>();
         std::thread::scope(|s| {
-            s.spawn(|| rx.into_iter().for_each(|m| progress(m)));
+            s.spawn(|| rx.into_iter().for_each(progress));
             let r = detector::download(&tx);
             drop(tx);
             r
@@ -1065,13 +1214,25 @@ fn read_scene_split(
     let hints = twoimg::rule_split(&tags, ctx.threshold);
     let (split, mut how) = match ctx.model.clone() {
         Some(model) => {
-            progress(format!("AI is reading who does what with {model}…"));
+            let status_name = match &ctx.vision_encoder {
+                Some(enc) if !ai_engine::same_model(enc, &model) => {
+                    if ctx.second_pass {
+                        format!("{enc} + {model} (2nd Pass Vision)")
+                    } else {
+                        format!("{enc} → {model}")
+                    }
+                }
+                _ => model.clone(),
+            };
+            progress(format!("AI is reading who does what with {status_name}…"));
             match ai_engine::split_image(&ai_engine::TwoImageRequest {
                 host: ctx.host.clone(),
                 model,
+                vision_encoder: ctx.vision_encoder.clone(),
                 mode: ctx.mode,
                 hints: hints.clone(),
                 split: tags.clone(),
+                second_pass_vision: ctx.second_pass,
             }) {
                 Ok((s, _)) => (twoimg::settle(s, &tags, ctx.threshold), "AI".to_string()),
                 Err(_) => (hints, "tagger, the AI failed".to_string()),
@@ -1108,7 +1269,8 @@ fn run_scene_fast_scan(ui: &AppWindow, state: &State) {
         return;
     };
     let mut ctx = read_ctx(ui, state);
-    ctx.model = None; // FORCE FAST SCAN (Skips slow AI LLM/VLM)
+    ctx.model = None;
+    ctx.vision_encoder = None; // FORCE FAST SCAN (Skips slow AI LLM/VLM)
     let n = tab_chars(ui);
     ui.set_tagger_busy(true);
     let weak = ui.as_weak();
@@ -1148,7 +1310,7 @@ fn run_read_queue(ui: &AppWindow, state: &State) {
     }
     let (scene, chars) = {
         let st = state.borrow();
-        let scene = st.scene_ref_path.clone().filter(|_| st.scene_ref.is_none());
+        let scene = st.scene_ref_path.clone();
         let chars: Vec<(usize, std::path::PathBuf)> = (0..tab_chars(ui))
             .filter_map(|k| st.char_paths[k].clone().filter(|_| st.char_images[k].is_none()).map(|p| (k, p)))
             .collect();
@@ -1277,33 +1439,44 @@ fn apply_scene_ref(ui: &AppWindow, state: &State) {
     let plan = sceneref::plan(&actions, &ov, n);
 
     // Box index: 0 = Before / Char 1, 1 = Char 2, 2 = Char 3, 3 = Char 4, 4 = Scene box
-    let targets: Vec<(usize, Vec<String>, bool)> = if n == 1 {
+    // (box, tags, which predicate: 0 = actions, 1 = scene, 2 = both)
+    let targets: Vec<(usize, Vec<String>, u8)> = if n == 1 {
         // 1 Character tab: both actions and scene tags go to Before
-        let mut all = plan.chars.get(0).cloned().unwrap_or_default();
+        let mut all = plan.chars.first().cloned().unwrap_or_default();
         for s in &plan.scene {
             if !all.contains(s) { all.push(s.clone()); }
         }
-        vec![(0, all, true)]
+        // Before holds the character's actions and the scene together, so the reference
+        // replaces both (otherwise your own "indoors" would sit next to its "beach")
+        vec![(0, all, 2)]
     } else {
         let mut list = Vec::new();
         for i in 0..n {
             let tags = plan.chars.get(i).cloned().unwrap_or_default();
-            list.push((i, tags, true));
+            list.push((i, tags, 0));
         }
-        list.push((4, plan.scene.clone(), false));
+        list.push((4, plan.scene.clone(), 1));
         list
     };
 
     let mut new_snaps = Vec::new();
-    for (target, refs, is_char_act) in targets {
+    let other_prompts: Vec<String> = (0..n).map(|i| char_box(ui, i)).collect();
+    for (target, refs, kind) in targets {
         let current = if target == 4 { ui.get_scene_prompt().to_string() } else { char_box(ui, target) };
         let original = match old_boxes.iter().find(|b| b.target == target && b.injected == current) {
             Some(b) => b.original.clone(),
             None => current.clone(),
         };
-        let injected = sceneref::inject(&original, &refs, &|t| {
-            if is_char_act { sceneref::is_action(t) } else { scene::is_scene_or_pose(t) }
-        });
+        let injected = if target == 4 {
+            // When doing references or scene: clear shared prompt; if text already exists that is different from character prompts, add to it
+            sceneref::update_shared_scene_prompt(&original, &refs, &other_prompts)
+        } else {
+            sceneref::inject(&original, &refs, &|t| match kind {
+                0 => sceneref::is_action(t),
+                1 => scene::is_scene_or_pose(t),
+                _ => sceneref::is_pose_or_scene(t),
+            })
+        };
         if target == 4 {
             ui.set_scene_prompt(injected.clone().into());
         } else {
@@ -1341,6 +1514,17 @@ fn restore_boxes(ui: &AppWindow, snaps: &[BoxSnap]) {
 }
 
 /// Syncs the horizontal Scene Panel cards in Slint from the current plan.
+/// Extracts only action and pose tags describing what a character is doing.
+fn extract_char_actions(prompt: &str) -> String {
+    let tokens = parser::parse_prompt(prompt);
+    tokens
+        .into_iter()
+        .filter(sceneref::is_action)
+        .map(|t| t.raw.trim().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn sync_scene_panel(ui: &AppWindow, state: &State) {
     let n = tab_chars(ui);
     let st = state.borrow();
@@ -1360,10 +1544,15 @@ fn sync_scene_panel(ui: &AppWindow, state: &State) {
     for i in 0..n {
         let title = if n == 1 { "Character 1".to_string() } else { format!("Character {}", i + 1) };
         let cbox = char_box(ui, i);
-        let actions = if !cbox.trim().is_empty() {
-            cbox.clone()
+        let actions = if let Some(ref p) = plan {
+            let acts = p.chars.get(i).map(|v| v.join(", ")).unwrap_or_default();
+            if !acts.trim().is_empty() {
+                acts
+            } else {
+                extract_char_actions(&cbox)
+            }
         } else {
-            plan.as_ref().and_then(|p| p.chars.get(i)).map(|v| v.join(", ")).unwrap_or_default()
+            extract_char_actions(&cbox)
         };
         let has_actions = !actions.trim().is_empty();
 
@@ -1536,9 +1725,25 @@ fn clear_scene_ref(ui: &AppWindow, state: &State) {
     analyze(ui, state);
 }
 
-/// The model for reading images: the selected one if it can see, else any installed one that can.
+/// The default target text model for writing prompts (from dropdown or default tier).
+fn default_text_model(ui: &AppWindow, state: &State) -> String {
+    let st = state.borrow();
+    st.model_choices
+        .get(ui.get_model_index().max(0) as usize)
+        .filter(|c| c.installed)
+        .map(|c| c.name.clone())
+        .or_else(|| st.model_choices.iter().find(|c| c.installed && (c.name.contains("12b") || c.name.contains("llama") || c.name.contains("e4b"))).map(|c| c.name.clone()))
+        .or_else(|| st.model_choices.iter().find(|c| c.installed).map(|c| c.name.clone()))
+        .unwrap_or_else(|| profiles::AiModelTier::Best.ollama_name().to_string())
+}
+
+/// The vision encoder for reading images: defaults to Moondream if installed, else selected or first vision model.
 fn vision_model(ui: &AppWindow, state: &State) -> Option<String> {
     let st = state.borrow();
+    // Default to Moondream if available
+    if let Some(m) = st.vision_models.iter().find(|m| m.to_lowercase().contains("moondream")) {
+        return Some(m.clone());
+    }
     let selected = st.model_choices.get(ui.get_model_index().max(0) as usize).map(|c| c.name.clone());
     selected
         .filter(|s| st.vision_models.iter().any(|v| ai_engine::same_model(v, s)))
@@ -1552,36 +1757,68 @@ fn run_ai_image(ui: &AppWindow, state: &State) {
         ui.set_image_status("AI mode needs Ollama: connect first (or switch to Tagger).".into());
         return;
     }
-    let Some(model) = vision_model(ui, state) else {
+    let Some(encoder) = vision_model(ui, state) else {
         ui.set_image_status(
-            "AI mode needs a model that can see images: download Maximum Fast (Gemma 4 12B) in the AI model list.".into(),
+            "AI mode needs a vision model (like Moondream): download it with `ollama run moondream:1.8b`.".into(),
         );
         return;
     };
+    let text_model = default_text_model(ui, state);
     let cached_tags = state.borrow().last_tags.clone();
+    let has_vision = state.borrow().vision_models.iter().any(|v| ai_engine::same_model(v, &text_model));
+    let second_pass = ui.get_image_second_pass() && has_vision;
     let req = ai_engine::ImageAiRequest {
         host: ui.get_ollama_host().to_string(),
-        model: model.clone(),
+        model: text_model.clone(),
+        vision_encoder: Some(encoder.clone()),
         mode: AiMode::from_index(ui.get_ai_mode_index()),
         image_path: path.clone(),
         config: scan_config(ui),
         tag_hints: String::new(),
+        second_pass_vision: second_pass,
     };
     let threshold = ui.get_tag_threshold();
     ui.set_tagger_busy(true);
-    ui.set_image_status(format!("AI is reading the image with {model}…").into());
+    let status_name = if ai_engine::same_model(&encoder, &text_model) {
+        encoder.clone()
+    } else if second_pass {
+        format!("{encoder} + {text_model} (2nd Pass Vision)")
+    } else {
+        format!("{encoder} → {text_model}")
+    };
+    ui.set_image_status(format!("Combined reading: Tagger + {status_name}…").into());
     let weak = ui.as_weak();
     std::thread::spawn(move || {
         let started = std::time::Instant::now();
-        // the tagger's tags make the AI's reading more reliable
-        let tags = cached_tags.or_else(|| {
-            tagger::is_installed().then(|| twoimg::tag_one_fast(&path, &status_sender(&weak)).ok()).flatten()
-        });
+        // In Combined mode: run tagger and vision encoder in parallel for maximum speed
+        let (tags, vision_desc_res) = if cached_tags.is_none() && tagger::is_installed() && !ai_engine::same_model(&encoder, &text_model) {
+            std::thread::scope(|s| {
+                let tagger_handle = s.spawn(|| twoimg::tag_one_fast(&path, &status_sender(&weak)).ok());
+                let vision_handle = s.spawn(|| {
+                    ai_engine::extract_visual_description_from_path(&path, &req.host, req.mode, &encoder)
+                });
+                (
+                    tagger_handle.join().unwrap_or(None),
+                    Some(vision_handle.join().unwrap_or_else(|_| Err(anyhow::anyhow!("Vision thread panicked")))),
+                )
+            })
+        } else {
+            (
+                cached_tags.or_else(|| {
+                    tagger::is_installed().then(|| twoimg::tag_one_fast(&path, &status_sender(&weak)).ok()).flatten()
+                }),
+                None,
+            )
+        };
         let mut req = req;
         if let Some(t) = &tags {
             req.tag_hints = tagger::build_prompt(t, threshold).prompt;
         }
-        let result = ai_engine::describe_image(&req);
+        let result = match vision_desc_res {
+            Some(Ok(desc)) => ai_engine::describe_image_with_desc(&req, &desc, &encoder),
+            Some(Err(e)) => Err(e),
+            None => ai_engine::describe_image(&req),
+        };
         let secs = started.elapsed().as_secs_f32();
         let _ = weak.upgrade_in_event_loop(move |ui| {
             ui.set_tagger_busy(false);
@@ -1631,7 +1868,7 @@ fn identity(ui: &AppWindow, prompt: &str) -> String {
 fn apply_ai_image(ui: &AppWindow, state: &State, res: &ai_engine::ImageAiResult, secs: Option<f32>) {
     set_prompt_from_image(ui, state, &identity(ui, &res.prompt));
     let timing = secs.map(|s| format!(" • {s:.0} s")).unwrap_or_default();
-    ui.set_image_status(format!("AI{timing}: {}", res.description.trim()).into());
+    ui.set_image_status(format!("Combined{timing}: {}", res.description.trim()).into());
 }
 
 /// Runs the Danbooru tagger on the loaded image (off the UI thread).
@@ -1712,6 +1949,8 @@ struct Settings {
     angle_index: i32,
     /// Pose (0 None, 1 Standing, etc.).
     pose_index: i32,
+    /// Body proportion (0 None, 1 Flat chest, etc.).
+    proportion_index: i32,
     /// AI detail level (0 Faithful, 1 Balanced, 2 Rich).
     detail_index: i32,
     /// Image reading: false = Danbooru tagger, true = AI.
@@ -1733,6 +1972,7 @@ struct Settings {
     char_break: bool,
     scene_prompt: String,
     image_identity_only: bool,
+    image_second_pass: bool,
     /// THEME dropdown: 0 OLED Pitch Black, 1 M3 Deep Violet, 2 OLED Cyber Emerald,
     /// 3 M3 Ocean Blue, 4 M3 Crimson Ember, 5 M3 Mocha Gold.
     theme_index: i32,
@@ -1740,6 +1980,8 @@ struct Settings {
     lora_split_ratios: [f32; 4],
     /// The Options drawer open or closed.
     options_expanded: bool,
+    /// Output view: 0 Rule-based, 1 AI Improved, 2 Dynamic, 3 Section Blocks.
+    after_view: i32,
 }
 
 impl Default for Settings {
@@ -1754,6 +1996,7 @@ impl Default for Settings {
             target_view_index: 0,
             angle_index: 0,
             pose_index: 0,
+            proportion_index: 0,
             detail_index: 1,
             image_use_ai: false,
             raw_prompt: String::new(),
@@ -1771,9 +2014,11 @@ impl Default for Settings {
             char_break: true,
             scene_prompt: String::new(),
             image_identity_only: false,
+            image_second_pass: true,
             theme_index: 1,
             lora_split_ratios: [0.7; 4],
             options_expanded: true,
+            after_view: 3,
             ollama_host: "localhost:11434".into(),
         }
     }
@@ -1800,6 +2045,7 @@ fn load_settings(ui: &AppWindow) {
     ui.set_target_view_index(st.target_view_index.clamp(0, 7));
     ui.set_angle_index(st.angle_index.max(0));
     ui.set_pose_index(st.pose_index.max(0));
+    ui.set_proportion_index(st.proportion_index.max(0));
     ui.set_detail_index(st.detail_index.clamp(0, 2));
     ui.set_image_use_ai(st.image_use_ai);
     ui.set_raw_prompt(st.raw_prompt.into());
@@ -1817,8 +2063,10 @@ fn load_settings(ui: &AppWindow) {
     ui.set_char_break_enabled(st.char_break);
     ui.set_scene_prompt(st.scene_prompt.into());
     ui.set_image_identity_only(st.image_identity_only);
+    ui.set_image_second_pass(st.image_second_pass);
     ui.set_theme_index(st.theme_index.clamp(0, 5));
     ui.set_options_expanded(st.options_expanded);
+    ui.set_after_view(st.after_view.clamp(0, 4));
     let [r1, r2, r3, r4] = st.lora_split_ratios.map(|r| r.clamp(0.2, 0.9));
     ui.set_lora_split_ratio_c1(r1);
     ui.set_lora_split_ratio_c2(r2);
@@ -1840,6 +2088,7 @@ fn save_settings(ui: &AppWindow) {
         target_view_index: ui.get_target_view_index(),
         angle_index: ui.get_angle_index(),
         pose_index: ui.get_pose_index(),
+        proportion_index: ui.get_proportion_index(),
         detail_index: ui.get_detail_index(),
         image_use_ai: ui.get_image_use_ai(),
         raw_prompt: ui.get_raw_prompt().to_string(),
@@ -1857,8 +2106,10 @@ fn save_settings(ui: &AppWindow) {
         char_break: ui.get_char_break_enabled(),
         scene_prompt: ui.get_scene_prompt().to_string(),
         image_identity_only: ui.get_image_identity_only(),
+        image_second_pass: ui.get_image_second_pass(),
         theme_index: ui.get_theme_index(),
         options_expanded: ui.get_options_expanded(),
+        after_view: ui.get_after_view(),
         lora_split_ratios: [
             ui.get_lora_split_ratio_c1(),
             ui.get_lora_split_ratio_c2(),
@@ -1919,6 +2170,9 @@ fn main() -> Result<(), slint::PlatformError> {
     )));
     ui.set_pose_labels(ModelRc::new(VecModel::from(
         profiles::POSES.iter().map(|(l, _)| SharedString::from(*l)).collect::<Vec<_>>(),
+    )));
+    ui.set_proportion_labels(ModelRc::new(VecModel::from(
+        profiles::PROPORTIONS.iter().map(|(l, _)| SharedString::from(*l)).collect::<Vec<_>>(),
     )));
     let mut scene_poses = vec![
         SharedString::from("+ Add Pose ▾"),
@@ -2041,6 +2295,51 @@ fn main() -> Result<(), slint::PlatformError> {
     {
         let weak = ui.as_weak();
         let state = state.clone();
+        ui.on_copy_section_blocks_requested(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            let (text, is_ai) = if ui.get_after_view() == 3 || ui.get_after_view() == 4 {
+                (ui.get_condensed_prompt().to_string(), ui.get_after_view() == 4)
+            } else {
+                let config = scan_config(&ui);
+                let prompts = char_prompts(&ui, &config);
+                let ai_sentence = state.borrow().ai_scene.as_ref().map(|sc| sc.natural_sentence.clone()).filter(|s| !s.is_empty());
+                let two_char = ui.get_app_tab() >= 1;
+                let use_ai = ui.get_after_view() == 1 && state.borrow().ai_scene.is_some();
+                let ai_raw = state.borrow().ai_scene.as_ref().map(|sc| sc.improved_prompt.clone()).filter(|p| !p.trim().is_empty());
+                let t = match (use_ai, ai_raw) {
+                    (true, Some(ai)) => {
+                        if two_char {
+                            two::combine_section_blocks_ai(&ai, &prompts, &config, ai_sentence.as_deref())
+                        } else {
+                            two::combine_section_blocks(&[ai], &config, true, ai_sentence.as_deref())
+                        }
+                    }
+                    _ => {
+                        let mut p = prompts.clone();
+                        if two_char {
+                            p[0] = with_scene(&p[0], &config);
+                        }
+                        two::combine_section_blocks(&p, &config, true, ai_sentence.as_deref())
+                    }
+                };
+                (t, use_ai)
+            };
+            let mut st = state.borrow_mut();
+            if st.clipboard.is_none() {
+                st.clipboard = arboard::Clipboard::new().ok();
+            }
+            let msg = match st.clipboard.as_mut().map(|c| c.set_text(text)) {
+                Some(Ok(())) => if is_ai { "AI Section blocks prompt copied to clipboard.".to_string() } else { "Section blocks prompt copied to clipboard.".to_string() },
+                Some(Err(e)) => format!("Copy failed: {e}"),
+                None => "Copy failed: no clipboard available.".to_string(),
+            };
+            ui.set_status_message(msg.into());
+        });
+    }
+
+    {
+        let weak = ui.as_weak();
+        let state = state.clone();
         ui.on_copy_recommended_negative_requested(move || {
             let Some(ui) = weak.upgrade() else { return };
             let text = ui.get_negative_text().to_string();
@@ -2059,7 +2358,7 @@ fn main() -> Result<(), slint::PlatformError> {
         let weak = ui.as_weak();
         ui.on_connect_ollama_requested(move || {
             if let Some(ui) = weak.upgrade() {
-                connect_ollama(&ui, false);
+                connect_ollama(&ui, false, true);
             }
         });
     }
@@ -2092,7 +2391,7 @@ fn main() -> Result<(), slint::PlatformError> {
                         Ok(()) => ui.set_status_message(format!("{} is ready.", tier.label()).into()),
                         Err(e) => ui.set_status_message(format!("Download failed: {e:#}").into()),
                     }
-                    connect_ollama(&ui, false);
+                    connect_ollama(&ui, false, false);
                 });
             });
         });
@@ -2145,11 +2444,21 @@ fn main() -> Result<(), slint::PlatformError> {
         ui.on_read_image_requested(move || {
             let Some(ui) = weak.upgrade() else { return };
             // reference images first (scene, then characters); otherwise the loaded image
-            if ui.get_images_pending() {
+            if ui.get_images_pending() || ui.get_scene_ref_loaded() {
+                state.borrow_mut().char_images = [None, None, None, None];
                 run_read_queue(&ui, &state);
             } else {
                 image_extract(&ui, &state, true);
             }
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_redo_image_requested(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            ui.set_image_use_ai(true);
+            refresh_vision_encoder(&ui, &state);
         });
     }
     {
@@ -2229,7 +2538,7 @@ fn main() -> Result<(), slint::PlatformError> {
             let Some(ui) = weak.upgrade() else { return };
             let which = (which.max(0) as usize).min(tab_chars(&ui) - 1);
             let Some(path) = rfd::FileDialog::new()
-                .set_title(&format!("Pick a reference image for character {}", which + 1))
+                .set_title(format!("Pick a reference image for character {}", which + 1))
                 .add_filter("Images", &["png", "jpg", "jpeg", "webp"])
                 .pick_file()
             else {
@@ -2391,7 +2700,15 @@ fn main() -> Result<(), slint::PlatformError> {
         ui.on_scene_char_clear_requested(move |which| {
             let Some(ui) = weak.upgrade() else { return };
             let idx = which.max(0) as usize;
-            set_char_box(&ui, idx, "");
+            let current = char_box(&ui, idx);
+            let new_prompt = sceneref::replace(&current, &[], &|t| sceneref::is_action(t));
+            set_char_box(&ui, idx, &new_prompt);
+            match idx {
+                0 => ui.set_scene_override_c1("".into()),
+                1 => ui.set_scene_override_c2("".into()),
+                2 => ui.set_scene_override_c3("".into()),
+                _ => ui.set_scene_override_c4("".into()),
+            }
             let changed = {
                 let mut st = state.borrow_mut();
                 if let Some(r) = st.scene_ref.as_mut() {
@@ -2406,7 +2723,7 @@ fn main() -> Result<(), slint::PlatformError> {
             }
             sync_scene_panel(&ui, &state);
             analyze(&ui, &state);
-            ui.set_scene_ref_status(format!("Character {} cleared.", idx + 1).into());
+            ui.set_scene_ref_status(format!("Character {} actions cleared.", idx + 1).into());
         });
     }
     {
@@ -2415,7 +2732,27 @@ fn main() -> Result<(), slint::PlatformError> {
         ui.on_scene_char_text_edited(move |which, text| {
             let Some(ui) = weak.upgrade() else { return };
             let idx = which.max(0) as usize;
-            set_char_box(&ui, idx, &text);
+            let current = char_box(&ui, idx);
+            let action_tags: Vec<String> = parser::parse_prompt(&text)
+                .into_iter()
+                .map(|t| t.raw.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            // exactly the tags in the card: removing one removes it, emptying the card removes all
+            let new_prompt = sceneref::replace(&current, &action_tags, &sceneref::is_action);
+            set_char_box(&ui, idx, &new_prompt);
+            if action_tags.is_empty() {
+                // an empty card means "none", not "use the image's": drop them from the reading too
+                if let Some(r) = state.borrow_mut().scene_ref.as_mut() {
+                    sceneref::clear_char_actions(&mut r.actions, idx);
+                }
+            }
+            match idx {
+                0 => ui.set_scene_override_c1(text.clone()),
+                1 => ui.set_scene_override_c2(text.clone()),
+                2 => ui.set_scene_override_c3(text.clone()),
+                _ => ui.set_scene_override_c4(text.clone()),
+            }
             analyze(&ui, &state);
         });
     }
@@ -2492,6 +2829,25 @@ fn main() -> Result<(), slint::PlatformError> {
                     apply_char_image(&ui, &state, which);
                 }
             }
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let _state = state.clone();
+        ui.on_second_pass_changed(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            save_settings(&ui);
+            let on = ui.get_image_second_pass();
+            let msg = if on {
+                "2nd pass visual check enabled (vision models directly rescan image pixels)."
+            } else {
+                "2nd pass visual check disabled (pure text synthesis from pass 1 description)."
+            };
+            ui.set_image_status(msg.into());
+            with_state(|state| {
+                state.borrow_mut().image_ai = None;
+                state.borrow_mut().two_ai = None;
+            });
         });
     }
     {
@@ -2777,13 +3133,18 @@ fn main() -> Result<(), slint::PlatformError> {
                                 };
                                 let has_rewrite = state.borrow().ai_scene.as_ref().map(|s| !s.improved_prompt.is_empty()).unwrap_or(false);
                                 if has_rewrite {
-                                    ui.set_after_view(1);
+                                    if ui.get_after_view() == 3 || ui.get_after_view() == 4 {
+                                        ui.set_after_view(4);
+                                    } else {
+                                        ui.set_after_view(1);
+                                    }
                                 }
                                 render(&ui, state);
                                 let msg = match (has_rewrite, found) {
-                                    (true, _) => format!(
-                                        "AI scan done — showing the AI Improved prompt; {found} individual suggestion(s) in the cards • {where_ran}"
-                                    ),
+                                    (true, _) => {
+                                        let which = if ui.get_after_view() == 4 { "AI Section Blocks" } else { "AI Improved prompt" };
+                                        format!("AI scan done — showing the {which}; {found} individual suggestion(s) in the cards • {where_ran}")
+                                    }
                                     (false, 0) => format!("AI scan done — nothing beyond the rule cards • {where_ran}"),
                                     (false, n) => format!("AI scan done — {n} AI card(s) added; click to apply • {where_ran}"),
                                 };
@@ -2813,7 +3174,7 @@ fn main() -> Result<(), slint::PlatformError> {
     }
     analyze(&ui, &state);
     refresh_hardware_badge(&ui);
-    connect_ollama(&ui, false);
+    connect_ollama(&ui, false, false);
 
     // Keep retrying while disconnected, so starting Ollama after the app just works.
     let reconnect = slint::Timer::default();
@@ -2822,7 +3183,7 @@ fn main() -> Result<(), slint::PlatformError> {
         reconnect.start(slint::TimerMode::Repeated, std::time::Duration::from_secs(5), move || {
             if let Some(ui) = weak.upgrade() {
                 if !ui.get_ollama_connected() && !ui.get_ollama_busy() {
-                    connect_ollama(&ui, true);
+                    connect_ollama(&ui, true, false);
                 }
             }
         });
@@ -2905,5 +3266,16 @@ mod scene_panel_tests {
         assert!(new_p.contains("{red dress|blue dress}"), "Dynamic outfit was erased! {new_p}");
         assert!(new_p.contains("sitting"));
         assert!(!new_p.contains("standing"));
+    }
+
+    #[test]
+    fn extract_char_actions_only_returns_actions_and_poses() {
+        let p = "1girl, mature female, long black hair, grey eyes, thick lips, freckles, sunglasses on head, light blue bikini, sitting, leaning forward, holding garment, looking at viewer, on bed, full body, bedroom, bed, soft lighting, anime style";
+        let acts = extract_char_actions(p);
+        assert_eq!(acts, "sitting, leaning forward, holding garment, looking at viewer");
+        assert!(!acts.contains("black hair"));
+        assert!(!acts.contains("grey eyes"));
+        assert!(!acts.contains("bikini"));
+        assert!(!acts.contains("bedroom"));
     }
 }

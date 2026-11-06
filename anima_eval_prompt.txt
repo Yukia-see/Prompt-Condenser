@@ -1,0 +1,33 @@
+# Anima Checkpoint Evaluation Prompts (With Full Physical Proportions & Chest Sizing)
+Image Reference: /home/yukia/Pictures/HWL8f8wbYAAMJ-a.jpg (3 Characters)
+Target Checkpoint: Anima Pencil-XL / Anima
+
+================================================================================
+Option 1: Anima Single Prompt (Hybrid Tag + Positional Clause + Physical Proportions)
+================================================================================
+
+masterpiece, best quality, 3girls, school uniform, (large breasts:1.25), (curvy:1.2), (thick thighs:1.15), (from behind:1.2), (looking back:1.2), looking back over shoulder, dynamic pose, yellow and white striped background, (the girl on the left has black ponytail, large breasts, curvy figure, pale blue blouse, plaid skirt, holding wrench), (the girl in the center has teal hair, cowlicks, navy blazer, crossed arms, smirk), (the girl on the right has honey blonde hair, large breasts, sky blue skirt, navy vest, holding backpack), full body, bright lighting, anime style, vibrant colors
+
+
+================================================================================
+Option 2: Anima Explicit Weight Format (Pure Danbooru Tags with Body Scaling)
+================================================================================
+
+masterpiece, best quality, 3girls, school uniform, (gigantic breasts:1.2), (huge breasts:1.2), (large breasts:1.2), (thick thighs:1.15), (curvy:1.2), (from behind:1.2), (looking back:1.2), looking back over shoulder, (yellow and white striped background:1.15), (left: black hair, twin-tails, gigantic breasts, pale blue shirt, plaid skirt, holding wrench:1.2), (center: teal hair, ahoge, navy blazer, crossed arms, smirk:1.15), (right: blonde hair, huge breasts, sky blue skirt, navy vest, backpack:1.2), loose socks, loafers, bright lighting, full body
+
+
+================================================================================
+Option 3: ComfyUI / Regional Prompter Multi-Character Format
+================================================================================
+
+[Shared Header / Scene]:
+masterpiece, best quality, 3girls, school uniform, (curvy:1.2), (from behind:1.2), (looking back:1.2), looking back over shoulder, yellow and white striped background, bright lighting, anime style, full body
+
+[Character 1 - Left Box (x: 0.0 - 0.35)]:
+1girl, black hair, twin-tails, bangs, (gigantic breasts:1.25), (curvy:1.2), (thick thighs:1.15), pale blue blouse, navy plaid skirt, white loose socks, black loafers, holding wrench, looking back, smile
+
+[Character 2 - Center Box (x: 0.35 - 0.65)]:
+1girl, teal hair, cowlicks, ahoge, (medium breasts:1.1), navy blazer, white shirt, light plaid skirt, white socks, crossed arms, smirk, leaning forward
+
+[Character 3 - Right Box (x: 0.65 - 1.0)]:
+1girl, honey blonde hair, side bangs, (huge breasts:1.25), (curvy:1.2), (thick thighs:1.15), sky blue pleated skirt, navy vest, white knee-high socks, brown loafers, holding backpack, head tilt, cheerful smile

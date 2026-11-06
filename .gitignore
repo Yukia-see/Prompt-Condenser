@@ -6,3 +6,5 @@
 /packaging/arch/pkg/
 /packaging/arch/*.pkg.tar.zst
 /packaging/arch/*.tar.gz
+/packaging/arch/*.sha256
+/scratch/

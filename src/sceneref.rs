@@ -218,21 +218,86 @@ pub fn plan(actions: &[Action], ov: &Overrides, n: usize) -> Plan {
     Plan { chars, scene: keep(scene) }
 }
 
-/// Puts `refs` into a box: the box keeps its own tags except the ones `replaced`
-/// says the reference takes over (only when it brings any), then gets the refs.
-pub fn inject(original: &str, refs: &[String], replaced: &dyn Fn(&PromptToken) -> bool) -> String {
-    let mut kept: Vec<String> = parse_prompt(original)
+/// What a tag is called for duplicate checks: weights and brackets don't make it a
+/// different tag ("(beach:1.2)" is "beach").
+fn name_of(tag: &str) -> String {
+    parse_prompt(tag).first().map(|t| key(&t.normalized)).unwrap_or_else(|| key(tag))
+}
+
+/// Takes out every tag of `original` that `drop` matches and puts exactly `refs` in: with
+/// no refs the matching tags simply go (Clear, or emptying a character card). A tag
+/// already in the box stays where it is, whatever its weight.
+pub fn replace(original: &str, refs: &[String], drop: &dyn Fn(&PromptToken) -> bool) -> String {
+    let mut out: Vec<(String, String)> = parse_prompt(original)
         .into_iter()
-        .filter(|t| refs.is_empty() || !replaced(t))
-        .map(|t| t.raw.trim().to_string())
-        .filter(|t| !t.is_empty())
+        .filter(|t| !drop(t))
+        .map(|t| (key(&t.normalized), t.raw.trim().to_string()))
+        .filter(|(_, raw)| !raw.is_empty())
         .collect();
     for r in refs {
-        if !kept.iter().any(|k| key(k) == key(r)) {
-            kept.push(r.clone());
+        let name = name_of(r);
+        if !name.is_empty() && !out.iter().any(|(k, _)| *k == name) {
+            out.push((name, r.trim().to_string()));
         }
     }
-    kept.join(", ")
+    out.into_iter().map(|(_, raw)| raw).collect::<Vec<_>>().join(", ")
+}
+
+/// Puts `refs` into a box for a reference image: the box keeps its own tags except the
+/// ones `replaced` says the reference takes over, and only when the reference brings
+/// something (a reference with nothing for this box leaves it as it was).
+pub fn inject(original: &str, refs: &[String], replaced: &dyn Fn(&PromptToken) -> bool) -> String {
+    if refs.is_empty() {
+        return replace(original, &[], &|_| false);
+    }
+    replace(original, refs, replaced)
+}
+
+/// Pose, gaze, camera, setting, lighting and style: everything a Scene / Pose reference
+/// can replace in a box that holds both (the 1 Character tab's Before).
+pub fn is_pose_or_scene(t: &PromptToken) -> bool {
+    is_action(t) || crate::scene::is_scene_or_pose(t)
+}
+
+/// Combines existing scene text with new scene tags while ensuring:
+/// 1. The shared prompt is cleared of duplicate character tags (actions/looks already in the other character prompts).
+/// 2. If there is text already existing in the shared prompt that is DIFFERENT from all character prompts, it is preserved.
+/// 3. New scene tags from the reference or scene scan are added, as long as they are different from the character prompts.
+pub fn update_shared_scene_prompt(
+    existing_scene: &str,
+    new_scene_tags: &[String],
+    other_prompts: &[String],
+) -> String {
+    let other_tags: std::collections::HashSet<String> = other_prompts
+        .iter()
+        .flat_map(|p| parse_prompt(p))
+        .map(|t| t.normalized)
+        .collect();
+
+    let mut out_tags: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // 1. If text already exists in the shared prompt that is different from the other prompts, keep it:
+    for t in parse_prompt(existing_scene) {
+        let norm = t.normalized;
+        if !other_tags.contains(&norm) && !seen.contains(&norm) {
+            seen.insert(norm);
+            out_tags.push(t.raw.trim().to_string());
+        }
+    }
+
+    // 2. Add new scene reference tags that are different from the other prompts:
+    for tag_str in new_scene_tags {
+        for t in parse_prompt(tag_str) {
+            let norm = t.normalized;
+            if !other_tags.contains(&norm) && !seen.contains(&norm) {
+                seen.insert(norm);
+                out_tags.push(t.raw.trim().to_string());
+            }
+        }
+    }
+
+    out_tags.into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(", ")
 }
 
 #[cfg(test)]
@@ -280,8 +345,8 @@ mod tests {
         assert_eq!(owner_of(&a, "drinking tea"), vec![Owner::Char(0)]);
         assert_eq!(owner_of(&a, "sitting"), vec![Owner::Char(1)]);
         assert_eq!(owner_of(&a, "indoors"), vec![Owner::Scene]);
-        // identity never comes from the reference
-        assert!(a.iter().all(|x| !x.tag.contains("hair") && x.tag != "armor" && x.tag != "1girl"));
+        // identity never comes from the reference (hair traits, but not furniture like chair)
+        assert!(a.iter().all(|x| (!x.tag.contains("hair") || x.tag.contains("chair")) && x.tag != "armor" && x.tag != "1girl"));
     }
 
     #[test]
@@ -331,6 +396,23 @@ mod tests {
     }
 
     #[test]
+    fn replace_can_remove_and_inject_does_not_duplicate_weighted_tags() {
+        let acts = |t: &PromptToken| is_action(t);
+        // an explicit replace with nothing removes the actions (Clear, emptying a character card)
+        assert_eq!(replace("1girl, red hair, sitting, holding cup", &[], &acts), "1girl, red hair");
+        // inject leaves a box alone when the reference brings nothing
+        assert_eq!(inject("1girl, sitting", &[], &acts), "1girl, sitting");
+        // a weighted tag is the same tag
+        assert_eq!(inject("1girl, (beach:1.2), sitting", &["beach".into(), "standing".into()], &acts), "1girl, (beach:1.2), standing");
+        assert_eq!(inject("1girl", &["Sitting".into(), "sitting".into(), "(sitting:1.1)".into()], &acts), "1girl, Sitting");
+        // facial expressions are not poses, so a reference never overwrites them
+        for face in ["winking", "pouting", "smirking", "blushing", "smiling"] {
+            assert!(!is_action(&parse_prompt(face)[0]), "{face}");
+        }
+        assert!(is_action(&parse_prompt("sitting")[0]) && is_action(&parse_prompt("hands on hips")[0]));
+    }
+
+    #[test]
     fn inject_replaces_only_when_the_reference_brings_something() {
         let replaced = |t: &PromptToken| is_action(t);
         assert_eq!(inject("1girl, red hair, sitting", &["standing".into()], &replaced), "1girl, red hair, standing");
@@ -352,5 +434,29 @@ mod tests {
         assert_eq!(owner_of(&a, "sitting"), vec![Owner::Char(0)]);
         assert_eq!(owner_of(&a, "looking at viewer"), vec![Owner::Char(0)]);
         assert_eq!(owner_of(&a, "bedroom"), vec![Owner::Scene]);
+    }
+
+    #[test]
+    fn update_shared_scene_prompt_clears_duplicates_and_preserves_unique() {
+        let c1 = "1girl, brown hair, gym shirt, blue shorts, standing, looking at viewer";
+        let c2 = "1girl, green hair, dress, from behind, looking at viewer";
+        let existing = "school bag, from behind, striped background, full body, gym, standing";
+        let new_tags = vec!["gymnasium".to_string(), "polished floor".to_string(), "looking at viewer".to_string()];
+
+        let updated = update_shared_scene_prompt(existing, &new_tags, &[c1.to_string(), c2.to_string()]);
+        // "from behind", "standing", "looking at viewer" must be cleared because they exist in character prompts:
+        assert!(!updated.contains("from behind"), "{updated}");
+        assert!(!updated.contains("standing"), "{updated}");
+        assert!(!updated.contains("looking at viewer"), "{updated}");
+
+        // Unique existing tags must be preserved:
+        assert!(updated.contains("school bag"), "{updated}");
+        assert!(updated.contains("striped background"), "{updated}");
+        assert!(updated.contains("full body"), "{updated}");
+        assert!(updated.contains("gym"), "{updated}");
+
+        // New unique tags must be added:
+        assert!(updated.contains("gymnasium"), "{updated}");
+        assert!(updated.contains("polished floor"), "{updated}");
     }
 }

@@ -89,7 +89,7 @@ pub fn tag_one(path: &Path, progress: &(dyn Fn(String) + Sync)) -> Result<Vec<Sc
     if !detector::is_installed() {
         let (tx, rx) = std::sync::mpsc::channel::<String>();
         let downloaded = std::thread::scope(|s| {
-            s.spawn(|| rx.into_iter().for_each(|m| progress(m)));
+            s.spawn(|| rx.into_iter().for_each(progress));
             let r = detector::download(&tx);
             drop(tx);
             r
@@ -110,12 +110,36 @@ pub fn tag_one_fast(path: &Path, progress: &(dyn Fn(String) + Sync)) -> Result<V
         return tag_one(path, progress);
     }
     let image = image::open(path).with_context(|| format!("Couldn't open {}", path.display()))?;
-    let main = detector::detect(&image).ok().and_then(|b| b.into_iter().max_by(|a, b| a.area().total_cmp(&b.area())));
-    let Some(main) = main else { return tagger::tag_dynamic(&image) };
-    let up = detector::upper_crop(&image, &main);
-    let mut tags = [&image, &up].iter().map(|v| tagger::tag_dynamic(v)).collect::<Result<Vec<_>>>()?.into_iter();
-    let (full, detail) = (tags.next().unwrap_or_default(), tags.next().unwrap_or_default());
-    Ok(tagger::merge_detail_crop(&full, &detail))
+    let boxes = detector::detect(&image).unwrap_or_default();
+    if boxes.is_empty() {
+        return tagger::tag_dynamic(&image);
+    }
+    let full = tagger::tag_dynamic(&image)?;
+    if boxes.len() == 1 {
+        let main = &boxes[0];
+        let up = detector::upper_crop(&image, main);
+        let is_tall = (main.y1 - main.y0) / (image.height() as f32).max(1.0) >= 0.35;
+        if is_tall {
+            let low = detector::lower_crop(&image, main);
+            let mut tags = [&up, &low].iter().map(|v| tagger::tag_dynamic(v)).collect::<Result<Vec<_>>>()?.into_iter();
+            let (up_detail, low_detail) = (tags.next().unwrap_or_default(), tags.next().unwrap_or_default());
+            let merged = tagger::merge_detail_crop(&full, &up_detail);
+            return Ok(tagger::merge_detail_crop(&merged, &low_detail));
+        } else {
+            let detail = tagger::tag_dynamic(&up)?;
+            return Ok(tagger::merge_detail_crop(&full, &detail));
+        }
+    }
+    // Multiple characters: zoom in on each main character so individual clothing/hair/breast tags are detected
+    let count = boxes.len().min(4);
+    let chars = detector::main_n(&boxes, count).unwrap_or_else(|| boxes.clone());
+    let mut merged = full;
+    for b in &chars {
+        let crop = detector::crop(&image, b);
+        let tags = tagger::tag_dynamic(&crop)?;
+        merged = tagger::merge_detail_crop(&merged, &tags);
+    }
+    Ok(merged)
 }
 
 fn tokens(scores: &[ScoredTag], threshold: f32) -> Vec<PromptToken> {
@@ -492,9 +516,12 @@ mod tests {
             for (i, c) in rules.chars.iter().enumerate() { println!("TAGGER c{}   : {c}", i + 1); }
             println!("TAGGER scene: {}", rules.scene);
             let t = std::time::Instant::now();
+            let model = std::env::var("IMAGE_MODEL").unwrap_or_else(|_| "prompt-condenser-gemma4-e4b:latest".into());
             let (ai, who) = crate::ai_engine::split_image(&crate::ai_engine::TwoImageRequest {
-                host: "localhost:11434".into(), model: "prompt-condenser-gemma4-12b".into(),
+                host: "localhost:11434".into(), model,
+                vision_encoder: Some("moondream:1.8b".into()),
                 mode: crate::profiles::AiMode::Gpu, split: ts.clone(), hints: rules,
+                second_pass_vision: false,
             }).unwrap();
             let ai = settle(ai, &ts2, 0.35);
             println!("AI ({:.0}s) who: {who}", t.elapsed().as_secs_f32());

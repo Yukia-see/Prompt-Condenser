@@ -31,8 +31,11 @@ pub fn build_condensed_output(
 
     let mut result_tokens: Vec<PromptToken> = base_tokens.to_vec();
 
-    // Apply any user overrides where `mode != 0` (AI cards are handled below)
-    for ch in changes.iter().filter(|c| c.action != ChangeAction::AiRewrite) {
+    // Apply any user overrides where `mode != 0` (AI and Recommendation cards are handled below)
+    for ch in changes
+        .iter()
+        .filter(|c| c.action != ChangeAction::AiRewrite && c.action != ChangeAction::Recommendation)
+    {
         match ch.mode {
             1 => {
                 // Mode 1: User chose "Adjust Camera Framing Instead" on a FramingSafeSwap
@@ -50,6 +53,7 @@ pub fn build_condensed_output(
                             && t.normalized != "close-up"
                             && t.normalized != "close up"
                             && t.normalized != "front view"
+                            && t.normalized != "straight-on"
                             && t.normalized != "from behind"
                             && t.normalized != "back view"
                     });
@@ -123,7 +127,10 @@ pub fn build_condensed_output(
         }
     }
 
-    for ch in changes.iter().filter(|c| c.action == ChangeAction::AiRewrite) {
+    for ch in changes
+        .iter()
+        .filter(|c| c.action == ChangeAction::AiRewrite || c.action == ChangeAction::Recommendation)
+    {
         apply_ai_card(&mut result_tokens, ch);
     }
 
@@ -384,7 +391,20 @@ pub fn tidy_ai_prompt(text: &str, checkpoint: CheckpointProfile) -> String {
     while let Some(t) = queue.pop() {
         // never split {a, b|c} variation groups
         if t.text.contains(',') && t.category != TokenCategory::LoraOrSpecial && !t.text.starts_with('{') {
-            let mut inner = parse_prompt(&balance_brackets(&t.text));
+            let trimmed = t.text.trim();
+            // If wrapped in brackets, unwrap outer layer to split inner comma items
+            let candidate = if (trimmed.starts_with('(') && trimmed.ends_with(')'))
+                || (trimmed.starts_with('[') && trimmed.ends_with(']'))
+            {
+                &trimmed[1..trimmed.len() - 1]
+            } else {
+                trimmed
+            };
+            let mut inner = parse_prompt(&balance_brackets(candidate));
+            if inner.len() == 1 && inner[0].text == t.text {
+                tokens.push(t);
+                continue;
+            }
             inner.reverse();
             queue.extend(inner);
             continue;
@@ -467,17 +487,61 @@ pub fn dropped_tags(raw_prompt: &str, ai_text: &str, checkpoint: CheckpointProfi
 }
 
 /// Recommended negative prompt: the checkpoint's standard negatives plus tags that
-/// keep the camera on the target view, minus anything the positive prompt asks for.
+/// keep the camera on the target view and lock out conflicting body proportions,
+/// minus anything the positive prompt asks for.
 pub fn recommended_negative(config: &ScanConfig, positive: &str) -> String {
     if config.checkpoint.default_negative().is_empty() {
         return String::new();
     }
     let view_negs = config.target_view.negative_tags();
-    let base = if view_negs.is_empty() {
-        config.checkpoint.default_negative().to_string()
-    } else {
-        format!("{}, {}", config.checkpoint.default_negative(), view_negs)
-    };
+    let pos_tokens = parse_prompt(positive);
+    let prop_tiers = crate::analyzer::detect_all_proportion_tiers(&pos_tokens);
+    let mut auto_negs: Vec<String> = Vec::new();
+
+    // Multi-character isolation: gather tags from all other active character and scene prompts
+    // so we never put something into the negative prompt that another character in the scene asks for!
+    let mut other_char_tags: HashSet<String> = HashSet::new();
+    if config.two_char {
+        let other_prompts = [&config.char2_prompt_raw, &config.scene_prompt_raw];
+        for p in other_prompts {
+            for t in parse_prompt(p) {
+                other_char_tags.insert(t.normalized);
+            }
+        }
+        for (extra_prompt, extra_lora) in &config.more_chars {
+            for t in parse_prompt(extra_prompt) {
+                other_char_tags.insert(t.normalized);
+            }
+            for t in parse_prompt(extra_lora) {
+                other_char_tags.insert(t.normalized);
+            }
+        }
+    }
+
+    for (tier, _) in prop_tiers {
+        let rec = crate::analyzer::get_proportion_recommendations(tier);
+        for tag in rec.auto_negative_lock {
+            let clean = tag.replace('_', " ");
+            // Multi-character isolation check
+            if other_char_tags.contains(&clean)
+                || other_char_tags.iter().any(|t| t == &clean || t.contains(&clean) || clean.contains(t.as_str()))
+            {
+                continue;
+            }
+            if !auto_negs.contains(&clean) {
+                auto_negs.push(clean);
+            }
+        }
+    }
+
+    let mut parts = vec![config.checkpoint.default_negative().to_string()];
+    if !view_negs.is_empty() {
+        parts.push(view_negs.to_string());
+    }
+    if !auto_negs.is_empty() {
+        parts.push(auto_negs.join(", "));
+    }
+    let base = parts.join(", ");
     merge_negative(&base, positive)
 }
 

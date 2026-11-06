@@ -2,7 +2,7 @@
 //! another PC), which handles GPU offload itself (Vulkan via `ollama-vulkan`).
 
 use crate::analyzer::{ChangeAction, PromptChange, ScanConfig};
-use crate::profiles::{AiMode, AiModelTier};
+use crate::profiles::{AiMode, AiModelTier, CheckpointProfile};
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -146,7 +146,7 @@ pub fn prompt_guidance(raw_prompt: &str, config: &ScanConfig) -> Vec<String> {
         return Vec::new();
     }
     let norms: Vec<&str> = tokens.iter().map(|t| t.normalized.as_str()).collect();
-    let has = |w: &str| norms.iter().any(|n| *n == w);
+    let has = |w: &str| norms.contains(&w);
     let mut g = Vec::new();
     if config.two_char {
         let n = config.char_count();
@@ -167,7 +167,8 @@ pub fn prompt_guidance(raw_prompt: &str, config: &ScanConfig) -> Vec<String> {
         .copied()
         .filter(|n| {
             n.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false)
-                && (n.ends_with("girl") || n.ends_with("girls") || n.ends_with("boy") || n.ends_with("boys") || n.ends_with("other"))
+                && (n.ends_with("girl") || n.ends_with("girls") || n.ends_with("boy") || n.ends_with("boys") || n.ends_with("other") || n.ends_with("others"))
+                && !n.contains(' ')
         })
         .collect();
     let scenery = has("no humans") || (has("scenery") && person_counts.is_empty());
@@ -220,7 +221,8 @@ pub fn prompt_guidance(raw_prompt: &str, config: &ScanConfig) -> Vec<String> {
     }
 
     // Explicit content
-    if norms.iter().any(|n| EXPLICIT_WORDS.iter().any(|w| n.contains(w))) {
+    // whole words: "oral" isn't in "floral", "cum" isn't in "cumulus", "anal" isn't in "canal"
+    if norms.iter().any(|n| EXPLICIT_WORDS.iter().any(|w| crate::parser::has_phrase(n, w))) {
         g.push("The scene is explicit. Keep the explicit tags precise and anatomically consistent with the pose and \
                 camera angle; don't soften, censor or drop them.".into());
     }
@@ -254,8 +256,15 @@ pub fn prompt_guidance(raw_prompt: &str, config: &ScanConfig) -> Vec<String> {
         });
     }
 
-    // What the scene already has vs what's missing
-    let scene = crate::scene::describe(&tokens);
+    // What the scene already has vs what's missing (strip prompt tags that contradict LoRA first)
+    // (only on the 1 Character tab: with several characters the text holds all of them, and
+    // the first LoRA box says nothing about the others)
+    let clean_tokens = if config.lora_tags_raw.trim().is_empty() || config.two_char {
+        tokens.clone()
+    } else {
+        crate::analyzer::strip_lora_tokens(tokens.clone(), &config.lora_tags_raw, true)
+    };
+    let scene = crate::scene::describe(&clean_tokens);
     let present: Vec<&str> = scene
         .details
         .iter()
@@ -296,7 +305,12 @@ pub fn prompt_guidance(raw_prompt: &str, config: &ScanConfig) -> Vec<String> {
         for c in rules.changes {
             if matches!(
                 c.action,
-                crate::analyzer::ChangeAction::FramingSafeSwap | crate::analyzer::ChangeAction::PositioningConflict
+                crate::analyzer::ChangeAction::FramingSafeSwap
+                    | crate::analyzer::ChangeAction::PositioningConflict
+                    | crate::analyzer::ChangeAction::PoseConflict
+                    | crate::analyzer::ChangeAction::AnatomyConflict
+                    | crate::analyzer::ChangeAction::SizeConflict
+                    | crate::analyzer::ChangeAction::StyleConflict
             ) && !conflicts.contains(&c.original)
             {
                 conflicts.push(c.original);
@@ -306,6 +320,18 @@ pub fn prompt_guidance(raw_prompt: &str, config: &ScanConfig) -> Vec<String> {
             g.push(format!(
                 "The rule checker already found framing conflicts with: {}. improved_prompt must resolve these too.",
                 conflicts.join(", ")
+            ));
+        }
+
+        let prop_tiers = crate::analyzer::detect_all_proportion_tiers(&tokens);
+        for (tier, tier_tok) in prop_tiers {
+            let rec = crate::analyzer::get_proportion_recommendations(tier);
+            g.push(format!(
+                "Detected proportion tier '{}'. Reinforce it using compatible clothing ({}) and pose/physics ({}); strictly avoid conflicting volume tags ({}).",
+                tier_tok.text,
+                rec.clothing_interaction.join(", "),
+                rec.pose_and_physics.join(", "),
+                rec.auto_negative_lock.join(", ")
             ));
         }
     }
@@ -447,16 +473,32 @@ pub fn build_ai_system_and_user_prompt_for(raw_prompt: &str, config: &ScanConfig
         format!("Checkpoint: {}. {}", config.checkpoint.display_name(), config.checkpoint.system_prompt_rules()),
         if config.two_char {
             let n = config.char_count();
-            format!(
-                "This prompt has {} characters. Write improved_prompt (and dynamic_prompt) in this order: quality tags, \
-                 the character count (e.g. {}) and tags about them together (holding hands, facing each other...); then \
-                 the single word BREAK; then ALL of character 1's own tags; then BREAK; then ALL of character 2's own \
-                 tags{}; then BREAK; then the shared camera, setting, lighting and style. Never use 'solo'. Never give \
-                 one character another one's feature.",
-                ["", "", "TWO", "THREE", "FOUR"][n.min(4)],
-                ["", "", "2girls / 1girl, 1boy", "3girls / 2girls, 1boy", "4girls / 2girls, 2boys"][n.min(4)],
-                (3..=n).map(|k| format!("; then BREAK; then ALL of character {k}'s own tags")).collect::<String>(),
-            )
+            if config.checkpoint == CheckpointProfile::Anima {
+                format!(
+                    "This prompt has {} characters for Anima (SDXL). Use BREAK chunk fencing for maximum character separation. \
+                     Write improved_prompt (and dynamic_prompt) in this order: \
+                     1. Global scene header: quality tags (masterpiece, best quality), character count ({}), symmetry-breaking meta-tags \
+                     ('same height, equal height', 'alternate breast size', 'different hair colors', 'contrasting poses'), and shared background, setting, lighting, followed by the single word BREAK. \
+                     2. Character 1: 1girl, on the left, hair, eyes, body build, clothing, accessories, pose, followed by BREAK. \
+                     3. Character 2: 1girl, in the middle, hair, eyes, body build, clothing, accessories, pose{}. \
+                     4. Modifier isolation: never use leaky modifiers like 'giant'; use 'flat chest' or 'petite bust' to strictly enforce small upper profiles and prevent attribute bleed, and use 'large ass, wide hips' for lower curves. \
+                     Never use 'solo'. Never give one character another one's feature.",
+                    ["", "", "TWO", "THREE", "FOUR"][n.min(4)],
+                    ["", "", "2girls / 1girl, 1boy", "3girls / 2girls, 1boy", "4girls / 2girls, 2boys"][n.min(4)],
+                    (3..=n).map(|k| format!("; then BREAK; then Character {k}: 1girl, on the right, hair, body, clothing, pose")).collect::<String>()
+                )
+            } else {
+                format!(
+                    "This prompt has {} characters. Write improved_prompt (and dynamic_prompt) in this order: quality tags, \
+                     the character count (e.g. {}) and tags about them together (holding hands, facing each other...); then \
+                     the single word BREAK; then ALL of character 1's own tags; then BREAK; then ALL of character 2's own \
+                     tags{}; then BREAK; then the shared camera, setting, lighting and style. Never use 'solo'. Never give \
+                     one character another one's feature.",
+                    ["", "", "TWO", "THREE", "FOUR"][n.min(4)],
+                    ["", "", "2girls / 1girl, 1boy", "3girls / 2girls, 1boy", "4girls / 2girls, 2boys"][n.min(4)],
+                    (3..=n).map(|k| format!("; then BREAK; then ALL of character {k}'s own tags")).collect::<String>(),
+                )
+            }
         } else {
             String::new()
         },
@@ -485,9 +527,10 @@ pub fn build_ai_system_and_user_prompt_for(raw_prompt: &str, config: &ScanConfig
             } else {
                 format!(
                     "LoRA tags (HIGHEST PRIORITY — {}): the app puts each character's LoRA into the final prompt \
-                     automatically, so don't repeat them in improved_prompt, and make sure that character's tags never \
-                     contradict their LoRA (e.g. LoRA tag 'large breasts' with 'gigantic breasts' on that character \
-                     means drop 'gigantic breasts').",
+                     automatically. They define the character's fixed appearance (hair, eyes, skin, body type, features). \
+                     Do not repeat them in improved_prompt, and NEVER contradict them: drop any conflicting hair, eye, skin, \
+                     or body tags from improved_prompt. In scene_summary and scene_breakdown, ALWAYS describe each character \
+                     matching their LoRA.",
                     loras.join("; ")
                 )
             }
@@ -495,10 +538,12 @@ pub fn build_ai_system_and_user_prompt_for(raw_prompt: &str, config: &ScanConfig
             "LoRA tags: none".to_string()
         } else {
             format!(
-                "LoRA tags (HIGHEST PRIORITY): {}. The app puts these into the final prompt exactly as written, so \
-                 don't repeat them in improved_prompt, but treat them as part of the scene and make sure nothing in \
-                 improved_prompt contradicts them (e.g. LoRA tag 'large breasts' with 'gigantic breasts' in the prompt \
-                 means drop 'gigantic breasts').",
+                "LoRA tags (HIGHEST PRIORITY): {}. The app puts these into the final prompt exactly as written. \
+                 They define the character's fixed appearance (hair, eyes, skin, body type, features). Do not \
+                 repeat them in improved_prompt, and NEVER contradict them: drop any conflicting hair, eye, skin, \
+                 or body tags from improved_prompt (e.g. if LoRA has 'white hair', drop 'black hair'; if LoRA has \
+                 'amber eyes', drop 'grey eyes'; if LoRA has 'short hair', drop 'long hair'). In scene_summary and \
+                 scene_breakdown, ALWAYS describe the character matching their LoRA.",
                 config.lora_tags_raw.trim().trim_matches(',')
             )
         },
@@ -628,16 +673,28 @@ pub fn build_ai_system_and_user_prompt_for(raw_prompt: &str, config: &ScanConfig
                 let n = config.char_count();
                 let count = ["", "", "1boy, 1girl", "2boys, 1girl", "2boys, 2girls"][n.min(4)];
                 let who = ex_chars[..n].iter().map(|c| c.1).collect::<Vec<_>>();
-                (
-                    format!("{} stand side by side on a red desert dune at dusk.", who.join(" and ")),
-                    ex_chars[..n].iter().map(|c| c.0).collect::<Vec<_>>().join("; "),
-                    format!(
-                        "{q_prefix}{count}, side by side, BREAK, {}, BREAK, full body, from below, red desert, \
-                         sand dunes, dusk, rim lighting",
-                        ex_chars[..n].iter().map(|c| c.0).collect::<Vec<_>>().join(", BREAK, ")
-                    ),
-                    format!("On the left {} waves at the others while the last one looks away, all lit by the dying sun.", who[0]),
-                )
+                if config.checkpoint == CheckpointProfile::Anima {
+                    (
+                        format!("{} stand side by side on a red desert dune at dusk.", who.join(" and ")),
+                        ex_chars[..n].iter().map(|c| c.0).collect::<Vec<_>>().join("; "),
+                        format!(
+                            "{q_prefix}{count}, side by side, same height, contrasting poses, red desert, sand dunes, dusk, rim lighting, BREAK, \
+                             1boy, on the left, spacesuit, standing, BREAK, 1girl, on the right, silver armor, waving"
+                        ),
+                        format!("On the left {} stands while the robot girl on the right waves, all lit by the dying sun.", who[0]),
+                    )
+                } else {
+                    (
+                        format!("{} stand side by side on a red desert dune at dusk.", who.join(" and ")),
+                        ex_chars[..n].iter().map(|c| c.0).collect::<Vec<_>>().join("; "),
+                        format!(
+                            "{q_prefix}{count}, side by side, BREAK, {}, BREAK, full body, from below, red desert, \
+                             sand dunes, dusk, rim lighting",
+                            ex_chars[..n].iter().map(|c| c.0).collect::<Vec<_>>().join(", BREAK, ")
+                        ),
+                        format!("On the left {} waves at the others while the last one looks away, all lit by the dying sun.", who[0]),
+                    )
+                }
             } else {
                 (
                     "A lone astronaut stands on a red desert dune at dusk.".to_string(),
@@ -1022,11 +1079,16 @@ pub fn convert_ai_changes(
 pub struct ImageAiRequest {
     pub host: String,
     pub model: String,
+    /// Vision encoder (e.g. `moondream:1.8b`). If set and different from `model`, it reads the
+    /// image pixels first, and its visual description is piped to `model` for checkpoint formatting.
+    pub vision_encoder: Option<String>,
     pub mode: AiMode,
     pub image_path: std::path::PathBuf,
     pub config: ScanConfig,
     /// Tags the Danbooru tagger read from the image (may be empty).
     pub tag_hints: String,
+    /// If true and the target text model has vision capability, directly attach image pixels for a 2nd pass visual check.
+    pub second_pass_vision: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1052,12 +1114,16 @@ fn shrink_for_vision(path: &std::path::Path) -> Result<Vec<u8>> {
     let Ok(img) = image::load_from_memory(&original) else {
         return Ok(original);
     };
-    if img.width().max(img.height()) <= 1024 {
+    if img.width().max(img.height()) <= 1024 && original.starts_with(&[0xFF, 0xD8, 0xFF]) {
         return Ok(original);
     }
-    let small = img.resize(1024, 1024, image::imageops::FilterType::Triangle).to_rgb8();
+    let small = if img.width().max(img.height()) > 1024 {
+        img.resize(1024, 1024, image::imageops::FilterType::Triangle).to_rgb8()
+    } else {
+        img.to_rgb8()
+    };
     let mut out = Vec::new();
-    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 90).encode_image(&small)?;
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 85).encode_image(&small)?;
     Ok(out)
 }
 
@@ -1087,9 +1153,12 @@ fn image_system_prompt(config: &ScanConfig, tag_hints: &str) -> String {
         String::new()
     } else {
         format!(
-            "## Tagger hints\nA Danbooru tagger read these tags from the image: {tag_hints}\nMost are right. Keep the \
-             correct ones (they're the most reliable names for what's visible), drop any that are clearly wrong, and add \
-             what a tagger can't judge: lighting, mood, composition, background details, art style.\n\n"
+            "## Tagger Detections (from Danbooru tagger)\n{tag_hints}\n\n\
+             ## Combination & Synthesis Instructions\n\
+             Combine the visual description from the vision encoder with the Danbooru tagger detections:\n\
+             1. PRESERVE specific micro-features detected by the tagger that match what is visible: mouth shapes and expressions (e.g. ':3', 'smile', 'blush'), face decals and ornaments (e.g. 'blush stickers', 'hair ornament'), animal ears and tails (e.g. 'rabbit ears', 'rabbit tail'), and specific accessories.\n\
+             2. USE the visual description to correct garment and clothing misidentifications: unify single-piece dresses (e.g. 'pink china dress', 'cheongsam') instead of fragmented underwear/skirt tags, correctly identify sleeves (e.g. 'detached sleeves' instead of gloves), resolve color conflicts (e.g. choose between red eyes vs pink eyes), and add archetype tags ('kemonomimi', 'rabbit girl') and scene framing/lighting.\n\
+             3. DEDUPLICATE and clean up: keep the most descriptive tag (e.g. 'very long hair' over 'long hair'), and do not add body-fur tags to smooth human skin.\n\n"
         )
     };
     format!(
@@ -1099,6 +1168,12 @@ fn image_system_prompt(config: &ScanConfig, tag_hints: &str) -> String {
          - Only describe what is actually visible; don't invent characters or details.\n\
          - Count people carefully; the tagger's count (1girl, 2girls, multiple girls...) is usually right. 'solo' only \
          when exactly one person is in the image.\n\
+         - When multiple characters are present (e.g. 2girls, 3girls):\n\
+           * NEVER assign them all the same generic pose or shared body size in the main tag list.\n\
+           * Include contrast meta-tags in the scene header when they differ: 'alternate breast size', 'different hair colors', 'contrasting poses', 'same height, equal height'.\n\
+           * Lock vertical stature: include 'same height, equal height' and 'standing upright' on upright figures to prevent leaning or proportion distortion from squishing characters vertically.\n\
+           * Isolate characters using BREAK chunk fencing by default: [quality, count, scene header, contrast tags], BREAK, 1girl, on the left, [traits, outfit, pose], BREAK, 1girl, in the middle, [traits, outfit, pose], BREAK, 1girl, on the right, [traits, outfit, pose].\n\
+           * Modifier isolation: never use leaky adjectives like 'giant' near chest areas; use 'flat chest' or 'petite bust' to strictly enforce small upper profiles and prevent attribute bleed, and use 'large ass, wide hips' for lower curves.\n\
          - Never write the checkpoint's name in the prompt.\n\
          - 'description' is 1-2 plain sentences about the image; 'prompt' is the prompt itself.\n\
          - Reply with JSON only.",
@@ -1134,7 +1209,21 @@ fn scene_pose_system_prompt(tag_hints: &str) -> String {
 
 /// Reads a Scene / Pose reference image: only pose, camera, setting and lighting.
 pub fn describe_scene_pose(req: &ImageAiRequest) -> Result<ImageAiResult> {
-    let mut out = describe_image_with(req, &scene_pose_system_prompt(&req.tag_hints), "Describe only the pose and the scene.")?;
+    let mut out = if let Some(ref encoder) = req.vision_encoder {
+        if !same_model(encoder, &req.model) {
+            let ask = "Describe ONLY the poses, actions, physical positions, camera angle, framing, setting, background, and lighting in this image. Do not describe character identity, clothing, or hair.";
+            let vision_desc = extract_visual_description(req, encoder, ask)?;
+            let system = scene_pose_system_prompt(&req.tag_hints);
+            let user_prompt = format!(
+                "## Visual description of the pose and scene from vision encoder ({encoder}):\n{vision_desc}\n\nDescribe only the pose and the scene."
+            );
+            describe_with_text_model(req, &system, &user_prompt)?
+        } else {
+            describe_image_with(req, &scene_pose_system_prompt(&req.tag_hints), "Describe only the pose and the scene.")?
+        }
+    } else {
+        describe_image_with(req, &scene_pose_system_prompt(&req.tag_hints), "Describe only the pose and the scene.")?
+    };
     // whatever slipped through about the characters themselves goes, and so do words the
     // keyword lists don't know: they could be a name, species or clothing
     out.prompt = crate::scene::filter_scene_and_pose_only(&out.prompt, false);
@@ -1144,9 +1233,279 @@ pub fn describe_scene_pose(req: &ImageAiRequest) -> Result<ImageAiResult> {
     Ok(out)
 }
 
-/// Asks a vision model to write a prompt for the image.
+/// Asks a vision model to write a prompt for the image. If a separate vision encoder is set
+/// (such as moondream), it reads the image pixels first and pipes the description into `model`.
 pub fn describe_image(req: &ImageAiRequest) -> Result<ImageAiResult> {
+    if let Some(ref encoder) = req.vision_encoder {
+        if !same_model(encoder, &req.model) {
+            let vision_desc = extract_visual_description_from_path(&req.image_path, &req.host, req.mode, encoder)?;
+            return describe_image_with_desc(req, &vision_desc, encoder);
+        }
+    }
     describe_image_with(req, &image_system_prompt(&req.config, &req.tag_hints), "Write the prompt for this image.")
+}
+
+/// Synthesizes a visual description and tagger hints into a Danbooru prompt using the text model.
+pub fn describe_image_with_desc(
+    req: &ImageAiRequest,
+    vision_desc: &str,
+    encoder_name: &str,
+) -> Result<ImageAiResult> {
+    let system = image_system_prompt(&req.config, &req.tag_hints);
+    let second_pass_note = if req.second_pass_vision {
+        "\n\n## 2nd Pass Visual Verification\nAn image is attached for direct visual verification. Cross-examine the visual description and tagger detections against the actual image to ensure exact hair, eyes, body build, bust size, clothing, and details are 100% accurate."
+    } else {
+        ""
+    };
+    let user_prompt = if req.tag_hints.trim().is_empty() {
+        format!(
+            "## Visual description from vision encoder ({encoder_name}):\n{vision_desc}{second_pass_note}\n\nWrite the prompt for this image."
+        )
+    } else {
+        format!(
+            "## Visual description from vision encoder ({encoder_name}):\n{vision_desc}{second_pass_note}\n\n\
+             ## Task\n\
+             Synthesize the visual description and tagger detections into a complete, accurate, conflict-free Danbooru prompt according to the combination instructions."
+        )
+    };
+    describe_with_text_model(req, &system, &user_prompt)
+}
+
+/// Encodes an in-memory DynamicImage to JPEG base64 string, scaling down if over 1024px.
+fn encode_dynamic_image_b64(img: &image::DynamicImage) -> Result<String> {
+    use base64::Engine as _;
+    let small = if img.width().max(img.height()) > 1024 {
+        img.resize(1024, 1024, image::imageops::FilterType::Triangle).to_rgb8()
+    } else {
+        img.to_rgb8()
+    };
+    let mut out = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 85).encode_image(&small)?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(&out))
+}
+
+/// Extracts a visual description from an image file path using a vision encoder.
+/// For single characters, performs an anatomical multi-zone scan (Scene + Upper + Middle + Lower zones)
+/// so fine physical traits (ears, horns, expressions, belts, claws, paws, tails, footwear, chest/bust size) are enlarged and detected.
+/// For multiple characters, performs a left-to-right positional scan so each character's position, features,
+/// chest size, outfit, and pose are clearly delineated.
+pub fn extract_visual_description_from_path(
+    path: &std::path::Path,
+    host: &str,
+    mode: AiMode,
+    encoder: &str,
+) -> Result<String> {
+    let base = base_url(host)?;
+    let img = image::open(path).with_context(|| format!("Couldn't open {}", path.display()))?;
+
+    let boxes = crate::detector::detect(&img).unwrap_or_default();
+
+    if boxes.len() > 1 {
+        // Multi-character spatial pass
+        let scene_b64 = encode_dynamic_image_b64(&img)?;
+        let scene_ask = "Describe the overall scene, background, lighting, and the exact spatial arrangement of characters from left to right (who is on the left, center, right, and their relative positions and poses).";
+        let scene_desc = ask_vision_encoder(&base, mode, encoder, scene_b64, scene_ask)?;
+
+        let count = boxes.len().min(4);
+        let chars = crate::detector::main_n(&boxes, count).unwrap_or_else(|| boxes.clone());
+        let pos_labels: &[&str] = match count {
+            2 => &["Left Character", "Right Character"],
+            3 => &["Left Character", "Center Character", "Right Character"],
+            _ => &["Far-Left Character", "Center-Left Character", "Center-Right Character", "Far-Right Character"],
+        };
+
+        let mut char_descs = Vec::new();
+        for (i, b) in chars.iter().enumerate() {
+            let label = pos_labels.get(i).copied().unwrap_or("Character");
+            let crop = crate::detector::crop(&img, b);
+            let b64 = encode_dynamic_image_b64(&crop)?;
+            let ask = format!(
+                "Describe the {} in detail: hair color and hairstyle, eyes, facial expression, body build, chest/breast size (e.g. flat chest, small, medium, large, or huge breasts), clothing (upper and lower), accessories, items held, pose, and footwear.",
+                label
+            );
+            let desc = ask_vision_encoder(&base, mode, encoder, b64, &ask).unwrap_or_default();
+            char_descs.push(format!("- **{}**: {}", label, desc));
+        }
+
+        return Ok(format!(
+            "### Scene & Environment (Spatial Overview):\n{scene_desc}\n\n\
+             ### Characters (Left-to-Right Positional Breakdown):\n{}",
+            char_descs.join("\n")
+        ));
+    }
+
+    // Pass 1: Global scene & environment pass
+    let scene_b64 = encode_dynamic_image_b64(&img)?;
+    let scene_ask = "Describe the overall scene: setting, background, atmosphere, lighting, camera framing, and character placement.";
+    let scene_desc = ask_vision_encoder(&base, mode, encoder, scene_b64, scene_ask)?;
+
+    // Check for detected single character to run multi-zone anatomical inspection
+    let main_char = boxes.into_iter().max_by(|a, b| a.area().total_cmp(&b.area()));
+
+    if let Some(main) = main_char {
+        let h = (main.y1 - main.y0).max(1.0);
+        let ih = (img.height() as f32).max(1.0);
+
+        // If the character is reasonably sized (> 30% of height), inspect upper, middle, and lower zones
+        if h / ih >= 0.30 {
+            let up_img = crate::detector::upper_crop(&img, &main);
+            let mid_img = crate::detector::middle_crop(&img, &main);
+            let low_img = crate::detector::lower_crop(&img, &main);
+
+            let up_b64 = encode_dynamic_image_b64(&up_img)?;
+            let mid_b64 = encode_dynamic_image_b64(&mid_img)?;
+            let low_b64 = encode_dynamic_image_b64(&low_img)?;
+
+            let up_ask = "Describe in detail the head, face, eyes, hair color and style, animal ears or horns, expressions, and collar accessories.";
+            let mid_ask = "Describe in detail the upper clothing, chest/breast size (e.g. flat chest, small, medium, large, or huge breasts), torso build, waist, sleeves, gloves, hands, holding items, belts, and any tail origin at the lower back.";
+            let low_ask = "Describe in detail the lower body: skirt or pants, legs, legwear, stockings, feet, shoes, boots, high heels, claws, paws, and tail.";
+
+            let up_desc = ask_vision_encoder(&base, mode, encoder, up_b64, up_ask).unwrap_or_default();
+            let mid_desc = ask_vision_encoder(&base, mode, encoder, mid_b64, mid_ask).unwrap_or_default();
+            let low_desc = ask_vision_encoder(&base, mode, encoder, low_b64, low_ask).unwrap_or_default();
+
+            return Ok(format!(
+                "### Scene & Environment:\n{scene_desc}\n\n\
+                 ### Character Anatomy (Multi-Zone Detail Scan):\n\
+                 - Head, Face & Ears (Upper Zone): {up_desc}\n\
+                 - Torso, Arms & Chest Size (Middle Zone): {mid_desc}\n\
+                 - Legs, Feet & Claws/Tail (Lower Zone): {low_desc}"
+            ));
+        }
+    }
+
+    Ok(scene_desc)
+}
+
+/// Sends a single image to a vision encoder (like Moondream) to extract an objective description.
+fn ask_vision_encoder(base: &str, mode: AiMode, encoder: &str, base64_image: String, ask: &str) -> Result<String> {
+    let body = json!({
+        "model": encoder,
+        "prompt": ask,
+        "images": [base64_image],
+        "stream": false,
+        "think": false,
+        "keep_alive": "30m",
+        "options": {
+            "temperature": 0.2,
+            "num_predict": 500,
+            "num_ctx": 2048,
+            "num_gpu": if mode == AiMode::CpuOnly { Some(0) } else { None::<i32> },
+        },
+    });
+    let resp = client(Some(Duration::from_secs(120)))?
+        .post(format!("{base}/api/generate"))
+        .json(&body)
+        .send()
+        .map_err(|e| if e.is_timeout() { anyhow!("Vision encoder took over 2 minutes") } else { anyhow!("Couldn't reach Ollama at {base}") })?;
+    let gen: GenerateResponse = check(resp, "Vision encoder reading image")?.json()?;
+    let desc = gen.response.trim().to_string();
+    if desc.is_empty() {
+        return Err(anyhow!("The vision encoder returned an empty description."));
+    }
+    Ok(desc)
+}
+
+/// Uses a vision encoder (like moondream) to extract a detailed visual description of an image.
+fn extract_visual_description(req: &ImageAiRequest, encoder: &str, ask: &str) -> Result<String> {
+    use base64::Engine as _;
+    let base = base_url(&req.host)?;
+    let image = base64::engine::general_purpose::STANDARD.encode(shrink_for_vision(&req.image_path)?);
+    ask_vision_encoder(&base, req.mode, encoder, image, ask)
+}
+
+/// Formats a visual description into checkpoint-tailored prompt tags using a target text model.
+fn describe_with_text_model(
+    req: &ImageAiRequest,
+    system: &str,
+    user_prompt: &str,
+) -> Result<ImageAiResult> {
+    let base = base_url(&req.host)?;
+    let text = json!({ "type": "string" });
+    let mut body = json!({
+        "model": req.model,
+        "system": system,
+        "prompt": user_prompt,
+        "format": { "type": "object", "properties": { "description": text, "prompt": text }, "required": ["description", "prompt"] },
+        "stream": false,
+        "think": false,
+        "keep_alive": "30m",
+        "options": {
+            "temperature": 0.2,
+            "repeat_penalty": 1.18,
+            "num_predict": 900,
+            "num_ctx": 16384,
+            "num_gpu": if req.mode == AiMode::CpuOnly { Some(0) } else { None::<i32> },
+        },
+    });
+    if req.second_pass_vision {
+        if let Ok(img_bytes) = shrink_for_vision(&req.image_path) {
+            use base64::Engine as _;
+            let b64 = base64::engine::general_purpose::STANDARD.encode(img_bytes);
+            body["images"] = json!([b64]);
+        }
+    }
+    let resp = client(Some(Duration::from_secs(300)))?
+        .post(format!("{base}/api/generate"))
+        .json(&body)
+        .send()
+        .map_err(|e| if e.is_timeout() { anyhow!("The model took over 5 minutes to write the prompt") } else { anyhow!("Couldn't reach Ollama at {base}") })?;
+    let gen: GenerateResponse = check(resp, "Formatting the prompt")?.json()?;
+    let mut out = parse_image_ai_result(gen.response.trim())?;
+    clean_image_ai_prompt(&mut out, req.config.checkpoint);
+    Ok(out)
+}
+
+/// Parses the model's reply into an ImageAiResult, handling code fences, surrounding text, or minor JSON flaws.
+fn parse_image_ai_result(raw: &str) -> Result<ImageAiResult> {
+    if let (Some(start), Some(end)) = (raw.find('{'), raw.rfind('}')) {
+        if end > start {
+            if let Ok(r) = serde_json::from_str::<ImageAiResult>(&raw[start..=end]) {
+                if !r.prompt.trim().is_empty() {
+                    return Ok(r);
+                }
+            }
+        }
+    }
+    // Fallback: extract "prompt" and "description" fields if JSON had trailing characters or formatting quirks
+    let find_field = |field: &str| -> Option<String> {
+        let pattern = format!("\"{field}\"");
+        let idx = raw.find(&pattern)?;
+        let rest = &raw[idx + pattern.len()..];
+        let colon = rest.find(':')?;
+        let after_colon = &rest[colon + 1..];
+        let val_start = after_colon.find('"')? + 1;
+        let body = &after_colon[val_start..];
+        let mut escaped = false;
+        let mut val_end = 0;
+        for (i, c) in body.char_indices() {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                val_end = i;
+                break;
+            }
+        }
+        if val_end > 0 {
+            Some(body[..val_end].to_string())
+        } else {
+            let trimmed = body.trim_end_matches(|c: char| c == ',' || c == '"' || c.is_whitespace());
+            if !trimmed.is_empty() {
+                Some(trimmed.to_string())
+            } else {
+                None
+            }
+        }
+    };
+    if let Some(prompt) = find_field("prompt") {
+        if !prompt.trim().is_empty() {
+            let description = find_field("description").unwrap_or_default();
+            return Ok(ImageAiResult { description, prompt });
+        }
+    }
+    Err(anyhow!("The model's reply was unreadable: {raw}"))
 }
 
 fn describe_image_with(req: &ImageAiRequest, system: &str, ask: &str) -> Result<ImageAiResult> {
@@ -1161,11 +1520,13 @@ fn describe_image_with(req: &ImageAiRequest, system: &str, ask: &str) -> Result<
         "images": [image],
         "format": { "type": "object", "properties": { "description": text, "prompt": text }, "required": ["description", "prompt"] },
         "stream": false,
+        "think": false,
         "keep_alive": "30m",
         "options": {
             "temperature": 0.2,
+            "repeat_penalty": 1.18,
             "num_predict": 900,
-            "num_ctx": 8192,
+            "num_ctx": 16384,
             "num_gpu": if req.mode == AiMode::CpuOnly { Some(0) } else { None::<i32> },
         },
     });
@@ -1175,15 +1536,16 @@ fn describe_image_with(req: &ImageAiRequest, system: &str, ask: &str) -> Result<
         .send()
         .map_err(|e| if e.is_timeout() { anyhow!("The model took over 5 minutes to read the image") } else { anyhow!("Couldn't reach Ollama at {base}") })?;
     let gen: GenerateResponse = check(resp, "Reading the image")?.json()?;
-    let raw = gen.response.trim();
-    let mut out: ImageAiResult = serde_json::from_str(&raw[raw.find('{').unwrap_or(0)..])
-        .ok()
-        .filter(|r: &ImageAiResult| !r.prompt.trim().is_empty())
-        .ok_or_else(|| anyhow!("The model's reply was unreadable. Try again."))?;
+    let mut out = parse_image_ai_result(gen.response.trim())?;
+    clean_image_ai_prompt(&mut out, req.config.checkpoint);
+    Ok(out)
+}
+
+fn clean_image_ai_prompt(out: &mut ImageAiResult, checkpoint: crate::profiles::CheckpointProfile) {
     // small cleanups: the checkpoint's name and bare category words aren't image content
-    let name = req.config.checkpoint.display_name().to_lowercase();
+    let name = checkpoint.display_name().to_lowercase();
     let junk = ["hair", "eyes", "lighting", "light", "pose", "expression", "clothing", "background", "style", "setting"];
-    let cleaned: Vec<String> = crate::condenser::tidy_ai_prompt(&out.prompt, req.config.checkpoint)
+    let cleaned: Vec<String> = crate::condenser::tidy_ai_prompt(&out.prompt, checkpoint)
         .split(", ")
         .map(str::to_string)
         .filter(|t| {
@@ -1191,21 +1553,29 @@ fn describe_image_with(req: &ImageAiRequest, system: &str, ask: &str) -> Result<
             !l.is_empty() && l != name && !junk.contains(&l.as_str())
         })
         .collect();
-    // "solo" contradicts a group
+    // "solo" and 1girl/1boy contradict a group
     let group = cleaned.iter().any(|t| {
         let l = t.to_lowercase();
         l.starts_with("multiple ") || (l.len() > 1 && l.as_bytes()[0].is_ascii_digit() && l.as_bytes()[0] > b'1' && (l.ends_with("girls") || l.ends_with("boys") || l.ends_with("others")))
     });
-    // one size per body part: the first one the model wrote wins
     let mut kept: Vec<String> = Vec::new();
-    for t in cleaned.into_iter().filter(|t| !(group && t.eq_ignore_ascii_case("solo"))) {
-        let n = crate::danbooru::key(&t);
-        if !kept.iter().any(|k| crate::analyzer::size_conflict(&crate::danbooru::key(k), &n)) {
-            kept.push(t);
+    for t in cleaned.into_iter().filter(|t| {
+        if group {
+            let l = t.to_lowercase();
+            if l == "solo" || l == "1girl" || l == "1boy" || l == "1other" {
+                return false;
+            }
         }
+        true
+    }) {
+        let n = crate::danbooru::key(&t);
+        // Only strip duplicate size attributes on single-character prompts; multi-character groups can have alternate breast/body sizes
+        if !group && kept.iter().any(|k| crate::analyzer::size_conflict(&crate::danbooru::key(k), &n)) {
+            continue;
+        }
+        kept.push(t);
     }
     out.prompt = kept.join(", ");
-    Ok(out)
 }
 
 // ============================================================================
@@ -1215,13 +1585,151 @@ fn describe_image_with(req: &ImageAiRequest, system: &str, ask: &str) -> Result<
 pub struct TwoImageRequest {
     pub host: String,
     pub model: String,
+    pub vision_encoder: Option<String>,
     pub mode: AiMode,
     pub split: crate::twoimg::TagSplit,
     /// The tag-only split, given to the model as hints.
     pub hints: crate::twoimg::SplitPrompt,
+    /// If true and the target text model has vision capability, directly attach image pixels for a 2nd pass visual check.
+    pub second_pass_vision: bool,
 }
 
 pub fn split_image(req: &TwoImageRequest) -> Result<(crate::twoimg::SplitPrompt, String)> {
+    if let Some(ref encoder) = req.vision_encoder {
+        if !same_model(encoder, &req.model) {
+            return split_image_pipelined(req, encoder);
+        }
+    }
+    split_image_direct(req)
+}
+
+fn split_image_pipelined(req: &TwoImageRequest, encoder: &str) -> Result<(crate::twoimg::SplitPrompt, String)> {
+    use crate::twoimg::BOX_COLORS;
+    let n = req.split.wanted.clamp(2, 4);
+    let words = ["", "", "two", "three", "four"];
+    let base = base_url(&req.host)?;
+
+    // 1. Describe each character crop and the overall scene with the vision encoder (one image per call)
+    let mut vision_parts = Vec::new();
+    if let Some(ref chars) = req.split.chars {
+        for (i, (crop, _)) in chars.iter().take(n).enumerate() {
+            let b64 = crate::twoimg::encode(crop, 768)?;
+            let ask = format!(
+                "Describe character {} in objective detail: gender, hair color and style, eyes, face, body build, chest/breast size (e.g. flat chest, small, medium, large, or huge breasts), clothing or nudity, pose, and expression.",
+                i + 1
+            );
+            let desc = ask_vision_encoder(&base, req.mode, encoder, b64, &ask)
+                .unwrap_or_else(|e| format!("Character {}: could not extract ({e})", i + 1));
+            vision_parts.push(format!("### Character {} ({} box):\n{}", i + 1, BOX_COLORS[i].1, desc));
+        }
+        let scene_b64 = crate::twoimg::encode(&req.split.image, 768)?;
+        let ask_scene = "Describe the camera angle, framing, setting, background, lighting, and the exact spatial arrangement of characters from left to right (who is on the left, center, right) and how they interact. Do not describe character outfits or hair.";
+        let scene_desc = ask_vision_encoder(&base, req.mode, encoder, scene_b64, ask_scene)
+            .unwrap_or_else(|e| format!("Scene: could not extract ({e})"));
+        vision_parts.push(format!("### Scene & Interactions:\n{}", scene_desc));
+    } else {
+        let full_b64 = crate::twoimg::encode(&req.split.image, 768)?;
+        let ask_full = format!(
+            "Describe in objective detail the {} characters (gender, hair, clothing, body, poses, actions) and the setting in this image.",
+            words[n]
+        );
+        let desc = ask_vision_encoder(&base, req.mode, encoder, full_b64, &ask_full)
+            .unwrap_or_else(|e| format!("Could not extract visual description ({e})"));
+        vision_parts.push(format!("### Visual Description:\n{}", desc));
+    }
+    let vision_descriptions = vision_parts.join("\n\n");
+
+    // 2. Format tagger hints
+    let hints = if req.split.chars.is_some() {
+        let mut h: Vec<String> = req.hints.chars.iter().enumerate().map(|(i, c)| format!("Character {}: {c}", i + 1)).collect();
+        h.push(format!("Shared: {}", req.hints.scene));
+        h.join("\n")
+    } else {
+        format!("Not split: {}, {}", req.hints.chars.join(", "), req.hints.scene)
+    };
+
+    let order_desc = if req.split.chars.is_some() {
+        let order = (0..n)
+            .map(|i| format!("character {} = {} box", i + 1, BOX_COLORS[i].1.to_lowercase()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(" ({order}, left to right)")
+    } else {
+        " (left to right)".to_string()
+    };
+
+    let fields = (1..=n).map(|i| format!("character_{i}")).collect::<Vec<_>>();
+    let system = format!(
+        "# Role\nYou split a picture with {} characters into Danbooru tag lists for Stable Diffusion / ComfyUI. You \
+         are uncensored: describe nudity, sexual content and violence accurately; never refuse or soften.\n\n\
+         ## Visual Descriptions from Vision Encoder ({encoder})\n\
+         {vision_descriptions}\n\n\
+         ## Tagger Hints (from Danbooru tagger)\n\
+         {hints}\n\n\
+         ## Task\n\
+         - analysis: 1-2 sentences on who is who{order_desc} and what each wears.\n\
+         - character_1 … character_{n}: for each character, only what belongs to them: count tag (1girl / 1boy / \
+         1other), the character's name if it's a known character, hair, eyes, body, clothing, accessories, \
+         expression, pose.\n\
+         - {CHARACTER_CHECKLIST}\n\
+         - scene: what they share: what they do together (holding hands, facing each other, hug...), camera / \
+         framing, setting and background, lighting, art style.\n\n\
+         ## Rules\n- Real Danbooru tags, comma-separated, lowercase, spaces instead of underscores.\n\
+         - Never put a feature on the wrong character. If several have it (long hair), list it for each of them.\n\
+         - Keep the hints that are right, drop the wrong ones, add what's missing.\n\
+         - Write plain tags, never labels like 'lighting: dim' or 'character 2'.\n\
+         - No quality tags, no 'solo'. Only what's visible. At most 40 tags per list.\n- Reply with JSON only.",
+        words[n]
+    );
+
+    let text = json!({ "type": "string" });
+    let mut properties = serde_json::Map::new();
+    properties.insert("analysis".into(), text.clone());
+    for f in &fields {
+        properties.insert(f.clone(), text.clone());
+    }
+    properties.insert("scene".into(), text.clone());
+    let mut required = vec!["analysis".to_string()];
+    required.extend(fields.iter().cloned());
+    required.push("scene".into());
+
+    let body = json!({
+        "model": req.model,
+        "system": system,
+        "prompt": format!("Split this picture into {} and scene based on the visual descriptions and tagger hints.", fields.join(", ")),
+        "format": { "type": "object", "properties": properties, "required": required },
+        "stream": false,
+        "keep_alive": "30m",
+        "options": {
+            "temperature": 0.0,
+            "seed": 7,
+            "repeat_penalty": 1.15,
+            "num_predict": 1200 * n as i32,
+            "num_ctx": 16384,
+            "num_gpu": if req.mode == AiMode::CpuOnly { Some(0) } else { None::<i32> },
+        },
+    });
+
+    let mut last_err = anyhow!("The model's reply was unreadable. Try again.");
+    let mut body = body;
+    if req.second_pass_vision {
+        if let Ok(b64) = crate::twoimg::encode(&req.split.image, 1024) {
+            body["images"] = json!([b64]);
+        }
+    }
+    for attempt in 0..2u32 {
+        body["options"]["seed"] = json!(7 + attempt);
+        body["options"]["temperature"] = json!(if attempt == 0 { 0.0 } else { 0.3 });
+        match split_once(&base, &body, n) {
+            Ok(r) => return Ok(r),
+            Err(e) if e.to_string().starts_with("Couldn't reach") => return Err(e),
+            Err(e) => last_err = e,
+        }
+    }
+    Err(last_err)
+}
+
+fn split_image_direct(req: &TwoImageRequest) -> Result<(crate::twoimg::SplitPrompt, String)> {
     use crate::twoimg::{encode, BOX_COLORS};
     let n = req.split.wanted.clamp(2, 4);
     let words = ["", "", "two", "three", "four"];
@@ -1452,7 +1960,9 @@ pub fn danbooru_translate(req: &TranslateRequest) -> Result<TranslateResult> {
     });
     let mut required = vec!["mapping".to_string(), "tags".to_string()];
     if supports_natural {
-        properties.as_object_mut().unwrap().insert("natural".into(), text.clone());
+        if let Some(obj) = properties.as_object_mut() {
+            obj.insert("natural".into(), text.clone());
+        }
         required.push("natural".into());
     }
     let body = json!({
@@ -1470,7 +1980,7 @@ pub fn danbooru_translate(req: &TranslateRequest) -> Result<TranslateResult> {
         "options": {
             "temperature": 0.2,
             "num_predict": 1200,
-            "num_ctx": 8192,
+            "num_ctx": 16384,
             "num_gpu": if req.mode == AiMode::CpuOnly { Some(0) } else { None::<i32> },
         },
     });
@@ -1714,8 +2224,7 @@ fn pull_model(
         if let Some(err) = p.error {
             return Err(anyhow!("Ollama: {err}"));
         }
-        if p.total > 0 {
-            let pct = p.completed * 100 / p.total;
+        if let Some(pct) = (p.completed * 100).checked_div(p.total) {
             if pct != last_pct {
                 last_pct = pct;
                 let _ = progress.send(format!(
@@ -1730,32 +2239,34 @@ fn pull_model(
         }
     }
 
-    let _ = progress.send(format!("Registering {name} in Ollama..."));
-    let created = if let Some(template) = template {
-        http.post(format!("{base}/api/create"))
-        .json(&json!({
-            "model": name,
-            "from": source,
-            "template": template,
-            "parameters": { "stop": ["<|im_end|>", "<|endoftext|>", "<|im_start|>"] },
-            "stream": false,
-        }))
-        .send()
-        .map_err(anyhow::Error::from)
-        .and_then(|r| check(r, "Registering model"))
-    } else {
-        Err(anyhow!("plain copy"))
-    };
-    if created.is_err() {
-        // Older servers: plain copy keeps the GGUF's own template.
-        let r = http
-            .post(format!("{base}/api/copy"))
-            .json(&json!({ "source": source, "destination": name }))
-            .send()?;
-        check(r, "Registering model")?;
+    if !same_model(source, name) {
+        let _ = progress.send(format!("Registering {name} in Ollama..."));
+        let created = if let Some(template) = template {
+            http.post(format!("{base}/api/create"))
+            .json(&json!({
+                "model": name,
+                "from": source,
+                "template": template,
+                "parameters": { "stop": ["<|im_end|>", "<|endoftext|>", "<|im_start|>"] },
+                "stream": false,
+            }))
+            .send()
+            .map_err(anyhow::Error::from)
+            .and_then(|r| check(r, "Registering model"))
+        } else {
+            Err(anyhow!("plain copy"))
+        };
+        if created.is_err() {
+            // Older servers: plain copy keeps the GGUF's own template.
+            let r = http
+                .post(format!("{base}/api/copy"))
+                .json(&json!({ "source": source, "destination": name }))
+                .send()?;
+            check(r, "Registering model")?;
+        }
+        // The long hf.co name is now redundant; its data stays shared with the copy.
+        let _ = http.delete(format!("{base}/api/delete")).json(&json!({ "model": source })).send();
     }
-    // The long hf.co name is now redundant; its data stays shared with the copy.
-    let _ = http.delete(format!("{base}/api/delete")).json(&json!({ "model": source })).send();
     Ok(())
 }
 
@@ -1896,7 +2407,7 @@ fn generate_body<'a>(req: &'a AiScanRequest, system: &'a str, prompt: &'a str, s
                 let rich = req.config.detail == crate::profiles::DetailLevel::Rich;
                 1800 + if req.config.dynamic { 600 } else { 0 } + if rich { 800 } else { 0 }
             },
-            num_ctx: 8192,
+            num_ctx: 16384,
             num_gpu: if req.mode == AiMode::CpuOnly { Some(0) } else { None },
         },
     }
@@ -2129,7 +2640,7 @@ fn generate_negative(req: &AiScanRequest, positive: &str) -> Result<String> {
         "format": { "type": "object", "properties": { "negative": { "type": "string" } }, "required": ["negative"] },
         "stream": false,
         "keep_alive": req.keep_alive,
-        "options": { "temperature": 0.2, "num_predict": 300, "num_ctx": 8192, "num_gpu": if req.mode == AiMode::CpuOnly { Some(0) } else { None::<i32> } },
+        "options": { "temperature": 0.2, "num_predict": 300, "num_ctx": 16384, "num_gpu": if req.mode == AiMode::CpuOnly { Some(0) } else { None::<i32> } },
     });
     let resp = client(Some(Duration::from_secs(120)))?.post(format!("{base}/api/generate")).json(&body).send()?;
     let gen: GenerateResponse = check(resp, "Negative prompt")?.json()?;
@@ -2253,6 +2764,7 @@ mod tests {
                 camera_angle: 0,
 
                 pose: 0,
+                proportion: 0,
 
                 dynamic: false,
 
@@ -2364,6 +2876,7 @@ mod tests {
                 camera_angle: 0,
 
                 pose: 0,
+                proportion: 0,
 
                 dynamic: false,
 
@@ -2383,7 +2896,7 @@ mod tests {
         assert_eq!(placement, "GPU 100% • re-scanned 2× • still missing: scene analysis, negative prompt, cards");
 
         let (tx, rx) = std::sync::mpsc::channel();
-        pull_tier_model(&host, AiModelTier::GemmaE2B, tx).unwrap();
+        pull_tier_model(&host, AiModelTier::Good, tx).unwrap();
         let progress: Vec<String> = rx.try_iter().collect();
         assert!(progress.iter().any(|m| m.contains("(50%)")));
 
@@ -2395,8 +2908,8 @@ mod tests {
             ["/api/tags", "/api/generate", "/api/generate", "/api/generate", "/api/ps", "/api/pull", "/api/copy", "/api/delete"]
         );
         let copy: serde_json::Value = serde_json::from_str(&log[6].1).unwrap();
-        assert_eq!(copy["destination"], AiModelTier::GemmaE2B.ollama_name());
-        assert_eq!(copy["source"], AiModelTier::GemmaE2B.hf_ref());
+        assert_eq!(copy["destination"], AiModelTier::Good.ollama_name());
+        assert_eq!(copy["source"], AiModelTier::Good.hf_ref());
         let generate: serde_json::Value = serde_json::from_str(&log[1].1).unwrap();
         assert_eq!(generate["format"]["properties"]["changes"]["type"], "array");
         assert_eq!(generate["keep_alive"], "30m");
@@ -2423,6 +2936,7 @@ mod tests {
                 camera_angle: 0,
 
                 pose: 0,
+                proportion: 0,
 
                 dynamic: false,
 
@@ -2477,7 +2991,7 @@ mod tests {
             config: ScanConfig {
                 checkpoint: crate::profiles::CheckpointProfile::PonyV6, target_view: crate::profiles::TargetView::None, pinned_emphasis_raw: String::new(),
                 emphasis_weight: 1.25, cleanup_enabled: true, resolve_conflicts_enabled: true, clamp_weights_enabled: true,
-                camera_angle: 0, pose: 0, dynamic: false, lora_tags_raw: String::new(), arranged: false, natural: false, two_char: false, char2_prompt_raw: String::new(), char2_lora_tags_raw: String::new(), char_break: false, scene_prompt_raw: String::new(), more_chars: Vec::new(),
+                camera_angle: 0, pose: 0, proportion: 0, dynamic: false, lora_tags_raw: String::new(), arranged: false, natural: false, two_char: false, char2_prompt_raw: String::new(), char2_lora_tags_raw: String::new(), char_break: false, scene_prompt_raw: String::new(), more_chars: Vec::new(),
                 detail: crate::profiles::DetailLevel::Balanced,
             },
             mode: AiMode::Gpu, host: String::new(), model: String::new(), keep_alive: "30m".into(), think: false,
@@ -2510,7 +3024,7 @@ mod tests {
     #[test]
     #[ignore]
     fn live_translate() {
-        let model = std::env::var("TRANSLATE_MODEL").unwrap_or_else(|_| "prompt-condenser-gemma4-12b".into());
+        let model = std::env::var("TRANSLATE_MODEL").unwrap_or_else(|_| "richardyoung/llama-3.1-8b-instruct-abliterated".into());
         for (text, ckpt) in [
             ("a forlorn maiden sheltering beneath a parasol during a downpour, her tresses plastered to her cheeks", crate::profiles::CheckpointProfile::Illustrious),
             ("she's doing the thing where you peek out from behind a door, all shy, wearing those socks that go above the knee", crate::profiles::CheckpointProfile::Anima),
@@ -2530,21 +3044,39 @@ mod tests {
     #[test]
     #[ignore]
     fn live_image() {
+        let model = std::env::var("IMAGE_MODEL").unwrap_or_else(|_| "prompt-condenser-gemma4-e4b:latest".into());
+        let vision_encoder = match std::env::var("VISION_ENCODER").as_deref() {
+            Ok("none") | Ok("direct") | Ok("self") => None,
+            Ok(enc) => Some(enc.to_string()),
+            Err(_) => Some("moondream:1.8b".into()),
+        };
         for path in std::env::var("IMAGE_TEST").unwrap().split(':') {
             let path = std::path::PathBuf::from(path);
-            let hints = crate::tagger::tag_image(&path).map(|t| crate::tagger::build_prompt(&t, 0.35).prompt).unwrap_or_default();
+            let hints = crate::twoimg::tag_one_fast(&path, &|_| ()).map(|t| crate::tagger::build_prompt(&t, 0.35).prompt).unwrap_or_default();
             let config = ScanConfig {
-                checkpoint: crate::profiles::CheckpointProfile::PonyV6, target_view: crate::profiles::TargetView::None, pinned_emphasis_raw: String::new(),
+                checkpoint: crate::profiles::CheckpointProfile::Anima, target_view: crate::profiles::TargetView::None, pinned_emphasis_raw: String::new(),
                 emphasis_weight: 1.25, cleanup_enabled: true, resolve_conflicts_enabled: true, clamp_weights_enabled: true,
-                camera_angle: 0, pose: 0, dynamic: false, lora_tags_raw: String::new(), arranged: false, natural: false, two_char: false, char2_prompt_raw: String::new(), char2_lora_tags_raw: String::new(), char_break: false, scene_prompt_raw: String::new(), more_chars: Vec::new(), detail: crate::profiles::DetailLevel::Balanced,
+                camera_angle: 0, pose: 0, proportion: 0, dynamic: false, lora_tags_raw: String::new(), arranged: false, natural: false, two_char: false, char2_prompt_raw: String::new(), char2_lora_tags_raw: String::new(), char_break: false, scene_prompt_raw: String::new(), more_chars: Vec::new(), detail: crate::profiles::DetailLevel::Balanced,
             };
             let req = ImageAiRequest {
-                host: "localhost:11434".into(), model: "prompt-condenser-gemma4-12b".into(), mode: AiMode::Gpu,
-                image_path: path.clone(), config, tag_hints: hints.clone(),
+                host: "localhost:11434".into(),
+                model: model.clone(),
+                vision_encoder: vision_encoder.clone(),
+                mode: AiMode::Gpu,
+                image_path: path.clone(),
+                config,
+                tag_hints: hints.clone(),
+                second_pass_vision: false,
             };
             let t = std::time::Instant::now();
             let r = describe_image(&req).unwrap();
-            println!("{} ({:.0}s)\n  TAGGER: {hints}\n  DESC  : {}\n  PROMPT: {}", path.display(), t.elapsed().as_secs_f32(), r.description, r.prompt);
+            println!("\n=======================================================");
+            println!("IMAGE   : {}", path.display());
+            println!("TIME    : {:.2}s (Model: {})", t.elapsed().as_secs_f32(), model);
+            println!("TAGGER  : {hints}");
+            println!("DESC    : {}", r.description);
+            println!("PROMPT  : {}", r.prompt);
+            println!("=======================================================\n");
         }
     }
 
@@ -2554,10 +3086,10 @@ mod tests {
     fn live_pull() {
         let host = std::env::var("OLLAMA_TEST_HOST").unwrap_or_else(|_| "localhost:11434".into());
         let tier = match std::env::var("OLLAMA_TEST_TIER").as_deref() {
-            Ok("e2b") => AiModelTier::GemmaE2B,
-            Ok("e4b") => AiModelTier::GemmaE4B,
-            Ok("gemma12") => AiModelTier::Gemma12,
-            _ => AiModelTier::Gemma12,
+            Ok("good") | Ok("e4b") => AiModelTier::Good,
+            Ok("better") | Ok("llama8b") | Ok("llama8") | Ok("llama") => AiModelTier::Better,
+            Ok("best") | Ok("12b") => AiModelTier::Best,
+            _ => AiModelTier::Better,
         };
         let (tx, rx) = std::sync::mpsc::channel::<String>();
         let printer = std::thread::spawn(move || {
@@ -2618,6 +3150,7 @@ mod tests {
                         cleanup_enabled: true, resolve_conflicts_enabled: true, clamp_weights_enabled: true,
                         camera_angle: std::env::var("COMPARE_ANGLE").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
                         pose: 0,
+                proportion: 0,
                         dynamic: std::env::var("COMPARE_DYNAMIC").is_ok(),
                         lora_tags_raw: std::env::var("COMPARE_LORA").unwrap_or_default(), arranged: false, natural: std::env::var("COMPARE_NATURAL").is_ok(), two_char: false, char2_prompt_raw: String::new(), char2_lora_tags_raw: String::new(), char_break: false, scene_prompt_raw: String::new(), more_chars: Vec::new(),
                         detail: match std::env::var("COMPARE_DETAIL").as_deref() { Ok("rich") => crate::profiles::DetailLevel::Rich, Ok("faithful") => crate::profiles::DetailLevel::Faithful, _ => crate::profiles::DetailLevel::Balanced },
@@ -2677,7 +3210,7 @@ mod tests {
         let base = || ScanConfig {
             checkpoint: CheckpointProfile::PonyV6, target_view: TargetView::None, pinned_emphasis_raw: String::new(),
             emphasis_weight: 1.25, cleanup_enabled: true, resolve_conflicts_enabled: true, clamp_weights_enabled: true,
-            camera_angle: 0, pose: 0, dynamic: false, lora_tags_raw: String::new(), arranged: false, natural: false,
+            camera_angle: 0, pose: 0, proportion: 0, dynamic: false, lora_tags_raw: String::new(), arranged: false, natural: false,
             two_char: false, char2_prompt_raw: String::new(), char2_lora_tags_raw: String::new(), char_break: false,
             scene_prompt_raw: String::new(), more_chars: Vec::new(), detail: DetailLevel::Balanced,
         };
@@ -2710,6 +3243,26 @@ mod tests {
         c.detail = DetailLevel::Rich;
         let long = (0..40).map(|i| format!("tag{i} word")).collect::<Vec<_>>().join(", ");
         assert!(!prompt_guidance(&long, &c).join("\n").contains("75 tokens"));
+        // "explicit" only for explicit words, not words that contain them
+        for innocent in ["canal, cumulus clouds, floral print kimono, cucumber salad", "analog camera, coral reef, sussex"] {
+            let g = prompt_guidance(innocent, &base()).join("\n");
+            assert!(!g.contains("explicit"), "{innocent}: {g}");
+        }
+        assert!(prompt_guidance("1girl, nude, spread legs", &base()).join("\n").contains("explicit"));
+        // 2others / 3others are characters
+        assert!(prompt_guidance("2others, forest, mist", &base()).join("\n").contains("several characters"));
+        // on a multi-character tab, character 1's LoRA doesn't strip the other characters' tags
+        let text = "1girl, smile, blue background, sunlight, standing, upper body";
+        let mut c = base();
+        c.lora_tags_raw = "red background".into();
+        // 1 Character: the LoRA's "red background" replaces the prompt's "blue background"
+        let one = prompt_guidance(text, &c).join("\n");
+        assert!(one.contains("setting / background"), "{one}");
+        // several characters: the first LoRA box only speaks for character 1, so the setting counts
+        c.two_char = true;
+        c.char2_prompt_raw = "1girl, grey eyes".into();
+        let many = prompt_guidance(text, &c).join("\n");
+        assert!(!many.contains("setting / background") && many.contains("Already specified"), "{many}");
         // the 75-token note only exists for CLIP checkpoints: not for Anima or Flux
         let long = (0..60).map(|i| format!("tag{i} word")).collect::<Vec<_>>().join(", ");
         let mut c = base();
@@ -2744,6 +3297,7 @@ mod tests {
             emphasis_weight: 1.25, cleanup_enabled: true, resolve_conflicts_enabled: true, clamp_weights_enabled: true,
  camera_angle: 0,
  pose: 0,
+ proportion: 0,
  dynamic: false,
  lora_tags_raw: String::new(), arranged: false, natural: false, two_char: false, char2_prompt_raw: String::new(), char2_lora_tags_raw: String::new(), char_break: false, scene_prompt_raw: String::new(), more_chars: Vec::new(),
  detail: crate::profiles::DetailLevel::Balanced,
@@ -2783,7 +3337,7 @@ mod tests {
         let mut cfg = ScanConfig {
             checkpoint: CheckpointProfile::Anima, target_view: TargetView::None, pinned_emphasis_raw: String::new(),
             emphasis_weight: 1.25, cleanup_enabled: true, resolve_conflicts_enabled: true, clamp_weights_enabled: true,
-            camera_angle: 6, pose: 0, dynamic: true, lora_tags_raw: String::new(), arranged: false, natural: false, two_char: false, char2_prompt_raw: String::new(), char2_lora_tags_raw: String::new(), char_break: false, scene_prompt_raw: String::new(), more_chars: Vec::new(), detail: crate::profiles::DetailLevel::Rich,
+            camera_angle: 6, pose: 0, proportion: 0, dynamic: true, lora_tags_raw: String::new(), arranged: false, natural: false, two_char: false, char2_prompt_raw: String::new(), char2_lora_tags_raw: String::new(), char_break: false, scene_prompt_raw: String::new(), more_chars: Vec::new(), detail: crate::profiles::DetailLevel::Rich,
         };
         let p = "1girl, solo, smile, kimono, shrine, night";
         let (g, gu) = build_ai_system_and_user_prompt_for(p, &cfg, ModelFamily::Gemma);

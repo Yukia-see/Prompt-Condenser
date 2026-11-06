@@ -1,0 +1,37 @@
+# Corrected & Tuned Evaluation Prompts
+Image Reference: /home/yukia/Pictures/HWL8f8wbYAAMJ-a.jpg (3 Characters)
+Target Checkpoint: Anima Pencil-XL / Anima
+
+Fixes Applied:
+- Middle Character: Replaced "leaning forward" with "standing upright, normal height" and added "same height" to prevent height squishing.
+- Right Character: Replaced "(giant ass)" with "(large ass:1.25), (wide hips:1.25)" to eliminate the word "giant" cross-attending to breasts; boosted chest suppression using "(flat chest:1.3), petite bust".
+
+================================================================================
+Option 1: Corrected Anima Single Prompt (Positional Clauses)
+================================================================================
+
+masterpiece, best quality, 3girls, same height, equal height, school uniform, alternate breast size, (from behind:1.2), (looking back:1.2), looking back over shoulder, dynamic pose, yellow and white striped background, (the girl on the left has black ponytail, (gigantic breasts:1.25), curvy figure, pale blue blouse, plaid skirt, holding wrench), (the girl in the center has teal hair, cowlicks, standing upright, normal height, (medium breasts:1.15), navy blazer, crossed arms, smirk), (the girl on the right has honey blonde hair, (flat chest:1.3), petite bust, (large ass:1.25), (wide hips:1.25), (thick thighs:1.25), sky blue skirt, navy vest, holding backpack), full body, bright lighting, anime style, vibrant colors
+
+
+================================================================================
+Option 2: Corrected Anima Tag Clusters
+================================================================================
+
+masterpiece, best quality, 3girls, same height, school uniform, alternate breast size, (from behind:1.2), (looking back:1.2), looking back over shoulder, (yellow and white striped background:1.15), (left: black hair, twin-tails, (gigantic breasts:1.25), pale blue shirt, plaid skirt, holding wrench:1.2), (center: teal hair, ahoge, standing upright, normal height, (medium breasts:1.15), navy blazer, crossed arms, smirk:1.15), (right: blonde hair, (flat chest:1.3), (large ass:1.25), (wide hips:1.25), sky blue skirt, navy vest, backpack:1.2), loose socks, loafers, bright lighting, full body
+
+
+================================================================================
+Option 3: ComfyUI / Regional Prompter Multi-Conditioning (Guaranteed Zero-Bleed)
+================================================================================
+
+[Shared Header / Scene]:
+masterpiece, best quality, 3girls, same height, equal height, school uniform, alternate breast size, (from behind:1.2), (looking back:1.2), looking back over shoulder, yellow and white striped background, bright lighting, anime style, full body
+
+[Character 1 - Left Box (x: 0.0 - 0.35)]:
+1girl, black hair, twin-tails, bangs, (gigantic breasts:1.25), (curvy:1.2), (thick thighs:1.15), pale blue blouse, navy plaid skirt, white loose socks, black loafers, holding wrench, looking back, smile
+
+[Character 2 - Center Box (x: 0.35 - 0.65)]:
+1girl, teal hair, cowlicks, ahoge, standing upright, normal height, (medium breasts:1.15), navy blazer, white shirt, light plaid skirt, white socks, crossed arms, smirk, head tilt
+
+[Character 3 - Right Box (x: 0.65 - 1.0)]:
+1girl, honey blonde hair, side bangs, (flat chest:1.3), petite bust, (large ass:1.25), (wide hips:1.25), (thick thighs:1.25), sky blue pleated skirt, navy vest, white knee-high socks, brown loafers, holding backpack, cheerful smile

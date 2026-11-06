@@ -1,0 +1,47 @@
+# Composed Multi-Character Test: Indoor Gymnasium Scene + 2 Random Characters
+# Scene Reference: /home/yukia/Downloads/181813_00001_.png (Indoor Gymnasium, Polished Floor, From Behind / Over-Shoulder)
+# Base Checkpoint: Anima-based Community Checkpoints (Anima Pencil-XL / Animagine XL / SDXL)
+# Rule Applied:
+#   - Format 1: Single-Line Prompt includes BREAK chunk fencing for CLIPTextEncodeWithBreak.
+#   - Format 2: Line-Separated Prompt uses clean newlines without BREAK.
+
+================================================================================
+1. Single-Line Prompt (Includes BREAK for Single Text Box):
+================================================================================
+
+masterpiece, best quality, 2girls, indoors, gym, gymnasium, polished wooden floor, basketball hoops in background, bright overhead sports lighting, wide shot, full body, (from behind:1.2), (looking back:1.2), anime style, BREAK, 1girl, on the left, ruby red hair, high ponytail, crimson hair ribbon, expressive bright red eyes, energetic confident smile, (medium breasts:1.15), athletic toned build, white athletic tank top, red gym shorts, white wristbands, white crew socks, red sneakers, standing upright, arms at sides, looking at viewer, BREAK, 1girl, on the right, midnight blue hair, low wavy twin-tails, sapphire eyes, cute bashful blush, (large breasts:1.25), curvy figure, dark navy track jacket, matching navy running shorts, black knee-high athletic socks, white running shoes, standing, from behind, looking back over shoulder, looking at viewer
+
+================================================================================
+2. Line-Separated Prompt (Clean Line Separation — NO BREAK Needed):
+================================================================================
+
+masterpiece, best quality, 2girls, indoors, gym, gymnasium, polished wooden floor, basketball hoops in background, bright overhead sports lighting, wide shot, full body, (from behind:1.2), (looking back:1.2), anime style,
+1girl, on the left, ruby red hair, high ponytail, crimson hair ribbon, expressive bright red eyes, energetic confident smile, (medium breasts:1.15), athletic toned build, white athletic tank top, red gym shorts, white wristbands, white crew socks, red sneakers, standing upright, arms at sides, looking at viewer,
+1girl, on the right, midnight blue hair, low wavy twin-tails, sapphire eyes, cute bashful blush, (large breasts:1.25), curvy figure, dark navy track jacket, matching navy running shorts, black knee-high athletic socks, white running shoes, standing, from behind, looking back over shoulder, looking at viewer
+
+================================================================================
+3. Section-by-Section Blocks (Modular Node Layout — NO BREAK Needed):
+================================================================================
+
+[Scene / Environment & Shared Framing]:
+masterpiece, best quality, 2girls, indoors, gym, gymnasium, polished wooden floor, 
+basketball hoops in background, bright overhead sports lighting, wide shot, full body, 
+(from behind:1.2), (looking back:1.2), anime style
+
+[Left Character (Character 1 Identity + Gym Stance)]:
+1girl, on the left, ruby red hair, high ponytail, crimson hair ribbon, expressive bright red eyes, 
+energetic confident smile, (medium breasts:1.15), athletic toned build, white athletic tank top, 
+red gym shorts, white wristbands, white crew socks, red sneakers, standing upright, 
+arms at sides, looking at viewer
+
+[Right Character (Character 2 Identity + Over-the-Shoulder Pose)]:
+1girl, on the right, midnight blue hair, low wavy twin-tails, sapphire eyes, cute bashful blush, 
+(large breasts:1.25), curvy figure, dark navy track jacket, matching navy running shorts, 
+black knee-high athletic socks, white running shoes, standing, from behind, 
+looking back over shoulder, looking at viewer
+
+================================================================================
+Recommended Negative Prompt:
+================================================================================
+
+worst quality, low quality, score_1, score_2, score_3, blurry, jpeg artifacts, identical faces, identical hairstyles, attribute crossover, color bleed, symmetrical pose, deformed hands, bad anatomy, bad fingers, extra limbs

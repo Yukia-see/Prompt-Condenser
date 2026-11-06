@@ -204,11 +204,13 @@ pub fn main_n(boxes: &[PersonBox], n: usize) -> Option<Vec<PersonBox>> {
 pub fn crop(img: &image::DynamicImage, b: &PersonBox) -> image::DynamicImage {
     let (w, h) = (img.width() as f32, img.height() as f32);
     let (mx, my) = ((b.x1 - b.x0) * 0.06, (b.y1 - b.y0) * 0.04);
-    let x0 = (b.x0 - mx).max(0.0);
-    let y0 = (b.y0 - my).max(0.0);
-    let x1 = (b.x1 + mx).min(w);
-    let y1 = (b.y1 + my).min(h);
-    img.crop_imm(x0 as u32, y0 as u32, ((x1 - x0) as u32).max(1), ((y1 - y0) as u32).max(1))
+    let x0 = (b.x0 - mx).max(0.0).min((w - 1.0).max(0.0));
+    let y0 = (b.y0 - my).max(0.0).min((h - 1.0).max(0.0));
+    let x1 = (b.x1 + mx).min(w).max(x0 + 1.0);
+    let y1 = (b.y1 + my).min(h).max(y0 + 1.0);
+    let cw = ((x1 - x0) as u32).max(1).min(img.width().saturating_sub(x0 as u32));
+    let ch = ((y1 - y0) as u32).max(1).min(img.height().saturating_sub(y0 as u32));
+    img.crop_imm(x0 as u32, y0 as u32, cw.max(1), ch.max(1))
 }
 
 /// The top 55% of a character's box (face, hair, eyes, the top of the outfit), so the
@@ -216,6 +218,27 @@ pub fn crop(img: &image::DynamicImage, b: &PersonBox) -> image::DynamicImage {
 pub fn upper_crop(img: &image::DynamicImage, b: &PersonBox) -> image::DynamicImage {
     let top = PersonBox { y1: b.y0 + (b.y1 - b.y0) * 0.55, ..*b };
     crop(img, &top)
+}
+
+/// The middle 40% of a character's box (30% to 70%: torso, waist, hands, hips, tail root, belts).
+pub fn middle_crop(img: &image::DynamicImage, b: &PersonBox) -> image::DynamicImage {
+    let h = b.y1 - b.y0;
+    let mid = PersonBox {
+        y0: b.y0 + h * 0.30,
+        y1: b.y0 + h * 0.70,
+        ..*b
+    };
+    crop(img, &mid)
+}
+
+/// The lower 45% of a character's box (55% to 100%: legs, knees, calves, feet, shoes, claws, tail tip).
+pub fn lower_crop(img: &image::DynamicImage, b: &PersonBox) -> image::DynamicImage {
+    let h = b.y1 - b.y0;
+    let low = PersonBox {
+        y0: b.y0 + h * 0.55,
+        ..*b
+    };
+    crop(img, &low)
 }
 
 #[cfg(test)]

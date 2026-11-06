@@ -18,6 +18,16 @@ pub enum ChangeAction {
     PoseChoice,
     /// Two sizes / lengths for the same thing (medium + large breasts).
     SizeConflict,
+    /// Incompatible poses or arm gestures.
+    PoseConflict,
+    /// Species purity, four-ears triggers, facial state conflicts, eyewear conflict.
+    AnatomyConflict,
+    /// 3D bleed tags on 2D anime checkpoints.
+    StyleConflict,
+    /// Recommended chain tags (clothing interactions, pose/physics, negative locks).
+    Recommendation,
+    /// Body proportion set by the body dropdown.
+    ProportionChoice,
 }
 
 impl ChangeAction {
@@ -30,9 +40,14 @@ impl ChangeAction {
             Self::WeightClamped => "WEIGHT CLAMPED",
             Self::KeptEmphasized => "KEPT & EMPHASIZED",
             Self::SizeConflict => "SIZE CONFLICT",
+            Self::PoseConflict => "POSE CONFLICT",
+            Self::AnatomyConflict => "ANATOMY CONFLICT",
+            Self::StyleConflict => "STYLE CONFLICT",
             Self::AiRewrite => "AI SUGGESTION",
             Self::AngleChoice => "CAMERA ANGLE",
             Self::PoseChoice => "POSE",
+            Self::Recommendation => "CHAIN RECOMMENDATIONS",
+            Self::ProportionChoice => "BODY PROPORTION",
         }
     }
 }
@@ -64,6 +79,8 @@ pub struct ScanConfig {
     pub camera_angle: usize,
     /// Index into `profiles::POSES` (0 = none).
     pub pose: usize,
+    /// Index into `profiles::PROPORTIONS` (0 = none).
+    pub proportion: usize,
     /// Dynamic Prompts {a|b|c} variations wanted.
     pub dynamic: bool,
     /// The LoRA box: tags put into the output word for word.
@@ -139,7 +156,7 @@ pub fn detect_effective_view(tokens: &[PromptToken], selected_view: TargetView) 
         if n == "from behind" || n == "back view" {
             return TargetView::FromBehind;
         }
-        if n == "front view" {
+        if n == "front view" || n == "straight-on" {
             return TargetView::FrontView;
         }
         if n == "side profile" || n == "from side" || n == "side view" {
@@ -152,12 +169,1396 @@ pub fn detect_effective_view(tokens: &[PromptToken], selected_view: TargetView) 
     TargetView::None
 }
 
+/// Tags specifying small or flat chest.
+pub fn is_small_chest_tag(tag: &str) -> bool {
+    matches!(
+        tag,
+        "small breasts"
+            | "flat chest"
+            | "tiny breasts"
+            | "petite breasts"
+            | "perky breasts"
+            | "aa cup"
+            | "a cup"
+            | "b cup"
+            | "flat"
+    )
+}
+
+/// Tags specifying a large or prominent bust.
+#[allow(dead_code)]
+pub fn is_large_chest_tag(tag: &str) -> bool {
+    matches!(
+        tag,
+        "large breasts"
+            | "huge breasts"
+            | "gigantic breasts"
+            | "hyper breasts"
+            | "enormous breasts"
+            | "massive breasts"
+            | "full breasts"
+            | "heavy breasts"
+            | "e cup"
+            | "f cup"
+            | "g cup"
+            | "h cup"
+            | "i cup"
+            | "oppai"
+            | "busty"
+    )
+}
+
+/// Chest exposure / cleavage tags that require breast volume.
+#[allow(dead_code)]
+pub fn is_cleavage_or_chest_exposure_tag(tag: &str) -> bool {
+    matches!(
+        tag,
+        "cleavage"
+            | "deep cleavage"
+            | "underboob"
+            | "sideboob"
+            | "cleavage cutout"
+    )
+}
+
+/// Poses that physically require prominent breast volume.
+#[allow(dead_code)]
+pub fn is_large_chest_pose_tag(tag: &str) -> bool {
+    matches!(
+        tag,
+        "breast rest"
+            | "resting breasts on table"
+            | "breasts on table"
+            | "holding breasts"
+            | "holding own breasts"
+            | "cupping breasts"
+            | "breast grab"
+            | "groping own breasts"
+            | "grabbing own breasts"
+            | "breast press"
+            | "cleavage peek"
+            | "paizuri"
+            | "hand bra"
+    )
+}
+
+/// Kemonomimi / animal ears target tags.
+pub fn is_kemonomimi_tag(tag: &str) -> bool {
+    matches!(
+        tag,
+        "kemonomimi mode"
+            | "kemonomimi"
+            | "animal ears"
+            | "rabbit ears"
+            | "bunny ears"
+            | "fox ears"
+            | "cat ears"
+            | "dog ears"
+            | "tanuki ears"
+            | "wolf ears"
+            | "horse ears"
+            | "kitsune"
+            | "neko"
+    )
+}
+
+/// Furry bleed tags incompatible with human-skin kemonomimi.
+pub fn is_furry_bleed_tag(tag: &str) -> bool {
+    if matches!(
+        tag,
+        "furry"
+            | "furry female"
+            | "furry male"
+            | "anthro"
+            | "fur"
+            | "white fur"
+            | "pink fur"
+            | "black fur"
+            | "brown fur"
+            | "grey fur"
+            | "gray fur"
+            | "orange fur"
+            | "blue fur"
+            | "snout"
+            | "muzzle"
+            | "animal nose"
+            | "paws"
+            | "paw pads"
+            | "digitigrade"
+            | "furry body"
+            | "body fur"
+    ) {
+        return true;
+    }
+    if tag.ends_with(" fur") && tag.split_whitespace().count() == 2 {
+        let first = tag.split_whitespace().next().unwrap();
+        if COLOR_WORDS.contains(&first) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Human ear / accessory tags that trigger four-ear generation artifacts on kemonomimi.
+pub fn is_four_ears_trigger_tag(tag: &str) -> bool {
+    if matches!(
+        tag,
+        "human ears"
+            | "earrings"
+            | "hoop earrings"
+            | "stud earrings"
+            | "ear piercing"
+            | "ear piercings"
+            | "hair tucked behind ear"
+            | "elf ears"
+            | "pointy ears"
+            | "pointed ears"
+    ) {
+        return true;
+    }
+    if tag.contains("earring") || tag.contains("ear piercing") {
+        return true;
+    }
+    false
+}
+
+/// Closed eyes tags.
+pub fn is_closed_eyes_tag(tag: &str) -> bool {
+    matches!(tag, "closed eyes" | "eyes closed" | "sleeping")
+}
+
+/// Gaze, pupil, half-closed, and eye color tags that force eyelids open.
+pub fn is_closed_eyes_conflict_tag(tag: &str) -> bool {
+    if matches!(
+        tag,
+        "looking at viewer"
+            | "looking away"
+            | "looking back"
+            | "looking up"
+            | "looking down"
+            | "eye contact"
+            | "staring"
+            | "glaring"
+            | "half-closed eyes"
+            | "half closed eyes"
+            | "jitome"
+            | "tareme"
+            | "tsurime"
+            | "heterochromia"
+    ) {
+        return true;
+    }
+    if tag.contains("pupil") || tag.contains("sclera") {
+        return true;
+    }
+    let eye_colors = [
+        "red eyes", "blue eyes", "green eyes", "yellow eyes", "amber eyes",
+        "purple eyes", "pink eyes", "brown eyes", "black eyes", "aqua eyes",
+        "orange eyes", "grey eyes", "gray eyes",
+    ];
+    if eye_colors.contains(&tag) {
+        return true;
+    }
+    if tag.ends_with(" eyes") && tag.split_whitespace().count() == 2 {
+        let first = tag.split_whitespace().next().unwrap();
+        if COLOR_WORDS.contains(&first) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Closed mouth tags.
+pub fn is_closed_mouth_tag(tag: &str) -> bool {
+    matches!(
+        tag,
+        "closed mouth" | ":3" | "3" | "cat mouth" | "pout" | "tight lips"
+    )
+}
+
+/// Mouth anatomy and expressions that force the mouth open.
+pub fn is_closed_mouth_conflict_tag(tag: &str) -> bool {
+    if matches!(
+        tag,
+        "open mouth"
+            | "parted lips"
+            | "slightly open mouth"
+            | "uvula"
+            | "saliva"
+            | "drooling"
+            | "laughing"
+            | "shouting"
+            | "yawning"
+            | "sigh"
+    ) {
+        return true;
+    }
+    if tag.contains("teeth") || tag.contains("fang") || tag.contains("tongue") {
+        return true;
+    }
+    false
+}
+
+/// Eyewear worn on the face.
+pub fn is_face_eyewear_tag(tag: &str) -> bool {
+    matches!(
+        tag,
+        "glasses"
+            | "sunglasses"
+            | "round eyewear"
+            | "rimmed eyewear"
+            | "semi-rimless eyewear"
+            | "under-rim eyewear"
+            | "pince-nez"
+    )
+}
+
+/// Eyewear worn on the head or removed.
+pub fn is_head_or_off_eyewear_tag(tag: &str) -> bool {
+    matches!(
+        tag,
+        "eyewear on head"
+            | "glasses on head"
+            | "sunglasses on head"
+            | "goggles on head"
+            | "holding eyewear"
+            | "removing eyewear"
+            | "eyewear hang"
+    )
+}
+
+/// Petite and short stature tags.
+pub fn is_short_petite_tag(tag: &str) -> bool {
+    matches!(tag, "short" | "petite" | "loli" | "small stature" | "chibi")
+}
+
+/// Tags that stretch proportions or props that hijack framing away from petite stature.
+pub fn is_short_petite_conflict_tag(tag: &str) -> bool {
+    matches!(
+        tag,
+        "tall"
+            | "tall female"
+            | "tall male"
+            | "long legs"
+            | "model body"
+            | "mature female"
+            | "milf"
+            | "statuesque"
+            | "towering"
+            | "high heels"
+            | "stilettos"
+            | "huge weapon"
+            | "giant weapon"
+            | "polearm"
+            | "staff"
+            | "oversized weapon"
+            | "scythe"
+    )
+}
+
+/// Tall and statuesque stature tags.
+pub fn is_tall_statuesque_tag(tag: &str) -> bool {
+    matches!(
+        tag,
+        "tall" | "tall female" | "tall male" | "long legs" | "mature female" | "statuesque"
+    )
+}
+
+/// Childlike and oversized clothing tags that compress head-to-body ratio.
+pub fn is_tall_statuesque_conflict_tag(tag: &str) -> bool {
+    if matches!(
+        tag,
+        "short"
+            | "petite"
+            | "loli"
+            | "chibi"
+            | "big head"
+            | "round face"
+            | "oversized shirt"
+            | "oversized clothes"
+            | "sleeves past fingers"
+            | "sleeves past wrists"
+    ) {
+        return true;
+    }
+    if tag.starts_with("oversized ") {
+        return true;
+    }
+    false
+}
+
+/// 3D and semi-realistic bleed tags that degrade 2D anime checkpoints.
+pub fn is_3d_bleed_tag(tag: &str) -> bool {
+    matches!(
+        tag,
+        "realistic"
+            | "photorealistic"
+            | "3d"
+            | "blender"
+            | "octane render"
+            | "unreal engine"
+            | "unreal engine 5"
+            | "shiny skin"
+            | "oily skin"
+            | "pores"
+            | "subsurface scattering"
+            | "lips"
+            | "nose nostrils"
+    )
+}
+
+/// Dark skin and tanned skin tags.
+pub fn is_dark_skin_tag(tag: &str) -> bool {
+    matches!(
+        tag,
+        "dark skin"
+            | "dark-skinned female"
+            | "dark-skinned male"
+            | "dark-skinned"
+            | "tan"
+            | "brown skin"
+            | "tanned"
+            | "tanned skin"
+    )
+}
+
+/// Pale and bleached skin tags that wash out dark skin tones.
+pub fn is_dark_skin_conflict_tag(tag: &str) -> bool {
+    matches!(
+        tag,
+        "pale skin"
+            | "fair skin"
+            | "white skin"
+            | "porcelain skin"
+            | "albino"
+            | "overexposed"
+            | "bleached"
+            | "pale-skinned"
+            | "fair-skinned"
+            | "light skin"
+    )
+}
+
+/// Caution tags that risk washing out dark skin.
+pub fn is_dark_skin_caution_tag(tag: &str) -> bool {
+    matches!(tag, "tanlines" | "sunburn" | "full-face blush" | "full face blush")
+}
+
+/// Standard breast tiers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BreastTier {
+    FlatChest,
+    SmallBreasts,
+    MediumBreasts,
+    LargeBreasts,
+    HugeBreasts,
+    GiganticBreasts,
+}
+
+pub fn detect_breast_tier(tag: &str) -> Option<BreastTier> {
+    match tag {
+        "flat chest" | "aa cup" | "flat" => Some(BreastTier::FlatChest),
+        "small breasts" | "a cup" | "b cup" | "petite breasts" | "perky breasts" => {
+            Some(BreastTier::SmallBreasts)
+        }
+        "medium breasts" | "c cup" | "d cup" | "average breasts" => {
+            Some(BreastTier::MediumBreasts)
+        }
+        "large breasts" | "e cup" | "f cup" | "full breasts" => {
+            Some(BreastTier::LargeBreasts)
+        }
+        "huge breasts" | "g cup" | "h cup" | "heavy breasts" => {
+            Some(BreastTier::HugeBreasts)
+        }
+        "gigantic breasts"
+        | "hyper breasts"
+        | "enormous breasts"
+        | "massive breasts"
+        | "breasts bigger than head"
+        | "i cup"
+        | "oppai" => Some(BreastTier::GiganticBreasts),
+        _ => None,
+    }
+}
+
+pub fn breast_tier_conflicts(tier: BreastTier, tag: &str) -> Option<(&'static str, ChangeAction)> {
+    match tier {
+        BreastTier::FlatChest => {
+            let is_size = matches!(
+                tag,
+                "breasts"
+                    | "small breasts"
+                    | "medium breasts"
+                    | "large breasts"
+                    | "huge breasts"
+                    | "gigantic breasts"
+                    | "hyper breasts"
+                    | "a cup"
+                    | "b cup"
+                    | "c cup"
+                    | "d cup"
+                    | "e cup"
+                    | "f cup"
+                    | "g cup"
+                    | "h cup"
+                    | "voluptuous"
+                    | "curvy"
+                    | "busty"
+            );
+            if is_size {
+                return Some((
+                    "Removes all larger breast tiers, generic 'breasts' tag bias, and cleavage/physics tags that force breast volume.",
+                    ChangeAction::SizeConflict,
+                ));
+            }
+            let is_hijacker = matches!(
+                tag,
+                "cleavage"
+                    | "deep cleavage"
+                    | "underboob"
+                    | "sideboob"
+                    | "bouncing breasts"
+                    | "jiggling"
+                    | "breast press"
+                    | "boob shelf"
+                    | "breast rest"
+                    | "breasts on table"
+                    | "taut shirt"
+                    | "button gap"
+                    | "popping button"
+                    | "paizuri"
+                    | "hand bra"
+                    | "underbust"
+                    | "framed breasts"
+                    | "strap between breasts"
+                    | "seatbelt between breasts"
+                    | "sagging breasts"
+                    | "hanging breasts"
+                    | "breast curtains"
+                    | "bursting breasts"
+                    | "boob pocket"
+                    | "virgin killer sweater"
+            );
+            if is_hijacker {
+                let action = if matches!(
+                    tag,
+                    "breast press" | "breast rest" | "breasts on table" | "paizuri" | "hand bra"
+                ) {
+                    ChangeAction::PoseConflict
+                } else {
+                    ChangeAction::SizeConflict
+                };
+                return Some((
+                    "Removes all larger breast tiers, generic 'breasts' tag bias, and cleavage/physics tags that force breast volume.",
+                    action,
+                ));
+            }
+        }
+        BreastTier::SmallBreasts => {
+            let is_size = matches!(
+                tag,
+                "flat chest"
+                    | "aa cup"
+                    | "medium breasts"
+                    | "large breasts"
+                    | "huge breasts"
+                    | "gigantic breasts"
+                    | "hyper breasts"
+                    | "c cup"
+                    | "d cup"
+                    | "e cup"
+                    | "f cup"
+                    | "g cup"
+                    | "h cup"
+                    | "voluptuous"
+                    | "busty"
+            );
+            if is_size {
+                return Some((
+                    "Removes flat/larger tiers and heavy-physics tags that inflate small breasts to large.",
+                    ChangeAction::SizeConflict,
+                ));
+            }
+            let is_hijacker = matches!(
+                tag,
+                "cleavage"
+                    | "deep cleavage"
+                    | "underboob"
+                    | "sideboob"
+                    | "cleavage cutout"
+                    | "cleavage peek"
+                    | "boob shelf"
+                    | "breast rest"
+                    | "resting breasts on table"
+                    | "breasts on table"
+                    | "holding breasts"
+                    | "holding own breasts"
+                    | "cupping breasts"
+                    | "breast grab"
+                    | "groping own breasts"
+                    | "grabbing own breasts"
+                    | "breast press"
+                    | "hand bra"
+                    | "button gap"
+                    | "popping button"
+                    | "paizuri"
+                    | "sagging breasts"
+                    | "hanging breasts"
+                    | "heavy breasts"
+                    | "bursting breasts"
+                    | "framed breasts"
+                    | "boob pocket"
+                    | "breasts bigger than head"
+            );
+            if is_hijacker {
+                let action = if is_large_chest_pose_tag(tag)
+                    || matches!(tag, "breast rest" | "breasts on table" | "paizuri" | "holding breasts" | "breast grab")
+                {
+                    ChangeAction::PoseConflict
+                } else {
+                    ChangeAction::SizeConflict
+                };
+                let reason = if action == ChangeAction::PoseConflict {
+                    "Pose physically requires prominent breasts and forces the model to inflate breast size. Removes flat/larger tiers and heavy-physics tags that inflate small breasts to large."
+                } else {
+                    "Removes flat/larger tiers and heavy-physics tags that inflate small breasts to large."
+                };
+                return Some((reason, action));
+            }
+        }
+        BreastTier::MediumBreasts => {
+            let is_size = matches!(
+                tag,
+                "flat chest"
+                    | "aa cup"
+                    | "small breasts"
+                    | "a cup"
+                    | "b cup"
+                    | "large breasts"
+                    | "huge breasts"
+                    | "gigantic breasts"
+                    | "hyper breasts"
+                    | "e cup"
+                    | "f cup"
+                    | "g cup"
+                    | "h cup"
+            );
+            if is_size {
+                return Some((
+                    "Prevents extreme deflation (flat triggers) or extreme inflation (huge/shelf triggers).",
+                    ChangeAction::SizeConflict,
+                ));
+            }
+            let is_hijacker = matches!(
+                tag,
+                "boob shelf"
+                    | "breast rest"
+                    | "breasts on table"
+                    | "popping button"
+                    | "bursting breasts"
+                    | "sagging breasts"
+                    | "heavy breasts"
+                    | "breasts bigger than head"
+                    | "supporting own breasts"
+                    | "visible ribs"
+                    | "pectorals"
+            );
+            if is_hijacker {
+                let action = if matches!(tag, "breast rest" | "breasts on table" | "supporting own breasts") {
+                    ChangeAction::PoseConflict
+                } else {
+                    ChangeAction::SizeConflict
+                };
+                return Some((
+                    "Prevents extreme deflation (flat triggers) or extreme inflation (huge/shelf triggers).",
+                    action,
+                ));
+            }
+        }
+        BreastTier::LargeBreasts => {
+            let is_size = matches!(
+                tag,
+                "flat chest"
+                    | "aa cup"
+                    | "small breasts"
+                    | "a cup"
+                    | "b cup"
+                    | "medium breasts"
+                    | "c cup"
+                    | "d cup"
+                    | "huge breasts"
+                    | "gigantic breasts"
+                    | "hyper breasts"
+            );
+            if is_size {
+                return Some((
+                    "Strips smaller/larger tiers and hyper-scaling tags.",
+                    ChangeAction::SizeConflict,
+                ));
+            }
+            let is_hijacker = matches!(
+                tag,
+                "visible ribs"
+                    | "pectorals"
+                    | "flat"
+                    | "boyish"
+                    | "androgynous"
+                    | "breasts bigger than head"
+                    | "breasts bigger than torso"
+                    | "hyper"
+            );
+            if is_hijacker {
+                return Some((
+                    "Strips smaller/larger tiers and hyper-scaling tags.",
+                    ChangeAction::SizeConflict,
+                ));
+            }
+        }
+        BreastTier::HugeBreasts => {
+            let is_size = matches!(
+                tag,
+                "flat chest"
+                    | "aa cup"
+                    | "small breasts"
+                    | "a cup"
+                    | "b cup"
+                    | "medium breasts"
+                    | "c cup"
+                    | "d cup"
+                    | "large breasts"
+                    | "e cup"
+                    | "f cup"
+            );
+            if is_size {
+                return Some((
+                    "Strips smaller tiers and slender body tags that fight against huge breast rendering.",
+                    ChangeAction::SizeConflict,
+                ));
+            }
+            let is_hijacker = matches!(
+                tag,
+                "visible ribs"
+                    | "pectorals"
+                    | "perky breasts"
+                    | "petite"
+                    | "skinny"
+                    | "slender"
+                    | "boyish"
+                    | "androgynous"
+            );
+            if is_hijacker {
+                return Some((
+                    "Strips smaller tiers and slender body tags that fight against huge breast rendering.",
+                    ChangeAction::SizeConflict,
+                ));
+            }
+        }
+        BreastTier::GiganticBreasts => {
+            let is_size = matches!(
+                tag,
+                "flat chest"
+                    | "aa cup"
+                    | "small breasts"
+                    | "a cup"
+                    | "b cup"
+                    | "medium breasts"
+                    | "c cup"
+                    | "d cup"
+                    | "large breasts"
+                    | "e cup"
+                    | "f cup"
+                    | "proportionate"
+            );
+            if is_size {
+                return Some((
+                    "Strips smaller tiers and proportionate tags that fight against gigantic breast rendering.",
+                    ChangeAction::SizeConflict,
+                ));
+            }
+            let is_hijacker = matches!(
+                tag,
+                "visible ribs"
+                    | "pectorals"
+                    | "perky breasts"
+                    | "petite"
+                    | "skinny"
+                    | "slender"
+                    | "boyish"
+                    | "androgynous"
+            );
+            if is_hijacker {
+                return Some((
+                    "Strips smaller tiers and slender body tags that fight against gigantic breast rendering.",
+                    ChangeAction::SizeConflict,
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// Thick and curvy lower body tags.
+pub fn is_thick_curvy_lower_tag(tag: &str) -> bool {
+    matches!(
+        tag,
+        "thick thighs"
+            | "wide hips"
+            | "broad hips"
+            | "childbearing hips"
+            | "huge hips"
+            | "pronounced hips"
+            | "narrow waist wide hips"
+            | "wide pelvis"
+            | "curvy"
+            | "plump thighs"
+            | "bottom heavy"
+            | "huge ass"
+            | "pear shaped"
+    )
+}
+
+/// Tags incompatible with thick and curvy lower body.
+pub fn is_thick_curvy_conflict(tag: &str) -> bool {
+    matches!(
+        tag,
+        "thin legs"
+            | "slender legs"
+            | "stick legs"
+            | "thigh gap"
+            | "narrow hips"
+            | "boyish hips"
+            | "flat hips"
+            | "straight torso"
+            | "tubular waist"
+            | "tubular body"
+            | "flat ass"
+            | "small ass"
+            | "skinny"
+            | "lanky"
+            | "frail"
+    )
+}
+
+/// Slender and petite lower body tags.
+pub fn is_slender_petite_lower_tag(tag: &str) -> bool {
+    matches!(
+        tag,
+        "slender" | "skinny" | "thin legs" | "thigh gap" | "narrow hips" | "petite"
+    )
+}
+
+/// Tags incompatible with slender and petite lower body.
+pub fn is_slender_petite_conflict(tag: &str) -> bool {
+    matches!(
+        tag,
+        "thick thighs"
+            | "wide hips"
+            | "broad hips"
+            | "childbearing hips"
+            | "huge hips"
+            | "pronounced hips"
+            | "narrow waist wide hips"
+            | "curvy"
+            | "voluptuous"
+            | "plump"
+            | "chubby"
+            | "huge ass"
+            | "bottom heavy"
+            | "pear shaped"
+            | "skindentation"
+            | "thigh squish"
+            | "muffin top"
+            | "stomach bulge"
+            | "belly"
+    )
+}
+
+/// Muscular and toned physique tags.
+pub fn is_muscular_toned_tag(tag: &str) -> bool {
+    matches!(
+        tag,
+        "abs" | "toned" | "muscular" | "muscular female" | "six pack" | "athletic"
+    )
+}
+
+/// Tags incompatible with muscular and toned physique.
+pub fn is_muscular_conflict(tag: &str) -> bool {
+    matches!(
+        tag,
+        "chubby"
+            | "plump"
+            | "soft body"
+            | "belly"
+            | "stomach bulge"
+            | "pudge"
+            | "muffin top"
+            | "love handles"
+            | "flabby"
+            | "frail"
+            | "skinny"
+    )
+}
+
+/// Soft and chubby body tags.
+pub fn is_soft_chubby_tag(tag: &str) -> bool {
+    matches!(
+        tag,
+        "chubby" | "plump" | "soft body" | "belly" | "stomach bulge" | "muffin top"
+    )
+}
+
+/// Tags incompatible with soft and chubby body.
+pub fn is_soft_chubby_conflict(tag: &str) -> bool {
+    matches!(
+        tag,
+        "abs"
+            | "toned"
+            | "muscular"
+            | "six pack"
+            | "obliques"
+            | "narrow waist"
+            | "slim waist"
+            | "flat stomach"
+            | "skinny"
+            | "slender"
+            | "visible ribs"
+    )
+}
+
+/// Proportion tiers for chain tag recommendations, negative locking, and prompt reinforcement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProportionTier {
+    FlatChest,
+    SmallBreasts,
+    MediumBreasts,
+    LargeBreasts,
+    HugeBreasts,
+    GiganticBreasts,
+    ThickThighsAndHips,
+    MuscularFemale,
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct ProportionRecommendations {
+    pub tier: ProportionTier,
+    pub primary_name: &'static str,
+    pub core_reinforcers: &'static [&'static str],
+    pub clothing_interaction: &'static [&'static str],
+    pub pose_and_physics: &'static [&'static str],
+    pub auto_negative_lock: &'static [&'static str],
+}
+
+pub fn get_proportion_recommendations(tier: ProportionTier) -> &'static ProportionRecommendations {
+    match tier {
+        ProportionTier::FlatChest => &ProportionRecommendations {
+            tier: ProportionTier::FlatChest,
+            primary_name: "flat_chest",
+            core_reinforcers: &["aa_cup", "small_underbust", "slender_torso"],
+            clothing_interaction: &[
+                "loose_shirt",
+                "baggy_clothes",
+                "flat_chest_grab",
+                "sarashi",
+                "bandeau",
+                "open_shirt",
+                "oversized_shirt",
+            ],
+            pose_and_physics: &[
+                "collarbone",
+                "visible_ribs",
+                "pectorals",
+                "arms_crossed_over_chest",
+            ],
+            auto_negative_lock: &[
+                "breasts",
+                "cleavage",
+                "medium_breasts",
+                "large_breasts",
+                "underboob",
+                "sideboob",
+                "boob_shadow",
+            ],
+        },
+        ProportionTier::SmallBreasts => &ProportionRecommendations {
+            tier: ProportionTier::SmallBreasts,
+            primary_name: "small_breasts",
+            core_reinforcers: &["a_cup", "b_cup", "perky_breasts", "petite_breasts"],
+            clothing_interaction: &[
+                "tight_shirt",
+                "crop_top",
+                "sports_bra",
+                "micro_bikini",
+                "slight_cleavage",
+                "unbuttoned_shirt",
+            ],
+            pose_and_physics: &["collarbone", "slender", "arched_back"],
+            auto_negative_lock: &[
+                "flat_chest",
+                "large_breasts",
+                "huge_breasts",
+                "deep_cleavage",
+                "sagging_breasts",
+                "boob_shelf",
+            ],
+        },
+        ProportionTier::MediumBreasts => &ProportionRecommendations {
+            tier: ProportionTier::MediumBreasts,
+            primary_name: "medium_breasts",
+            core_reinforcers: &["c_cup", "d_cup", "proportionate_body", "full_breasts"],
+            clothing_interaction: &[
+                "cleavage",
+                "fitted_shirt",
+                "sweater",
+                "bikini",
+                "cleavage_cutout",
+            ],
+            pose_and_physics: &["hourglass_figure", "perky_breasts", "bouncing_breasts"],
+            auto_negative_lock: &[
+                "flat_chest",
+                "small_breasts",
+                "huge_breasts",
+                "gigantic_breasts",
+                "hyper_breasts",
+            ],
+        },
+        ProportionTier::LargeBreasts => &ProportionRecommendations {
+            tier: ProportionTier::LargeBreasts,
+            primary_name: "large_breasts",
+            core_reinforcers: &["e_cup", "f_cup", "curvy", "voluptuous", "deep_cleavage"],
+            clothing_interaction: &[
+                "taut_shirt",
+                "taut_clothes",
+                "button_gap",
+                "cleavage_cutout",
+                "underboob",
+                "sideboob",
+                "virgin_killer_sweater",
+                "keyhole_turtleneck",
+                "strap_between_breasts",
+                "seatbelt_between_breasts",
+                "boob_pocket",
+            ],
+            pose_and_physics: &[
+                "bouncing_breasts",
+                "jiggling",
+                "arms_crossed_under_breasts",
+                "framed_breasts",
+                "breast_press",
+                "leaning_forward",
+            ],
+            auto_negative_lock: &[
+                "flat_chest",
+                "small_breasts",
+                "medium_breasts",
+                "petite",
+            ],
+        },
+        ProportionTier::HugeBreasts => &ProportionRecommendations {
+            tier: ProportionTier::HugeBreasts,
+            primary_name: "huge_breasts",
+            core_reinforcers: &["g_cup", "h_cup", "heavy_breasts", "voluptuous", "deep_cleavage"],
+            clothing_interaction: &[
+                "boob_shelf",
+                "taut_clothes",
+                "button_gap",
+                "popping_button",
+                "impossible_shirt",
+                "vacuum_shirt",
+                "underboob_cutout",
+                "overflowing_breasts",
+                "cropped_sweater",
+                "micro_bikini",
+            ],
+            pose_and_physics: &[
+                "sagging_breasts",
+                "hanging_breasts",
+                "breast_rest",
+                "breasts_on_table",
+                "holding_own_breasts",
+                "arms_under_breasts",
+                "breast_curtains",
+                "heavy_breathing",
+            ],
+            auto_negative_lock: &[
+                "flat_chest",
+                "small_breasts",
+                "medium_breasts",
+                "perky_breasts",
+                "slender",
+                "skinny",
+            ],
+        },
+        ProportionTier::GiganticBreasts => &ProportionRecommendations {
+            tier: ProportionTier::GiganticBreasts,
+            primary_name: "gigantic_breasts",
+            core_reinforcers: &[
+                "hyper_breasts",
+                "massive_breasts",
+                "enormous_breasts",
+                "breasts_bigger_than_head",
+                "voluptuous",
+            ],
+            clothing_interaction: &[
+                "bursting_breasts",
+                "tearing_clothes",
+                "popping_button",
+                "button_strain",
+                "impossible_clothes",
+                "boob_shelf",
+                "underboob",
+                "sideboob",
+                "unbuttoned_shirt",
+                "open_clothes",
+                "string_bikini",
+            ],
+            pose_and_physics: &[
+                "supporting_own_breasts",
+                "two-handed_breast_hold",
+                "breasts_on_table",
+                "breast_rest",
+                "sagging_breasts",
+                "heavy_breasts",
+                "veiny_breasts",
+                "shiny_skin",
+                "back_pain",
+                "leaning_forward",
+            ],
+            auto_negative_lock: &[
+                "flat_chest",
+                "small_breasts",
+                "medium_breasts",
+                "large_breasts",
+                "proportionate",
+                "petite",
+                "skinny",
+            ],
+        },
+        ProportionTier::ThickThighsAndHips => &ProportionRecommendations {
+            tier: ProportionTier::ThickThighsAndHips,
+            primary_name: "thick_thighs_and_hips",
+            core_reinforcers: &[
+                "thick_thighs",
+                "wide_hips",
+                "broad_hips",
+                "narrow_waist_wide_hips",
+                "pronounced_hips",
+                "hourglass_figure",
+                "plump_thighs",
+                "curvy",
+                "bottom_heavy",
+                "pear_shaped",
+            ],
+            clothing_interaction: &[
+                "skindentation",
+                "thighhighs",
+                "garter_straps",
+                "thigh_strap",
+                "tight_shorts",
+                "denim_shorts",
+                "pelvic_curtain",
+                "hip_vent",
+                "side_slit",
+                "high_side_slit",
+                "highleg_panties",
+                "highleg_bikini",
+                "highleg_leotard",
+                "low-rise_shorts",
+                "low-rise_pants",
+                "whale_tail",
+                "hip_chain",
+                "waist_chain",
+                "bodycon_dress",
+                "pencil_skirt",
+                "taut_skirt",
+                "bike_shorts",
+            ],
+            pose_and_physics: &[
+                "hips_cocked",
+                "hip_sway",
+                "contrapposto",
+                "weight_on_one_leg",
+                "hands_on_hips",
+                "thigh_squish",
+                "sitting",
+                "crossed_legs",
+                "wide_stance",
+                "hips_pushed_back",
+            ],
+            auto_negative_lock: &[
+                "thin_legs",
+                "stick_legs",
+                "thigh_gap",
+                "narrow_hips",
+                "boyish_hips",
+                "flat_hips",
+                "straight_torso",
+                "tubular_body",
+                "skinny",
+                "slender_legs",
+                "flat_ass",
+            ],
+        },
+        ProportionTier::MuscularFemale => &ProportionRecommendations {
+            tier: ProportionTier::MuscularFemale,
+            primary_name: "muscular_female",
+            core_reinforcers: &[
+                "muscular_female",
+                "abs",
+                "toned",
+                "athletic",
+                "defined_muscles",
+                "six_pack",
+            ],
+            clothing_interaction: &[
+                "sports_bra",
+                "crop_top",
+                "midriff",
+                "tank_top",
+                "gym_shorts",
+                "spats",
+                "boxing_gloves",
+                "hand_wraps",
+            ],
+            pose_and_physics: &[
+                "flexing",
+                "biceps",
+                "obliques",
+                "broad_shoulders",
+                "sweat",
+                "shiny_skin",
+                "fighting_stance",
+                "confident_smile",
+            ],
+            auto_negative_lock: &[
+                "chubby",
+                "plump",
+                "soft_body",
+                "flabby",
+                "frail",
+                "skinny",
+                "narrow_shoulders",
+            ],
+        },
+    }
+}
+
+/// Detects if a tag corresponds to a proportion tier.
+pub fn detect_proportion_tier(tag: &str) -> Option<ProportionTier> {
+    match tag {
+        "flat chest" | "aa cup" | "flat" | "small underbust" | "slender torso" => {
+            Some(ProportionTier::FlatChest)
+        }
+        "small breasts" | "a cup" | "b cup" | "petite breasts" | "perky breasts" => {
+            Some(ProportionTier::SmallBreasts)
+        }
+        "medium breasts"
+        | "c cup"
+        | "d cup"
+        | "average breasts"
+        | "proportionate body"
+        | "full breasts" => Some(ProportionTier::MediumBreasts),
+        "large breasts" | "e cup" | "f cup" => Some(ProportionTier::LargeBreasts),
+        "huge breasts" | "g cup" | "h cup" | "heavy breasts" => Some(ProportionTier::HugeBreasts),
+        "gigantic breasts"
+        | "hyper breasts"
+        | "massive breasts"
+        | "enormous breasts"
+        | "breasts bigger than head" => Some(ProportionTier::GiganticBreasts),
+        "thick thighs"
+        | "wide hips"
+        | "broad hips"
+        | "childbearing hips"
+        | "huge hips"
+        | "pronounced hips"
+        | "narrow waist wide hips"
+        | "wide pelvis"
+        | "plump thighs"
+        | "bottom heavy"
+        | "pear shaped" => Some(ProportionTier::ThickThighsAndHips),
+        "muscular female" | "defined muscles" | "six pack" | "abs" | "toned" | "athletic" => {
+            Some(ProportionTier::MuscularFemale)
+        }
+        _ => None,
+    }
+}
+
+/// Detects all proportion tiers present in a list of tokens.
+pub fn detect_all_proportion_tiers(tokens: &[PromptToken]) -> Vec<(ProportionTier, PromptToken)> {
+    let mut detected = Vec::new();
+    let mut seen_breast = false;
+    let mut seen_thighs = false;
+    let mut seen_muscular = false;
+
+    for t in tokens {
+        if let Some(tier) = detect_proportion_tier(&t.normalized) {
+            match tier {
+                ProportionTier::FlatChest
+                | ProportionTier::SmallBreasts
+                | ProportionTier::MediumBreasts
+                | ProportionTier::LargeBreasts
+                | ProportionTier::HugeBreasts
+                | ProportionTier::GiganticBreasts => {
+                    if !seen_breast {
+                        seen_breast = true;
+                        detected.push((tier, t.clone()));
+                    }
+                }
+                ProportionTier::ThickThighsAndHips => {
+                    if !seen_thighs {
+                        seen_thighs = true;
+                        detected.push((tier, t.clone()));
+                    }
+                }
+                ProportionTier::MuscularFemale => {
+                    if !seen_muscular {
+                        seen_muscular = true;
+                        detected.push((tier, t.clone()));
+                    }
+                }
+            }
+        }
+    }
+    detected
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
+pub struct ProportionLockResult {
+    pub final_positive_tags: Vec<String>,
+    pub removed_conflicts: Vec<String>,
+    pub recommended_clothing: Vec<String>,
+    pub recommended_physics_poses: Vec<String>,
+    pub auto_negative_additions: Vec<String>,
+}
+
+/// Returns checkpoint-adaptive weight for proportion tags:
+/// - Pony V6: clamped to 1.15 to avoid burning and color shift.
+/// - Illustrious: clamped to 1.20 for optimal Danbooru cross-attention.
+/// - SD1.5 / Anima: up to 1.25.
+/// - Flux: 1.0 (natural language models don't use numeric multipliers).
+#[allow(dead_code)]
+pub fn adaptive_weight_for_checkpoint(checkpoint: CheckpointProfile, requested_weight: f32) -> f32 {
+    match checkpoint {
+        CheckpointProfile::PonyV6 => requested_weight.clamp(1.0, 1.15),
+        CheckpointProfile::Illustrious => requested_weight.clamp(1.0, 1.20),
+        CheckpointProfile::Sd15 | CheckpointProfile::Anima | CheckpointProfile::Sdxl => requested_weight.clamp(1.0, 1.25),
+        CheckpointProfile::Flux => 1.0,
+    }
+}
+
+#[allow(dead_code)]
+pub fn apply_proportion_lock_with_checkpoint(
+    current_tags: &[String],
+    selected_tier: ProportionTier,
+    auto_inject_core: bool,
+    weight_multiplier: f32,
+    checkpoint: CheckpointProfile,
+) -> ProportionLockResult {
+    let adaptive_weight = adaptive_weight_for_checkpoint(checkpoint, weight_multiplier);
+    apply_proportion_lock(current_tags, selected_tier, auto_inject_core, adaptive_weight)
+}
+
+/// Applies proportion locking:
+/// 1. Strips conflicting size/hijacker tags.
+/// 2. Locks in the primary tag (optionally with prompt weighting).
+/// 3. Returns categorized recommendations and auto-negative tags.
+#[allow(dead_code)]
+pub fn apply_proportion_lock(
+    current_tags: &[String],
+    selected_tier: ProportionTier,
+    auto_inject_core: bool,
+    weight_multiplier: f32,
+) -> ProportionLockResult {
+    let rec = get_proportion_recommendations(selected_tier);
+    let mut cleaned_tags = Vec::new();
+    let mut removed_conflicts = Vec::new();
+
+    for tag_str in current_tags {
+        let norm = tag_str.trim().to_lowercase().replace('_', " ");
+        let is_conflict = match selected_tier {
+            ProportionTier::FlatChest
+            | ProportionTier::SmallBreasts
+            | ProportionTier::MediumBreasts
+            | ProportionTier::LargeBreasts
+            | ProportionTier::HugeBreasts
+            | ProportionTier::GiganticBreasts => {
+                let breast_tier = match selected_tier {
+                    ProportionTier::FlatChest => BreastTier::FlatChest,
+                    ProportionTier::SmallBreasts => BreastTier::SmallBreasts,
+                    ProportionTier::MediumBreasts => BreastTier::MediumBreasts,
+                    ProportionTier::LargeBreasts => BreastTier::LargeBreasts,
+                    ProportionTier::HugeBreasts => BreastTier::HugeBreasts,
+                    ProportionTier::GiganticBreasts => BreastTier::GiganticBreasts,
+                    _ => unreachable!(),
+                };
+                breast_tier_conflicts(breast_tier, &norm).is_some()
+            }
+            ProportionTier::ThickThighsAndHips => is_thick_curvy_conflict(&norm),
+            ProportionTier::MuscularFemale => is_muscular_conflict(&norm),
+        };
+
+        if is_conflict {
+            removed_conflicts.push(tag_str.clone());
+        } else {
+            cleaned_tags.push(tag_str.clone());
+        }
+    }
+
+    let primary_clean = rec.primary_name.replace('_', " ");
+    let locked_tag = if weight_multiplier > 1.0 {
+        format!("({}:{:.2})", primary_clean, weight_multiplier)
+    } else {
+        primary_clean.clone()
+    };
+
+    let already_has_primary = cleaned_tags.iter().any(|t| {
+        let n = t.trim().to_lowercase().replace('_', " ");
+        n == primary_clean || n.contains(&primary_clean)
+    });
+
+    if weight_multiplier > 1.0 {
+        if let Some(pos) = cleaned_tags.iter().position(|t| {
+            let n = t.trim().to_lowercase().replace('_', " ");
+            n == primary_clean || n.starts_with(&format!("({primary_clean}:"))
+        }) {
+            cleaned_tags[pos] = locked_tag;
+        } else {
+            cleaned_tags.insert(0, locked_tag);
+        }
+    } else if !already_has_primary {
+        cleaned_tags.insert(0, locked_tag);
+    }
+
+    if auto_inject_core {
+        for core in rec.core_reinforcers {
+            let core_clean = core.replace('_', " ");
+            let has_core = cleaned_tags.iter().any(|t| {
+                let n = t.trim().to_lowercase().replace('_', " ");
+                n == core_clean || n.contains(&core_clean)
+            });
+            if !has_core {
+                cleaned_tags.push(core_clean);
+            }
+        }
+    }
+
+    ProportionLockResult {
+        final_positive_tags: cleaned_tags,
+        removed_conflicts,
+        recommended_clothing: rec.clothing_interaction.iter().map(|s| s.to_string()).collect(),
+        recommended_physics_poses: rec.pose_and_physics.iter().map(|s| s.to_string()).collect(),
+        auto_negative_additions: rec.auto_negative_lock.iter().map(|s| s.to_string()).collect(),
+    }
+}
+
 /// Checks whether a body-part token triggers a camera-pull conflict with the active view
 /// (e.g., `ass` or `butt` inside `Upper Body` or `Front View`), and returns:
 /// `Some((reason, framing_safe_body_alternative, camera_framing_alternative))`
 pub fn check_framing_safe_body_swap(
     normalized_tag: &str,
     effective_view: TargetView,
+    has_small_chest: bool,
 ) -> Option<(&'static str, &'static str, &'static str)> {
     let is_rear_lower = matches!(
         normalized_tag,
@@ -172,6 +1573,62 @@ pub fn check_framing_safe_body_swap(
             | "glutes"
             | "buttocks"
             | "ass focus"
+            | "butt crack"
+            | "back dimples"
+            | "sacral dimples"
+            | "tailplug"
+            | "buttplug"
+            | "back bow"
+    );
+
+    let is_shoulder_blades = normalized_tag.contains("shoulder blade")
+        || normalized_tag.contains("scapula")
+        || normalized_tag == "scapulae";
+
+    let is_rear_upper = is_shoulder_blades
+        || normalized_tag == "back"
+        || matches!(
+            normalized_tag,
+            "bare back"
+                | "back cutout"
+                | "backless"
+                | "backless dress"
+                | "backless outfit"
+                | "muscular back"
+                | "spine"
+                | "nape"
+                | "back tattoo"
+                | "reverse bunnysuit"
+                | "sideboob"
+        );
+
+    let is_front_chest = matches!(
+        normalized_tag,
+        "cleavage"
+            | "deep cleavage"
+            | "front cleavage"
+            | "underboob"
+            | "collarbone"
+            | "chest"
+            | "breasts"
+            | "large breasts"
+            | "medium breasts"
+            | "small breasts"
+            | "flat chest"
+            | "huge breasts"
+            | "gigantic breasts"
+            | "pectorals"
+    );
+
+    let is_front_midriff_lower = matches!(
+        normalized_tag,
+        "navel"
+            | "stomach"
+            | "midriff"
+            | "abs"
+            | "muscular abs"
+            | "cameltoe"
+            | "bulge"
     );
 
     let is_lower_legs_feet = matches!(
@@ -182,68 +1639,154 @@ pub fn check_framing_safe_body_swap(
             | "soles"
             | "ankles"
             | "calves"
+            | "shins"
             | "knees"
             | "thighs"
             | "thick thighs"
+            | "thigh gap"
             | "legs"
             | "long legs"
+            | "hips"
+            | "wide hips"
     );
 
-    let is_front_chest = matches!(
+    let is_footwear_legwear = matches!(
         normalized_tag,
-        "cleavage" | "deep cleavage" | "front cleavage" | "pectorals" | "abs" | "navel" | "stomach"
+        "shoes"
+            | "boots"
+            | "high heels"
+            | "sneakers"
+            | "sandals"
+            | "footwear"
+            | "anklet"
+            | "socks"
+            | "kneehighs"
+            | "thighhighs"
+            | "pantyhose"
+            | "legwear"
+    );
+
+    let is_lower_clothing = matches!(
+        normalized_tag,
+        "panties" | "skirt" | "shorts" | "pants"
+    );
+
+    let is_lower_or_full_action = matches!(
+        normalized_tag,
+        "standing" | "walking" | "running" | "sitting" | "squatting"
+    );
+
+    let is_micro_face = matches!(
+        normalized_tag,
+        "detailed eyes"
+            | "pupils"
+            | "slit pupils"
+            | "sclera"
+            | "lip gloss"
+            | "uvula"
+            | "mole under eye"
     );
 
     match effective_view {
         TargetView::UpperBody => {
             if is_rear_lower {
+                if has_small_chest {
+                    return Some((
+                        "Direct 'ass/butt' tags pull ComfyUI's camera downward and backward, breaking 'upper body' framing and twisting anatomy.",
+                        "slender, narrow waist, athletic build, arched back",
+                        "cowboy shot, from behind, looking back",
+                    ));
+                }
                 return Some((
                     "Direct 'ass/butt' tags pull ComfyUI's camera downward and backward, breaking 'upper body' framing and twisting anatomy.",
                     "curvy, voluptuous, hourglass figure, narrow waist, arched back",
                     "cowboy shot, from behind, looking back",
                 ));
             }
-            if matches!(normalized_tag, "feet" | "barefoot" | "toes" | "soles" | "ankles" | "calves") {
+            if is_lower_legs_feet
+                || is_footwear_legwear
+                || matches!(normalized_tag, "standing" | "walking" | "running" | "squatting")
+            {
                 return Some((
-                    "Lower-leg/foot tags force ComfyUI to zoom out to full body, breaking 'upper body' framing.",
+                    "Forces framing below the waist/hips.",
                     "slender build, graceful posture, poised stance",
                     "full body, standing",
                 ));
             }
         }
         TargetView::CloseUpPortrait => {
-            if is_rear_lower {
+            if is_rear_lower
+                || is_lower_legs_feet
+                || is_footwear_legwear
+                || is_lower_clothing
+                || is_lower_or_full_action
+                || is_front_midriff_lower
+                || is_shoulder_blades
+            {
                 return Some((
-                    "'ass/butt' pulls the camera out of 'portrait / close-up' into a lower-body rear shot.",
-                    "curvy figure, alluring expression, glamorous",
-                    "cowboy shot, from behind, looking back",
-                ));
-            }
-            if is_lower_legs_feet || normalized_tag == "abs" || normalized_tag == "muscular abs" {
-                return Some((
-                    "Mid/lower-body anatomy tags ('abs/thighs/legs/feet') pull the camera out of a close-up portrait.",
-                    "toned shoulders, defined collarbone, athletic build",
-                    "full body",
+                    "Pulls camera down/back to render lower body or full-body actions.",
+                    "toned shoulders, defined collarbone, expressive face, styled hair",
+                    "full body, cowboy shot",
                 ));
             }
         }
         TargetView::FrontView => {
             if is_rear_lower {
+                if has_small_chest {
+                    return Some((
+                        "Forces rear or side rotation to render back/side anatomy.",
+                        "narrow waist, slender build, athletic stance",
+                        "from behind, looking back",
+                    ));
+                }
                 return Some((
-                    "Direct 'ass/butt' tags force the character to turn their back to the camera, conflicting with 'front view'.",
+                    "Forces rear or side rotation to render back/side anatomy.",
                     "wide hips, curvy, hourglass figure, thick thighs",
                     "from behind, looking back",
+                ));
+            }
+            if is_rear_upper {
+                let alt = if matches!(normalized_tag, "backless dress" | "backless outfit" | "reverse bunnysuit") {
+                    "cleavage cutout, plunge dress, front cutout"
+                } else {
+                    "defined collarbone, toned shoulders, clavicle"
+                };
+                return Some((
+                    "Forces rear or side rotation to render back/side anatomy.",
+                    alt,
+                    "from behind, looking back over shoulder",
                 ));
             }
         }
         TargetView::FromBehind => {
             if is_front_chest {
+                if has_small_chest {
+                    return Some((
+                        "Forces torso to rotate forward to render front anatomy.",
+                        "small breasts from behind, slender silhouette, arched back",
+                        "front view, straight-on",
+                    ));
+                }
                 return Some((
-                    "Front torso tags ('cleavage/abs/navel') pull the camera to the front, fighting 'from behind / back view'.",
-                    "sideboob, breasts from behind, curvy silhouette, arched back, looking back",
-                    "front view, three-quarter view",
+                    "Forces torso to rotate forward to render front anatomy.",
+                    "sideboob, breasts from behind, curvy silhouette, arched back",
+                    "front view, straight-on",
                 ));
             }
+            if is_front_midriff_lower {
+                return Some((
+                    "Forces torso to rotate forward to render front anatomy.",
+                    "toned back, curvy hips, back dimples, defined spine, rear silhouette",
+                    "front view, straight-on",
+                ));
+            }
+        }
+        TargetView::FullBody if is_micro_face => {
+            return Some((
+                "Forces tight facial crop to resolve micro-details.",
+                "expressive face, clear facial features",
+                "portrait, close-up, face focus",
+            ));
         }
         _ => {}
     }
@@ -313,9 +1856,12 @@ pub fn check_view_positioning_conflict(
             }
         }
         TargetView::UpperBody => {
-            if matches!(normalized_tag, "full body" | "wide shot" | "extreme close-up" | "headshot") {
+            if matches!(
+                normalized_tag,
+                "full body" | "lower body" | "wide shot" | "extreme close-up" | "headshot"
+            ) {
                 return Some((
-                    "Conflicts with the selected 'Upper Body / Cowboy Shot' framing.",
+                    "Forces framing below the waist/hips.",
                     "upper body",
                 ));
             }
@@ -326,23 +1872,34 @@ pub fn check_view_positioning_conflict(
                 "full body" | "cowboy shot" | "wide shot" | "lower body" | "feetfocus"
             ) {
                 return Some((
-                    "Zooms the camera out and conflicts with 'Close-Up / Portrait' framing.",
+                    "Pulls camera down/back to render lower body or full-body actions.",
                     "portrait, close-up, face focus",
                 ));
             }
         }
         TargetView::FrontView => {
-            if matches!(normalized_tag, "from behind" | "back view" | "rear view") {
+            if matches!(
+                normalized_tag,
+                "from behind"
+                    | "back view"
+                    | "rear view"
+                    | "back focus"
+                    | "over the shoulder"
+                    | "looking back"
+                    | "profile"
+                    | "from side"
+                    | "side view"
+            ) {
                 return Some((
-                    "Rotates the subject away from the camera, conflicting with 'Front View'.",
+                    "Forces rear or side rotation to render back/side anatomy.",
                     "front view, looking at viewer",
                 ));
             }
         }
         TargetView::FromBehind => {
-            if matches!(normalized_tag, "front view" | "straight-on") {
+            if matches!(normalized_tag, "front view" | "straight-on" | "straight on") {
                 return Some((
-                    "Forces a front-facing angle, conflicting with 'From Behind / Back View'.",
+                    "Forces torso to rotate forward to render front anatomy.",
                     "from behind, back view, looking back",
                 ));
             }
@@ -358,16 +1915,126 @@ pub fn check_view_positioning_conflict(
         TargetView::FullBody => {
             if matches!(
                 normalized_tag,
-                "upper body" | "cowboy shot" | "portrait" | "close-up" | "close up" | "cropped"
+                "upper body"
+                    | "cowboy shot"
+                    | "portrait"
+                    | "close-up"
+                    | "close up"
+                    | "headshot"
+                    | "cropped"
+                    | "face focus"
+                    | "eye focus"
             ) {
                 return Some((
-                    "Crops out the lower body, conflicting with 'Full Body' framing.",
+                    "Forces tight facial crop to resolve micro-details.",
                     "full body, standing",
                 ));
             }
         }
         TargetView::None => {}
     }
+    None
+}
+
+/// Checks if an extreme high/low camera pitch tag conflicts with eye-level camera framing.
+pub fn check_eye_level_conflict(
+    normalized_tag: &str,
+    is_eye_level_active: bool,
+) -> Option<(&'static str, &'static str, &'static str)> {
+    if !is_eye_level_active {
+        return None;
+    }
+    let is_extreme_pitch = matches!(
+        normalized_tag,
+        "from below"
+            | "upskirt"
+            | "pantyshot"
+            | "underboob"
+            | "undershot"
+            | "soles"
+            | "stepping on viewer"
+            | "from above"
+            | "downblouse"
+            | "top of head"
+            | "low angle"
+            | "high angle"
+            | "bird's-eye view"
+            | "worm's-eye view"
+    );
+    if is_extreme_pitch {
+        Some((
+            "Hijacks camera pitch (Z-axis) to extreme high or low angles.",
+            "",
+            "straight-on, eye level",
+        ))
+    } else {
+        None
+    }
+}
+
+/// Checks if an arm gesture or grounded posture directly conflicts with an active resting/upright pose.
+pub fn check_pose_conflict(
+    normalized_tag: &str,
+    is_arms_down_or_hips: bool,
+    is_standing_upright: bool,
+) -> Option<(&'static str, &'static str, &'static str)> {
+    if is_arms_down_or_hips {
+        let is_gesture = matches!(
+            normalized_tag,
+            "armpits"
+                | "bare armpits"
+                | "armpit crease"
+                | "armpit hair"
+                | "arms up"
+                | "hands up"
+                | "stretching"
+                | "tying hair"
+                | "arms behind head"
+                | "hands behind head"
+                | "reaching towards viewer"
+                | "peace sign"
+                | "waving"
+                | "salute"
+        );
+        if is_gesture {
+            return Some((
+                "Armpits and gesture tags force arms to lift or break resting position.",
+                "",
+                "",
+            ));
+        }
+    }
+
+    if is_standing_upright {
+        let is_grounded = matches!(
+            normalized_tag,
+            "sitting"
+                | "seiza"
+                | "wariza"
+                | "indian style"
+                | "hugging knees"
+                | "lying"
+                | "on back"
+                | "on stomach"
+                | "on side"
+                | "all fours"
+                | "top-down bottom-up"
+                | "bent over"
+                | "leaning forward"
+                | "squatting"
+                | "crouching"
+                | "kneeling"
+                | "soles"
+        );
+        if is_grounded {
+            return Some((
+                "Forces grounded, seated, or bent spine postures.",
+                "",
+                "",
+            ));
+        }
+    }
+
     None
 }
 
@@ -421,6 +2088,46 @@ pub fn check_pinned_visibility_conflict(
 pub fn analyze_with_rules(tokens: &[PromptToken], config: &ScanConfig) -> RuleAnalysisResult {
     let effective_view = detect_effective_view(tokens, config.target_view);
 
+    let angle_label = crate::profiles::CAMERA_ANGLES
+        .get(config.camera_angle)
+        .map(|(l, _)| *l)
+        .unwrap_or("");
+    let is_eye_level_active = angle_label.starts_with("Eye level")
+        || tokens.iter().any(|t| t.normalized == "eye level");
+
+    let pose_label = crate::profiles::POSES
+        .get(config.pose)
+        .map(|(l, _)| *l)
+        .unwrap_or("");
+    let is_pose_standing_upright = pose_label.starts_with("Standing")
+        || pose_label.starts_with("Contrapposto")
+        || pose_label.starts_with("Hands on hips")
+        || pose_label.starts_with("Arms crossed");
+    let is_pose_arms_down_or_hips = pose_label.starts_with("Hands on hips")
+        || pose_label.starts_with("Arms crossed");
+
+    let prompt_has_standing = tokens.iter().any(|t| {
+        matches!(
+            t.normalized.as_str(),
+            "standing" | "straight posture" | "standing upright"
+        )
+    });
+    let prompt_has_arms_down_or_hips = tokens.iter().any(|t| {
+        matches!(
+            t.normalized.as_str(),
+            "arms at sides"
+                | "hands on hips"
+                | "hands on own hips"
+                | "hands in pockets"
+                | "crossed arms"
+        )
+    });
+
+    let standing_upright_active = is_pose_standing_upright
+        || (config.pose == 0 && prompt_has_standing);
+    let arms_down_or_hips_active = is_pose_arms_down_or_hips
+        || (config.pose == 0 && prompt_has_arms_down_or_hips);
+
     // Parse user's pinned emphasis parts
     // Pinned parts only boost tags already in the prompt; they are never added.
     let pinned_norms: Vec<String> = config
@@ -442,6 +2149,7 @@ pub fn analyze_with_rules(tokens: &[PromptToken], config: &ScanConfig) -> RuleAn
     let mut seen_normalized: HashSet<String> = HashSet::new();
     let mut processed_tokens: Vec<PromptToken> = Vec::new();
     let mut added_quality_replacement = false;
+    let has_small_chest = tokens.iter().any(|t| is_small_chest_tag(&t.normalized));
 
     for token in tokens {
         let mut tok = token.clone();
@@ -469,7 +2177,7 @@ pub fn analyze_with_rules(tokens: &[PromptToken], config: &ScanConfig) -> RuleAn
 
         // 2. Check Framing-Safe Body-Part Swap (e.g. `ass` + `Upper Body` -> `curvy, voluptuous, hourglass figure...`)
         if let Some((reason, body_alt, framing_alt)) =
-            check_framing_safe_body_swap(&tok.normalized, effective_view)
+            check_framing_safe_body_swap(&tok.normalized, effective_view, has_small_chest)
         {
             changes.push(PromptChange {
                 id: next_change_id,
@@ -541,6 +2249,46 @@ pub fn analyze_with_rules(tokens: &[PromptToken], config: &ScanConfig) -> RuleAn
             }
         }
 
+        // 3.1 Check Eye-Level Pitch Conflict (extreme high/low pitch vs eye level)
+        if let Some((reason, alt, framing_alt)) = check_eye_level_conflict(&tok.normalized, is_eye_level_active) {
+            changes.push(PromptChange {
+                id: next_change_id,
+                original: tok.raw.clone(),
+                action: ChangeAction::PositioningConflict,
+                reason: reason.to_string(),
+                suggested_alternative: alt.to_string(),
+                framing_alternative: framing_alt.to_string(),
+                mode: if config.resolve_conflicts_enabled { 0 } else { 2 },
+            });
+            next_change_id += 1;
+
+            if config.resolve_conflicts_enabled {
+                continue;
+            }
+        }
+
+        // 3.2 Check Pose Conflict (resting arms vs arm gestures, upright standing vs grounded/bent poses)
+        if let Some((reason, alt, framing_alt)) = check_pose_conflict(
+            &tok.normalized,
+            arms_down_or_hips_active,
+            standing_upright_active,
+        ) {
+            changes.push(PromptChange {
+                id: next_change_id,
+                original: tok.raw.clone(),
+                action: ChangeAction::PoseConflict,
+                reason: reason.to_string(),
+                suggested_alternative: alt.to_string(),
+                framing_alternative: framing_alt.to_string(),
+                mode: if config.resolve_conflicts_enabled { 0 } else { 2 },
+            });
+            next_change_id += 1;
+
+            if config.resolve_conflicts_enabled {
+                continue;
+            }
+        }
+
         // 4. Check if this framing tag hides a Pinned Body Part (when TargetView is None)
         if effective_view == TargetView::None {
             if let Some((reason, alt)) = check_pinned_visibility_conflict(&tok.normalized, &pinned_norms) {
@@ -599,7 +2347,25 @@ pub fn analyze_with_rules(tokens: &[PromptToken], config: &ScanConfig) -> RuleAn
             continue;
         }
 
-        // 6. Check Checkpoint-specific Bloat / Redundant Quality Synonyms (ONLY if Cleanup Mode is ON)
+        // 6. Check 2D Anime Flat Protection vs 3D Bleed Tags (if Cleanup or Conflict Resolution is ON and checkpoint is 2D anime)
+        if (config.cleanup_enabled || config.resolve_conflicts_enabled)
+            && config.checkpoint.is_2d_anime_checkpoint()
+            && is_3d_bleed_tag(&tok.normalized)
+        {
+            changes.push(PromptChange {
+                id: next_change_id,
+                original: tok.raw.clone(),
+                action: ChangeAction::StyleConflict,
+                reason: "Strips tags that pull 2D anime checkpoints toward uncanny 3D/semi-realistic rendering.".to_string(),
+                suggested_alternative: String::new(),
+                framing_alternative: String::new(),
+                mode: 0,
+            });
+            next_change_id += 1;
+            continue;
+        }
+
+        // 6.1 Check Checkpoint-specific Bloat / Redundant Quality Synonyms (ONLY if Cleanup Mode is ON)
         if config.cleanup_enabled {
             if let Some((reason, replacement)) = config.checkpoint.check_bloat_tag(&tok.normalized) {
                 let suggested = if !added_quality_replacement && !replacement.is_empty() {
@@ -670,11 +2436,12 @@ pub fn analyze_with_rules(tokens: &[PromptToken], config: &ScanConfig) -> RuleAn
         processed_tokens.push(tok);
     }
 
-    // Camera angle / pose dropdowns: the user's explicit choice replaces the prompt's
-    // own angle / pose tags (shown as a card so it can be undone).
+    // Camera angle / pose / proportion dropdowns: the user's explicit choice replaces the prompt's
+    // own angle / pose / proportion tags (shown as a card so it can be undone).
     for (list, idx, action, what) in [
         (crate::profiles::CAMERA_ANGLES, config.camera_angle, ChangeAction::AngleChoice, "camera angle"),
         (crate::profiles::POSES, config.pose, ChangeAction::PoseChoice, "pose"),
+        (crate::profiles::PROPORTIONS, config.proportion, ChangeAction::ProportionChoice, "body proportion"),
     ] {
         let Some((label, tags)) = list.get(idx).filter(|_| idx > 0) else { continue };
         let group = crate::profiles::group_tags(list);
@@ -737,6 +2504,463 @@ pub fn analyze_with_rules(tokens: &[PromptToken], config: &ScanConfig) -> RuleAn
         next_change_id += 1;
     }
 
+    // 1. Species and Anatomy Purity (Kemonomimi)
+    let kemonomimi_tok = processed_tokens
+        .iter()
+        .find(|t| is_kemonomimi_tag(&t.normalized))
+        .cloned();
+
+    if let Some(kemo_tok) = kemonomimi_tok {
+        let mut conflicts: Vec<PromptToken> = Vec::new();
+        for t in &processed_tokens {
+            if t.normalized == kemo_tok.normalized || is_kemonomimi_tag(&t.normalized) {
+                continue;
+            }
+            if is_furry_bleed_tag(&t.normalized) || is_four_ears_trigger_tag(&t.normalized) {
+                conflicts.push(t.clone());
+            }
+        }
+        for c in conflicts {
+            if config.resolve_conflicts_enabled {
+                processed_tokens.retain(|t| t.normalized != c.normalized);
+            }
+            changes.push(PromptChange {
+                id: next_change_id,
+                original: c.text.clone(),
+                action: ChangeAction::AnatomyConflict,
+                reason: "Prevents kemonomimi characters from turning into full anthros/furries or growing a second pair of human ears.".to_string(),
+                suggested_alternative: String::new(),
+                framing_alternative: String::new(),
+                mode: if config.resolve_conflicts_enabled { 0 } else { 2 },
+            });
+            next_change_id += 1;
+        }
+    }
+
+    // 2. Facial State Conflicts: Closed Eyes
+    let closed_eyes_tok = processed_tokens
+        .iter()
+        .find(|t| is_closed_eyes_tag(&t.normalized))
+        .cloned();
+
+    if let Some(ce_tok) = closed_eyes_tok {
+        let mut conflicts: Vec<PromptToken> = Vec::new();
+        for t in &processed_tokens {
+            if t.normalized == ce_tok.normalized || is_closed_eyes_tag(&t.normalized) {
+                continue;
+            }
+            if is_closed_eyes_conflict_tag(&t.normalized) {
+                conflicts.push(t.clone());
+            }
+        }
+        for c in conflicts {
+            if config.resolve_conflicts_enabled {
+                processed_tokens.retain(|t| t.normalized != c.normalized);
+            }
+            changes.push(PromptChange {
+                id: next_change_id,
+                original: c.text.clone(),
+                action: ChangeAction::AnatomyConflict,
+                reason: "Eye color, pupil, and gaze tags force the eyelids open even when closed_eyes is specified.".to_string(),
+                suggested_alternative: String::new(),
+                framing_alternative: String::new(),
+                mode: if config.resolve_conflicts_enabled { 0 } else { 2 },
+            });
+            next_change_id += 1;
+        }
+    }
+
+    // 3. Facial State Conflicts: Closed Mouth
+    let closed_mouth_tok = processed_tokens
+        .iter()
+        .find(|t| is_closed_mouth_tag(&t.normalized))
+        .cloned();
+
+    if let Some(cm_tok) = closed_mouth_tok {
+        let mut conflicts: Vec<PromptToken> = Vec::new();
+        for t in &processed_tokens {
+            if t.normalized == cm_tok.normalized || is_closed_mouth_tag(&t.normalized) {
+                continue;
+            }
+            if is_closed_mouth_conflict_tag(&t.normalized) {
+                conflicts.push(t.clone());
+            }
+        }
+        for c in conflicts {
+            if config.resolve_conflicts_enabled {
+                processed_tokens.retain(|t| t.normalized != c.normalized);
+            }
+            changes.push(PromptChange {
+                id: next_change_id,
+                original: c.text.clone(),
+                action: ChangeAction::AnatomyConflict,
+                reason: "Internal mouth anatomy (teeth, tongue, fang) forces the mouth open.".to_string(),
+                suggested_alternative: String::new(),
+                framing_alternative: String::new(),
+                mode: if config.resolve_conflicts_enabled { 0 } else { 2 },
+            });
+            next_change_id += 1;
+        }
+    }
+
+    // 4. Single Eyewear Rule: Face-worn vs Head-worn / removed eyewear
+    let face_eyewear_idx = processed_tokens.iter().position(|t| is_face_eyewear_tag(&t.normalized));
+    let head_eyewear_idx = processed_tokens.iter().position(|t| is_head_or_off_eyewear_tag(&t.normalized));
+
+    if let (Some(f_idx), Some(h_idx)) = (face_eyewear_idx, head_eyewear_idx) {
+        let drop_face = h_idx < f_idx;
+        let mut conflicts: Vec<PromptToken> = Vec::new();
+        for t in &processed_tokens {
+            if (drop_face && is_face_eyewear_tag(&t.normalized))
+                || (!drop_face && is_head_or_off_eyewear_tag(&t.normalized))
+            {
+                conflicts.push(t.clone());
+            }
+        }
+        for drop_tok in conflicts {
+            if config.resolve_conflicts_enabled {
+                processed_tokens.retain(|t| t.normalized != drop_tok.normalized);
+            }
+            changes.push(PromptChange {
+                id: next_change_id,
+                original: drop_tok.text.clone(),
+                action: ChangeAction::AnatomyConflict,
+                reason: "Combining face-worn and head-worn eyewear tags generates two pairs of glasses simultaneously.".to_string(),
+                suggested_alternative: String::new(),
+                framing_alternative: String::new(),
+                mode: if config.resolve_conflicts_enabled { 0 } else { 2 },
+            });
+            next_change_id += 1;
+        }
+    }
+
+    // 5. Stature & Ratio Conflicts
+    let first_short_idx = processed_tokens.iter().position(|t| is_short_petite_tag(&t.normalized));
+    let first_tall_idx = processed_tokens.iter().position(|t| is_tall_statuesque_tag(&t.normalized));
+
+    let stature_winner = match (first_short_idx, first_tall_idx) {
+        (Some(s), Some(t)) => {
+            if s < t {
+                Some((true, processed_tokens[s].clone()))
+            } else {
+                Some((false, processed_tokens[t].clone()))
+            }
+        }
+        (Some(s), None) => Some((true, processed_tokens[s].clone())),
+        (None, Some(t)) => Some((false, processed_tokens[t].clone())),
+        (None, None) => None,
+    };
+
+    if let Some((is_short, winner_tok)) = stature_winner {
+        let mut conflicts: Vec<(PromptToken, &'static str)> = Vec::new();
+        for t in &processed_tokens {
+            if is_short {
+                if is_short_petite_tag(&t.normalized) {
+                    continue;
+                }
+                if is_short_petite_conflict_tag(&t.normalized) {
+                    let reason = if matches!(
+                        t.normalized.as_str(),
+                        "huge weapon"
+                            | "giant weapon"
+                            | "polearm"
+                            | "staff"
+                            | "oversized weapon"
+                            | "scythe"
+                    ) {
+                        "Flags oversized props that zoom the camera out."
+                    } else {
+                        "Prevents mature/tall tags from stretching limb ratios."
+                    };
+                    conflicts.push((t.clone(), reason));
+                }
+            } else {
+                if is_tall_statuesque_tag(&t.normalized) {
+                    continue;
+                }
+                if is_tall_statuesque_conflict_tag(&t.normalized) {
+                    conflicts.push((
+                        t.clone(),
+                        "Oversized clothing and round-face tags compress the character's head-to-body ratio into a childlike stature.",
+                    ));
+                }
+            }
+        }
+        for (c, reason) in conflicts {
+            if config.resolve_conflicts_enabled {
+                processed_tokens.retain(|t| t.normalized != c.normalized);
+            }
+            changes.push(PromptChange {
+                id: next_change_id,
+                original: c.text.clone(),
+                action: ChangeAction::SizeConflict,
+                reason: format!("'{}' conflicts with '{}'; {reason}", c.text, winner_tok.text),
+                suggested_alternative: String::new(),
+                framing_alternative: String::new(),
+                mode: if config.resolve_conflicts_enabled { 0 } else { 2 },
+            });
+            next_change_id += 1;
+        }
+    }
+
+    // 6. Dark Skin Protection
+    let dark_skin_tok = processed_tokens
+        .iter()
+        .find(|t| is_dark_skin_tag(&t.normalized))
+        .cloned();
+
+    if let Some(ds_tok) = dark_skin_tok {
+        let mut conflicts: Vec<(PromptToken, bool)> = Vec::new();
+        for t in &processed_tokens {
+            if t.normalized == ds_tok.normalized || is_dark_skin_tag(&t.normalized) {
+                continue;
+            }
+            if is_dark_skin_conflict_tag(&t.normalized) {
+                conflicts.push((t.clone(), false));
+            } else if is_dark_skin_caution_tag(&t.normalized) {
+                conflicts.push((t.clone(), true));
+            }
+        }
+        for (c, is_caution) in conflicts {
+            if config.resolve_conflicts_enabled && !is_caution {
+                processed_tokens.retain(|t| t.normalized != c.normalized);
+            }
+            changes.push(PromptChange {
+                id: next_change_id,
+                original: c.text.clone(),
+                action: ChangeAction::SizeConflict,
+                reason: if is_caution {
+                    format!("'{}' with '{}': Caution - pale-biased lighting or blush effects can wash out dark skin tones.", c.text, ds_tok.text)
+                } else {
+                    "Prevents pale-biased lighting or skin tags from washing out dark skin tones.".to_string()
+                },
+                suggested_alternative: String::new(),
+                framing_alternative: String::new(),
+                mode: if config.resolve_conflicts_enabled && !is_caution { 0 } else { 2 },
+            });
+            next_change_id += 1;
+        }
+    }
+
+    // 7. Comprehensive Breast Size Tier Resolution
+    // Whichever breast tier is prompted first sets the character's breast tier.
+    let active_tier_tok = processed_tokens
+        .iter()
+        .find_map(|t| detect_breast_tier(&t.normalized).map(|tier| (tier, t.clone())));
+
+    if let Some((tier, tier_tok)) = active_tier_tok {
+        let mut conflicting: Vec<(PromptToken, &'static str, ChangeAction)> = Vec::new();
+        for t in &processed_tokens {
+            if t.normalized == tier_tok.normalized {
+                continue;
+            }
+            if let Some((reason, action)) = breast_tier_conflicts(tier, &t.normalized) {
+                conflicting.push((t.clone(), reason, action));
+            }
+        }
+        for (c, reason, action) in conflicting {
+            let suggested_alt = if tier == BreastTier::FlatChest {
+                match c.normalized.as_str() {
+                    "virgin killer sweater" => "loose sweater",
+                    "cleavage cutout" | "boob window" => "sarashi",
+                    "taut shirt" => "loose shirt",
+                    "boob pocket" => "chest pocket",
+                    _ => "",
+                }
+            } else {
+                ""
+            };
+
+            if config.resolve_conflicts_enabled {
+                processed_tokens.retain(|t| t.normalized != c.normalized);
+                if !suggested_alt.is_empty() {
+                    let norm = suggested_alt.to_string();
+                    if !processed_tokens.iter().any(|t| t.normalized == norm) {
+                        processed_tokens.push(PromptToken {
+                            raw: suggested_alt.to_string(),
+                            text: suggested_alt.to_string(),
+                            normalized: norm,
+                            weight: 1.0,
+                            had_runaway_weight: false,
+                            replaced: true,
+                            added: false,
+                            original_index: c.original_index,
+                            category: TokenCategory::Attire,
+                        });
+                    }
+                }
+            }
+            changes.push(PromptChange {
+                id: next_change_id,
+                original: c.text.clone(),
+                action,
+                reason: format!("'{}' conflicts with your prompted '{}'; {reason}", c.text, tier_tok.text),
+                suggested_alternative: suggested_alt.to_string(),
+                framing_alternative: String::new(),
+                mode: if config.resolve_conflicts_enabled { 0 } else { 2 },
+            });
+            next_change_id += 1;
+        }
+    }
+
+    // Pose conflicts with huge/gigantic breasts (e.g. prone / crossed arms)
+    let large_chest_tok = processed_tokens
+        .iter()
+        .find(|t| matches!(t.normalized.as_str(), "huge breasts" | "gigantic breasts" | "massive breasts" | "enormous breasts"))
+        .cloned();
+
+    if let Some(large_tok) = large_chest_tok {
+        let mut conflicting_poses: Vec<(PromptToken, String, &'static str)> = Vec::new();
+        for t in &processed_tokens {
+            if matches!(t.normalized.as_str(), "lying on stomach" | "on stomach" | "prone") {
+                conflicting_poses.push((
+                    t.clone(),
+                    format!("Lying flat on stomach causes clipping and severe anatomical distortion with '{}'.", large_tok.text),
+                    "",
+                ));
+            } else if matches!(t.normalized.as_str(), "crossed arms" | "arms crossed") {
+                conflicting_poses.push((
+                    t.clone(),
+                    format!("Crossing arms flat across the chest causes clipping and impossible geometry with '{}'.", large_tok.text),
+                    "",
+                ));
+            }
+        }
+        for (tok, reason, alt) in conflicting_poses {
+            if config.resolve_conflicts_enabled {
+                processed_tokens.retain(|t| t.normalized != tok.normalized);
+            }
+            changes.push(PromptChange {
+                id: next_change_id,
+                original: tok.text.clone(),
+                action: ChangeAction::PoseConflict,
+                reason,
+                suggested_alternative: alt.to_string(),
+                framing_alternative: String::new(),
+                mode: if config.resolve_conflicts_enabled { 0 } else { 2 },
+            });
+            next_change_id += 1;
+        }
+    }
+
+    // 8. Body Proportion Conflicts: Thick/Curvy vs Slender/Petite Lower
+    let first_thick_idx = processed_tokens.iter().position(|t| is_thick_curvy_lower_tag(&t.normalized));
+    let first_slender_idx = processed_tokens.iter().position(|t| is_slender_petite_lower_tag(&t.normalized));
+
+    let proportion_lower_winner = match (first_thick_idx, first_slender_idx) {
+        (Some(th), Some(sl)) => {
+            if th < sl {
+                Some((true, processed_tokens[th].clone()))
+            } else {
+                Some((false, processed_tokens[sl].clone()))
+            }
+        }
+        (Some(th), None) => Some((true, processed_tokens[th].clone())),
+        (None, Some(sl)) => Some((false, processed_tokens[sl].clone())),
+        (None, None) => None,
+    };
+
+    if let Some((is_thick, winner_tok)) = proportion_lower_winner {
+        let mut conflicts: Vec<(PromptToken, &'static str)> = Vec::new();
+        for t in &processed_tokens {
+            if is_thick {
+                if is_thick_curvy_lower_tag(&t.normalized) {
+                    continue;
+                }
+                if is_thick_curvy_conflict(&t.normalized) {
+                    conflicts.push((
+                        t.clone(),
+                        "Prevents thin/slender tags from neutralizing hip and thigh volume.",
+                    ));
+                }
+            } else {
+                if is_slender_petite_lower_tag(&t.normalized) {
+                    continue;
+                }
+                if is_slender_petite_conflict(&t.normalized) {
+                    conflicts.push((
+                        t.clone(),
+                        "Strips volume and compression tags (like skindentation) that force thick thighs.",
+                    ));
+                }
+            }
+        }
+        for (c, reason) in conflicts {
+            if config.resolve_conflicts_enabled {
+                processed_tokens.retain(|t| t.normalized != c.normalized);
+            }
+            changes.push(PromptChange {
+                id: next_change_id,
+                original: c.text.clone(),
+                action: ChangeAction::SizeConflict,
+                reason: format!("'{}' conflicts with '{}'; {reason}", c.text, winner_tok.text),
+                suggested_alternative: String::new(),
+                framing_alternative: String::new(),
+                mode: if config.resolve_conflicts_enabled { 0 } else { 2 },
+            });
+            next_change_id += 1;
+        }
+    }
+
+    // 9. Body Proportion Conflicts: Muscular/Toned vs Soft/Chubby
+    let first_muscular_idx = processed_tokens.iter().position(|t| is_muscular_toned_tag(&t.normalized));
+    let first_soft_idx = processed_tokens.iter().position(|t| is_soft_chubby_tag(&t.normalized));
+
+    let physique_winner = match (first_muscular_idx, first_soft_idx) {
+        (Some(m), Some(s)) => {
+            if m < s {
+                Some((true, processed_tokens[m].clone()))
+            } else {
+                Some((false, processed_tokens[s].clone()))
+            }
+        }
+        (Some(m), None) => Some((true, processed_tokens[m].clone())),
+        (None, Some(s)) => Some((false, processed_tokens[s].clone())),
+        (None, None) => None,
+    };
+
+    if let Some((is_muscular, winner_tok)) = physique_winner {
+        let mut conflicts: Vec<(PromptToken, &'static str)> = Vec::new();
+        for t in &processed_tokens {
+            if is_muscular {
+                if is_muscular_toned_tag(&t.normalized) {
+                    continue;
+                }
+                if is_muscular_conflict(&t.normalized) {
+                    conflicts.push((
+                        t.clone(),
+                        "Prevents body-fat tags from smoothing out muscle definition.",
+                    ));
+                }
+            } else {
+                if is_soft_chubby_tag(&t.normalized) {
+                    continue;
+                }
+                if is_soft_chubby_conflict(&t.normalized) {
+                    conflicts.push((
+                        t.clone(),
+                        "Prevents fitness and slim-waist tags from erasing soft midsection anatomy.",
+                    ));
+                }
+            }
+        }
+        for (c, reason) in conflicts {
+            if config.resolve_conflicts_enabled {
+                processed_tokens.retain(|t| t.normalized != c.normalized);
+            }
+            changes.push(PromptChange {
+                id: next_change_id,
+                original: c.text.clone(),
+                action: ChangeAction::SizeConflict,
+                reason: format!("'{}' conflicts with '{}'; {reason}", c.text, winner_tok.text),
+                suggested_alternative: String::new(),
+                framing_alternative: String::new(),
+                mode: if config.resolve_conflicts_enabled { 0 } else { 2 },
+            });
+            next_change_id += 1;
+        }
+    }
+
     // Two sizes for the same body part (or two hair lengths) can't both be right:
     // keep the one written first, with a card to bring the other back.
     if config.resolve_conflicts_enabled {
@@ -793,6 +3017,39 @@ pub fn analyze_with_rules(tokens: &[PromptToken], config: &ScanConfig) -> RuleAn
         }
     }
 
+    // 10. Proportion Chain Recommendations
+    let prop_tiers = detect_all_proportion_tiers(&processed_tokens);
+    for (tier, tier_tok) in prop_tiers {
+        let rec = get_proportion_recommendations(tier);
+        let clothing_str = rec.clothing_interaction.join(", ");
+        let pose_str = rec.pose_and_physics.join(", ");
+        let neg_str = rec.auto_negative_lock.join(", ");
+
+        // Top 2 clothing and top 2 pose/physics tags as quick suggested companion addition
+        let mut top_companions = Vec::new();
+        for c in rec.clothing_interaction.iter().take(2) {
+            top_companions.push(c.replace('_', " "));
+        }
+        for p in rec.pose_and_physics.iter().take(2) {
+            top_companions.push(p.replace('_', " "));
+        }
+        let suggested_alt = top_companions.join(", ");
+
+        changes.push(PromptChange {
+            id: next_change_id,
+            original: String::new(),
+            action: ChangeAction::Recommendation,
+            reason: format!(
+                "Reinforce '{}':\n• Clothing: {}\n• Pose/Physics: {}\n• Auto-Negative Locks: {}",
+                tier_tok.text, clothing_str, pose_str, neg_str
+            ),
+            suggested_alternative: suggested_alt,
+            framing_alternative: String::new(),
+            mode: 2, // Informational by default; user can click 'Add It' to insert suggested companion tags
+        });
+        next_change_id += 1;
+    }
+
     RuleAnalysisResult {
         processed_tokens,
         changes,
@@ -845,6 +3102,10 @@ const COLOR_WORDS: &[&str] = &[
     "black", "white", "silver", "grey", "gray", "blonde", "blond", "brown", "red", "blue", "green", "pink",
     "purple", "orange", "yellow", "aqua", "platinum", "multicolored", "two-tone", "gradient", "streaked",
     "dark", "light", "golden", "teal", "violet", "crimson", "auburn",
+    // Common anime eye, hair, and skin colors
+    "amber", "hazel", "cyan", "magenta", "turquoise", "lavender", "maroon", "emerald", "sapphire", "ruby",
+    "beige", "tan", "tanned", "pale", "fair", "copper", "bronze", "lilac", "indigo", "charcoal", "navy",
+    "olive", "lime", "peach", "coral", "mint", "rose", "scarlet", "ivory", "brunette",
 ];
 
 fn head_word(word: &str) -> &str {
@@ -853,15 +3114,96 @@ fn head_word(word: &str) -> &str {
         "butt" | "buttocks" => "ass",
         "eye" => "eyes",
         "thigh" => "thighs",
+        "ear" => "ears",
+        "tail" => "tail",
+        "pupil" => "pupils",
+        "eyebrow" => "eyebrows",
+        "eyelash" => "eyelashes",
+        "lip" => "lips",
         w => w,
     }
 }
 
 /// True when `tag` contradicts `keep` (a LoRA tag): same subject, same attribute,
-/// different value ("gigantic breasts" vs "large breasts", "black hair" vs "silver hair").
+/// different value ("gigantic breasts" vs "large breasts", "black hair" vs "silver hair",
+/// "amber eyes" vs "grey eyes").
 /// Long clauses (prose) are never treated as conflicts.
 pub fn tags_conflict(keep: &str, tag: &str) -> bool {
-    attribute_conflict(keep, tag, &[SIZE_WORDS, LENGTH_WORDS, COLOR_WORDS])
+    if attribute_conflict(keep, tag, &[SIZE_WORDS, LENGTH_WORDS, COLOR_WORDS]) {
+        return true;
+    }
+    // Species and Anatomy Purity (Kemonomimi)
+    if (is_kemonomimi_tag(keep) && (is_furry_bleed_tag(tag) || is_four_ears_trigger_tag(tag)))
+        || ((is_furry_bleed_tag(keep) || is_four_ears_trigger_tag(keep)) && is_kemonomimi_tag(tag))
+    {
+        return true;
+    }
+    // Facial State Conflicts
+    if (is_closed_eyes_tag(keep) && is_closed_eyes_conflict_tag(tag))
+        || (is_closed_eyes_conflict_tag(keep) && is_closed_eyes_tag(tag))
+    {
+        return true;
+    }
+    if (is_closed_mouth_tag(keep) && is_closed_mouth_conflict_tag(tag))
+        || (is_closed_mouth_conflict_tag(keep) && is_closed_mouth_tag(tag))
+    {
+        return true;
+    }
+    if (is_face_eyewear_tag(keep) && is_head_or_off_eyewear_tag(tag))
+        || (is_head_or_off_eyewear_tag(keep) && is_face_eyewear_tag(tag))
+    {
+        return true;
+    }
+    // Stature and Ratio Conflicts
+    if (is_short_petite_tag(keep) && is_short_petite_conflict_tag(tag))
+        || (is_short_petite_conflict_tag(keep) && is_short_petite_tag(tag))
+    {
+        return true;
+    }
+    if (is_tall_statuesque_tag(keep) && is_tall_statuesque_conflict_tag(tag))
+        || (is_tall_statuesque_conflict_tag(keep) && is_tall_statuesque_tag(tag))
+    {
+        return true;
+    }
+    // Skin Tone Protection
+    if (is_dark_skin_tag(keep) && is_dark_skin_conflict_tag(tag))
+        || (is_dark_skin_conflict_tag(keep) && is_dark_skin_tag(tag))
+    {
+        return true;
+    }
+    // Breast Size Tier Rules
+    if let Some(tier) = detect_breast_tier(keep) {
+        if breast_tier_conflicts(tier, tag).is_some() {
+            return true;
+        }
+    }
+    if let Some(tier) = detect_breast_tier(tag) {
+        if breast_tier_conflicts(tier, keep).is_some() {
+            return true;
+        }
+    }
+    // Body Proportion Conflicts
+    if (is_thick_curvy_lower_tag(keep) && is_thick_curvy_conflict(tag))
+        || (is_thick_curvy_conflict(keep) && is_thick_curvy_lower_tag(tag))
+    {
+        return true;
+    }
+    if (is_slender_petite_lower_tag(keep) && is_slender_petite_conflict(tag))
+        || (is_slender_petite_conflict(keep) && is_slender_petite_lower_tag(tag))
+    {
+        return true;
+    }
+    if (is_muscular_toned_tag(keep) && is_muscular_conflict(tag))
+        || (is_muscular_conflict(keep) && is_muscular_toned_tag(tag))
+    {
+        return true;
+    }
+    if (is_soft_chubby_tag(keep) && is_soft_chubby_conflict(tag))
+        || (is_soft_chubby_conflict(keep) && is_soft_chubby_tag(tag))
+    {
+        return true;
+    }
+    false
 }
 
 /// Two sizes or lengths of the same thing: "medium breasts" / "large breasts",
@@ -974,6 +3316,7 @@ mod tests {
             camera_angle: 0,
 
             pose: 0,
+            proportion: 0,
 
             dynamic: false,
 
@@ -1011,6 +3354,30 @@ mod tests {
         assert!(out.contains("ass"));
         assert!(out.contains("from behind"));
         assert!(!out.contains("hourglass figure"));
+    }
+
+    #[test]
+    fn front_view_swaps_shoulder_blades_for_framing_safe_words() {
+        let (res, out) = run("1girl, front view, (shoulder blades:1.2)", &cfg(TargetView::FrontView));
+        assert!(res.changes.iter().any(|c| c.action == ChangeAction::FramingSafeSwap && c.original.contains("shoulder blades")));
+        assert!(out.contains("defined collarbone"));
+        assert!(out.contains("toned shoulders"));
+        assert!(!out.contains("shoulder blades"));
+    }
+
+    #[test]
+    fn front_view_shoulder_blades_framing_alternative() {
+        let config = cfg(TargetView::FrontView);
+        let prompt = "1girl, front view, shoulder blades";
+        let toks = parse_prompt(prompt);
+        let mut res = analyze_with_rules(&toks, &config);
+        let swap = res.changes.iter_mut().find(|c| c.action == ChangeAction::FramingSafeSwap && c.original == "shoulder blades").unwrap();
+        swap.mode = 1;
+        let out = build_condensed_output(prompt, &res.processed_tokens, &res.changes, &config).final_prompt;
+        assert!(out.contains("shoulder blades"));
+        assert!(out.contains("from behind"));
+        assert!(!out.contains("front view"));
+        assert!(!out.contains("defined collarbone"));
     }
 
     #[test]
@@ -1079,6 +3446,10 @@ mod tests {
         assert!(tags_conflict("flat chest", "huge breasts"));
         assert!(!tags_conflict("large breasts", "breasts out"));
         assert!(!tags_conflict("long hair", "silver hair"));
+        assert!(tags_conflict("amber eyes", "grey eyes"));
+        assert!(tags_conflict("white hair", "long black hair"));
+        assert!(tags_conflict("short hair", "long black hair"));
+        assert!(tags_conflict("dark skin", "pale skin"));
     }
 
     #[test]
@@ -1310,6 +3681,498 @@ mod tests {
             CheckpointProfile::Anima,
         );
         assert_eq!(dropped, vec!["cherry blossoms"]);
+    }
+
+    #[test]
+    fn front_view_json_conflicts_are_detected() {
+        let config = cfg(TargetView::FrontView);
+        let prompt = "1girl, front view, backless dress, nape, spine, sideboob, butt crack, over the shoulder";
+        let (res, out) = run(prompt, &config);
+        assert!(res.changes.iter().any(|c| c.original == "backless dress" && c.reason.contains("Forces rear or side rotation")));
+        assert!(res.changes.iter().any(|c| c.original == "nape" && c.reason.contains("Forces rear or side rotation")));
+        assert!(res.changes.iter().any(|c| c.original == "spine" && c.reason.contains("Forces rear or side rotation")));
+        assert!(res.changes.iter().any(|c| c.original == "sideboob" && c.reason.contains("Forces rear or side rotation")));
+        assert!(res.changes.iter().any(|c| c.original == "butt crack" && c.reason.contains("Forces rear or side rotation")));
+        assert!(res.changes.iter().any(|c| c.original == "over the shoulder" && c.action == ChangeAction::PositioningConflict));
+        assert!(!out.contains("backless dress"));
+        assert!(!out.contains("spine"));
+    }
+
+    #[test]
+    fn back_view_json_conflicts_are_detected() {
+        let config = cfg(TargetView::FromBehind);
+        let prompt = "1girl, from behind, front view, navel, stomach, midriff, cleavage, collarbone";
+        let (res, out) = run(prompt, &config);
+        assert!(res.changes.iter().any(|c| c.original == "front view" && c.reason.contains("Forces torso to rotate forward")));
+        assert!(res.changes.iter().any(|c| c.original == "navel" && c.reason.contains("Forces torso to rotate forward")));
+        assert!(res.changes.iter().any(|c| c.original == "cleavage" && c.reason.contains("Forces torso to rotate forward")));
+        assert!(res.changes.iter().any(|c| c.original == "collarbone" && c.reason.contains("Forces torso to rotate forward")));
+        assert!(!out.contains("cleavage"));
+        assert!(!out.contains("navel"));
+    }
+
+    #[test]
+    fn eye_level_json_conflicts_are_detected() {
+        let mut config = cfg(TargetView::None);
+        config.camera_angle = 1; // Eye level / straight-on
+        let prompt = "1girl, from below, upskirt, downblouse, soles";
+        let (res, out) = run(prompt, &config);
+        assert!(res.changes.iter().any(|c| c.original == "from below" && c.reason.contains("Hijacks camera pitch")));
+        assert!(res.changes.iter().any(|c| c.original == "upskirt" && c.reason.contains("Hijacks camera pitch")));
+        assert!(res.changes.iter().any(|c| c.original == "downblouse" && c.reason.contains("Hijacks camera pitch")));
+        assert!(res.changes.iter().any(|c| c.original == "soles" && c.reason.contains("Hijacks camera pitch")));
+        assert!(!out.contains("from below"));
+        assert!(!out.contains("upskirt"));
+    }
+
+    #[test]
+    fn portrait_json_conflicts_are_detected() {
+        let config = cfg(TargetView::CloseUpPortrait);
+        let prompt = "1girl, portrait, shoes, skirt, thighs, standing, navel";
+        let (res, out) = run(prompt, &config);
+        assert!(res.changes.iter().any(|c| c.original == "shoes" && c.reason.contains("Pulls camera down/back")));
+        assert!(res.changes.iter().any(|c| c.original == "skirt" && c.reason.contains("Pulls camera down/back")));
+        assert!(res.changes.iter().any(|c| c.original == "thighs" && c.reason.contains("Pulls camera down/back")));
+        assert!(res.changes.iter().any(|c| c.original == "standing" && c.reason.contains("Pulls camera down/back")));
+        assert!(!out.contains("shoes"));
+        assert!(!out.contains("standing"));
+    }
+
+    #[test]
+    fn upper_body_json_conflicts_are_detected() {
+        let config = cfg(TargetView::UpperBody);
+        let prompt = "1girl, upper body, feet, high heels, knees, calves, squatting";
+        let (res, out) = run(prompt, &config);
+        assert!(res.changes.iter().any(|c| c.original == "feet" && c.reason.contains("Forces framing below the waist/hips")));
+        assert!(res.changes.iter().any(|c| c.original == "high heels" && c.reason.contains("Forces framing below the waist/hips")));
+        assert!(res.changes.iter().any(|c| c.original == "knees" && c.reason.contains("Forces framing below the waist/hips")));
+        assert!(res.changes.iter().any(|c| c.original == "squatting" && c.reason.contains("Forces framing below the waist/hips")));
+        assert!(!out.contains("feet"));
+        assert!(!out.contains("squatting"));
+    }
+
+    #[test]
+    fn full_body_json_conflicts_are_detected() {
+        let config = cfg(TargetView::FullBody);
+        let prompt = "1girl, full body, portrait, detailed eyes, pupils, lip gloss, uvula, mole under eye";
+        let (res, out) = run(prompt, &config);
+        assert!(res.changes.iter().any(|c| c.original == "portrait" && c.action == ChangeAction::PositioningConflict));
+        assert!(res.changes.iter().any(|c| c.original == "detailed eyes" && c.reason.contains("Forces tight facial crop")));
+        assert!(res.changes.iter().any(|c| c.original == "pupils" && c.reason.contains("Forces tight facial crop")));
+        assert!(res.changes.iter().any(|c| c.original == "lip gloss" && c.reason.contains("Forces tight facial crop")));
+        assert!(res.changes.iter().any(|c| c.original == "uvula" && c.reason.contains("Forces tight facial crop")));
+        assert!(!out.contains("lip gloss"));
+        assert!(!out.contains("uvula"));
+    }
+
+    #[test]
+    fn arms_down_pose_conflicts_are_detected() {
+        let config = cfg(TargetView::None);
+        let prompt = "1girl, hands on hips, arms up, bare armpits, peace sign, waving";
+        let (res, out) = run(prompt, &config);
+        assert!(res.changes.iter().any(|c| c.original == "arms up" && c.action == ChangeAction::PoseConflict && c.reason.contains("force arms to lift")));
+        assert!(res.changes.iter().any(|c| c.original == "bare armpits" && c.action == ChangeAction::PoseConflict));
+        assert!(res.changes.iter().any(|c| c.original == "peace sign" && c.action == ChangeAction::PoseConflict));
+        assert!(res.changes.iter().any(|c| c.original == "waving" && c.action == ChangeAction::PoseConflict));
+        assert!(out.contains("hands on hips"));
+        assert!(!out.contains("arms up"));
+        assert!(!out.contains("peace sign"));
+    }
+
+    #[test]
+    fn standing_upright_pose_conflicts_are_detected() {
+        let config = cfg(TargetView::None);
+        let prompt = "1girl, standing, sitting, seiza, lying, bent over, crouching";
+        let (res, out) = run(prompt, &config);
+        assert!(res.changes.iter().any(|c| c.original == "sitting" && c.action == ChangeAction::PoseConflict && c.reason.contains("Forces grounded")));
+        assert!(res.changes.iter().any(|c| c.original == "seiza" && c.action == ChangeAction::PoseConflict));
+        assert!(res.changes.iter().any(|c| c.original == "lying" && c.action == ChangeAction::PoseConflict));
+        assert!(res.changes.iter().any(|c| c.original == "bent over" && c.action == ChangeAction::PoseConflict));
+        assert!(res.changes.iter().any(|c| c.original == "crouching" && c.action == ChangeAction::PoseConflict));
+        assert!(out.contains("standing"));
+        assert!(!out.contains("sitting"));
+        assert!(!out.contains("seiza"));
+    }
+
+    #[test]
+    fn small_breasts_keeps_size_and_drops_cleavage_and_large_breasts() {
+        let config = cfg(TargetView::None);
+        // When small breasts is prompted, it preserves the breast size and strips cleavage, large breasts, etc.
+        let (res, out) = run("1girl, small breasts, cleavage, large breasts, busty, underboob", &config);
+        assert!(out.contains("small breasts"));
+        assert!(!out.contains("cleavage"));
+        assert!(!out.contains("large breasts"));
+        assert!(!out.contains("busty"));
+        assert!(!out.contains("underboob"));
+        assert!(res.changes.iter().any(|c| c.original == "cleavage" && c.action == ChangeAction::SizeConflict));
+        assert!(res.changes.iter().any(|c| c.original == "large breasts" && c.action == ChangeAction::SizeConflict));
+        assert!(res.changes.iter().any(|c| c.original == "busty" && c.action == ChangeAction::SizeConflict));
+        assert!(res.changes.iter().any(|c| c.original == "underboob" && c.action == ChangeAction::SizeConflict));
+    }
+
+    #[test]
+    fn small_breasts_drops_prominent_breast_poses() {
+        let config = cfg(TargetView::None);
+        let prompt = "1girl, small breasts, breast rest, holding breasts, breast grab";
+        let (res, out) = run(prompt, &config);
+        assert!(out.contains("small breasts"));
+        assert!(!out.contains("breast rest"));
+        assert!(!out.contains("holding breasts"));
+        assert!(!out.contains("breast grab"));
+        assert!(res.changes.iter().any(|c| c.original == "breast rest" && c.action == ChangeAction::PoseConflict && c.reason.contains("prominent breasts")));
+        assert!(res.changes.iter().any(|c| c.original == "holding breasts" && c.action == ChangeAction::PoseConflict));
+        assert!(res.changes.iter().any(|c| c.original == "breast grab" && c.action == ChangeAction::PoseConflict));
+    }
+
+    #[test]
+    fn lora_overrides_small_breasts_when_specified() {
+        let mut config = cfg(TargetView::None);
+        config.lora_tags_raw = "<lora:hero:1>, large breasts".into();
+        let prompt = "1girl, small breasts, smile";
+        let (res, out) = run(prompt, &config);
+        let finished = insert_lora_block(&out, &config, false);
+        assert!(finished.contains("large breasts"));
+        assert!(!finished.contains("small breasts"));
+        assert!(res.changes.iter().any(|c| c.original == "small breasts" && c.action == ChangeAction::KeptEmphasized));
+    }
+
+    #[test]
+    fn lora_small_breasts_overrides_prompt_cleavage_and_busty() {
+        let mut config = cfg(TargetView::None);
+        config.lora_tags_raw = "<lora:hero:1>, small breasts".into();
+        let prompt = "1girl, cleavage, busty, smile";
+        let (res, out) = run(prompt, &config);
+        let finished = insert_lora_block(&out, &config, false);
+        assert!(finished.contains("small breasts"));
+        assert!(!finished.contains("cleavage"));
+        assert!(!finished.contains("busty"));
+        assert!(res.changes.iter().any(|c| c.original.contains("cleavage") && c.action == ChangeAction::KeptEmphasized));
+    }
+
+    #[test]
+    fn huge_breasts_lying_on_stomach_causes_pose_conflict() {
+        let config = cfg(TargetView::None);
+        let prompt = "1girl, gigantic breasts, lying on stomach";
+        let (res, out) = run(prompt, &config);
+        assert!(out.contains("gigantic breasts"));
+        assert!(!out.contains("lying on stomach"));
+        assert!(res.changes.iter().any(|c| c.original == "lying on stomach" && c.action == ChangeAction::PoseConflict && c.reason.contains("clipping")));
+    }
+
+    #[test]
+    fn small_breasts_framing_swap_preserves_slender_physique() {
+        let config = cfg(TargetView::UpperBody);
+        let prompt = "1girl, small breasts, upper body, ass";
+        let (res, out) = run(prompt, &config);
+        assert!(out.contains("small breasts"));
+        assert!(out.contains("slender"));
+        assert!(out.contains("narrow waist"));
+        assert!(!out.contains("voluptuous"));
+        assert!(!out.contains("hourglass figure"));
+        assert!(res.changes.iter().any(|c| c.action == ChangeAction::FramingSafeSwap));
+    }
+
+    #[test]
+    fn kemonomimi_strips_furry_bleed_and_four_ears_triggers() {
+        let config = cfg(TargetView::None);
+        let prompt = "1girl, cat ears, furry, muzzle, paws, human ears, earrings, pointy ears";
+        let (res, out) = run(prompt, &config);
+        assert!(out.contains("cat ears"));
+        assert!(!out.contains("furry"));
+        assert!(!out.contains("muzzle"));
+        assert!(!out.contains("paws"));
+        assert!(!out.contains("human ears"));
+        assert!(!out.contains("earrings"));
+        assert!(!out.contains("pointy ears"));
+        assert!(res.changes.iter().any(|c| c.original == "furry" && c.action == ChangeAction::AnatomyConflict && c.reason.contains("Prevents kemonomimi")));
+        assert!(res.changes.iter().any(|c| c.original == "human ears" && c.action == ChangeAction::AnatomyConflict));
+    }
+
+    #[test]
+    fn closed_eyes_strips_gaze_pupils_and_eye_colors() {
+        let config = cfg(TargetView::None);
+        let prompt = "1girl, closed eyes, looking at viewer, blue eyes, slit pupils, eye contact";
+        let (res, out) = run(prompt, &config);
+        assert!(out.contains("closed eyes"));
+        assert!(!out.contains("looking at viewer"));
+        assert!(!out.contains("blue eyes"));
+        assert!(!out.contains("slit pupils"));
+        assert!(!out.contains("eye contact"));
+        assert!(res.changes.iter().any(|c| c.original == "looking at viewer" && c.action == ChangeAction::AnatomyConflict && c.reason.contains("force the eyelids open")));
+        assert!(res.changes.iter().any(|c| c.original == "blue eyes" && c.action == ChangeAction::AnatomyConflict));
+    }
+
+    #[test]
+    fn closed_mouth_strips_open_mouth_teeth_and_fangs() {
+        let config = cfg(TargetView::None);
+        let prompt = "1girl, closed mouth, open mouth, teeth, fangs, tongue out";
+        let (res, out) = run(prompt, &config);
+        assert!(out.contains("closed mouth"));
+        assert!(!out.contains("open mouth"));
+        assert!(!out.contains("teeth"));
+        assert!(!out.contains("fangs"));
+        assert!(!out.contains("tongue out"));
+        assert!(res.changes.iter().any(|c| c.original == "open mouth" && c.action == ChangeAction::AnatomyConflict && c.reason.contains("Internal mouth anatomy")));
+    }
+
+    #[test]
+    fn single_eyewear_rule_drops_second_pair() {
+        let config = cfg(TargetView::None);
+        let prompt = "1girl, glasses, glasses on head, holding eyewear";
+        let (res, out) = run(prompt, &config);
+        assert!(out.contains("glasses"));
+        assert!(!out.contains("glasses on head"));
+        assert!(!out.contains("holding eyewear"));
+        assert!(res.changes.iter().any(|c| c.original == "glasses on head" && c.action == ChangeAction::AnatomyConflict && c.reason.contains("two pairs of glasses")));
+        assert!(res.changes.iter().any(|c| c.original == "holding eyewear" && c.action == ChangeAction::AnatomyConflict));
+    }
+
+    #[test]
+    fn short_petite_strips_tall_and_giant_weapon_framing_hijackers() {
+        let config = cfg(TargetView::None);
+        let prompt = "1girl, short, petite, tall, long legs, scythe, giant weapon";
+        let (res, out) = run(prompt, &config);
+        assert!(out.contains("short"));
+        assert!(!out.contains("tall"));
+        assert!(!out.contains("long legs"));
+        assert!(!out.contains("scythe"));
+        assert!(!out.contains("giant weapon"));
+        assert!(res.changes.iter().any(|c| c.original == "tall" && c.action == ChangeAction::SizeConflict));
+        assert!(res.changes.iter().any(|c| c.original == "scythe" && c.action == ChangeAction::SizeConflict && c.reason.contains("oversized props")));
+    }
+
+    #[test]
+    fn tall_statuesque_strips_childlike_and_oversized_clothes() {
+        let config = cfg(TargetView::None);
+        let prompt = "1girl, tall, mature female, round face, oversized shirt, chibi";
+        let (res, out) = run(prompt, &config);
+        assert!(out.contains("tall"));
+        assert!(!out.contains("round face"));
+        assert!(!out.contains("oversized shirt"));
+        assert!(!out.contains("chibi"));
+        assert!(res.changes.iter().any(|c| c.original == "round face" && c.action == ChangeAction::SizeConflict && c.reason.contains("childlike stature")));
+    }
+
+    #[test]
+    fn anime_flat_protection_strips_3d_bleed_tags() {
+        let mut config = cfg(TargetView::None);
+        config.cleanup_enabled = true;
+        config.checkpoint = CheckpointProfile::PonyV6;
+        let prompt = "1girl, photorealistic, 3d, blender, octane render, shiny skin, pores";
+        let (res, out) = run(prompt, &config);
+        assert!(!out.contains("photorealistic"));
+        assert!(!out.contains("3d"));
+        assert!(!out.contains("blender"));
+        assert!(!out.contains("octane render"));
+        assert!(!out.contains("shiny skin"));
+        assert!(!out.contains("pores"));
+        assert!(res.changes.iter().any(|c| c.original == "photorealistic" && c.action == ChangeAction::StyleConflict && c.reason.contains("2D anime checkpoints")));
+    }
+
+    #[test]
+    fn dark_skin_protection_strips_pale_skin_and_cautions_tanlines() {
+        let config = cfg(TargetView::None);
+        let prompt = "1girl, dark skin, pale skin, white skin, tanlines";
+        let (res, out) = run(prompt, &config);
+        assert!(out.contains("dark skin"));
+        assert!(!out.contains("pale skin"));
+        assert!(!out.contains("white skin"));
+        assert!(out.contains("tanlines"));
+        assert!(res.changes.iter().any(|c| c.original == "pale skin" && c.action == ChangeAction::SizeConflict && c.reason.contains("washing out dark skin tones")));
+        assert!(res.changes.iter().any(|c| c.original == "tanlines" && c.action == ChangeAction::SizeConflict && c.reason.contains("Caution")));
+    }
+
+    #[test]
+    fn flat_chest_strips_larger_tiers_cleavage_and_physics_hijackers() {
+        let config = cfg(TargetView::None);
+        let prompt = "1girl, flat chest, large breasts, cleavage, deep cleavage, boob shelf, breast press, virgin killer sweater";
+        let (res, out) = run(prompt, &config);
+        assert!(out.contains("flat chest"));
+        assert!(!out.contains("large breasts"));
+        assert!(!out.contains("cleavage"));
+        assert!(!out.contains("deep cleavage"));
+        assert!(!out.contains("boob shelf"));
+        assert!(!out.contains("breast press"));
+        assert!(!out.contains("virgin killer sweater"));
+        assert!(res.changes.iter().any(|c| c.original == "cleavage" && c.action == ChangeAction::SizeConflict && c.reason.contains("Removes all larger breast tiers")));
+        assert!(res.changes.iter().any(|c| c.original == "breast press" && c.action == ChangeAction::PoseConflict));
+    }
+
+    #[test]
+    fn medium_breasts_strips_deflation_and_inflation_hijackers() {
+        let config = cfg(TargetView::None);
+        let prompt = "1girl, medium breasts, flat chest, huge breasts, breasts on table, visible ribs";
+        let (res, out) = run(prompt, &config);
+        assert!(out.contains("medium breasts"));
+        assert!(!out.contains("flat chest"));
+        assert!(!out.contains("huge breasts"));
+        assert!(!out.contains("breasts on table"));
+        assert!(!out.contains("visible ribs"));
+        assert!(res.changes.iter().any(|c| c.original == "flat chest" && c.action == ChangeAction::SizeConflict && c.reason.contains("Prevents extreme deflation")));
+        assert!(res.changes.iter().any(|c| c.original == "breasts on table" && c.action == ChangeAction::PoseConflict));
+    }
+
+    #[test]
+    fn large_breasts_strips_smaller_larger_tiers_and_hyper() {
+        let config = cfg(TargetView::None);
+        let prompt = "1girl, large breasts, flat chest, small breasts, huge breasts, visible ribs, hyper";
+        let (res, out) = run(prompt, &config);
+        assert!(out.contains("large breasts"));
+        assert!(!out.contains("flat chest"));
+        assert!(!out.contains("small breasts"));
+        assert!(!out.contains("huge breasts"));
+        assert!(!out.contains("visible ribs"));
+        assert!(!out.contains("hyper"));
+        assert!(res.changes.iter().any(|c| c.original == "flat chest" && c.action == ChangeAction::SizeConflict && c.reason.contains("Strips smaller/larger tiers")));
+    }
+
+    #[test]
+    fn huge_breasts_strips_slender_tags() {
+        let config = cfg(TargetView::None);
+        let prompt = "1girl, huge breasts, small breasts, flat chest, visible ribs, slender, petite";
+        let (res, out) = run(prompt, &config);
+        assert!(out.contains("huge breasts"));
+        assert!(!out.contains("small breasts"));
+        assert!(!out.contains("flat chest"));
+        assert!(!out.contains("visible ribs"));
+        assert!(!out.contains("slender"));
+        assert!(res.changes.iter().any(|c| c.original == "slender" && c.action == ChangeAction::SizeConflict && c.reason.contains("slender body tags that fight against huge breast")));
+    }
+
+    #[test]
+    fn thick_curvy_lower_strips_thin_legs() {
+        let config = cfg(TargetView::None);
+        let prompt = "1girl, thick thighs, wide hips, thin legs, stick legs, flat ass";
+        let (res, out) = run(prompt, &config);
+        assert!(out.contains("thick thighs"));
+        assert!(out.contains("wide hips"));
+        assert!(!out.contains("thin legs"));
+        assert!(!out.contains("stick legs"));
+        assert!(!out.contains("flat ass"));
+        assert!(res.changes.iter().any(|c| c.original == "thin legs" && c.action == ChangeAction::SizeConflict && c.reason.contains("neutralizing hip and thigh volume")));
+    }
+
+    #[test]
+    fn slender_petite_lower_strips_thick_thighs_and_skindentation() {
+        let config = cfg(TargetView::None);
+        let prompt = "1girl, slender, thin legs, thigh gap, thick thighs, skindentation, muffin top";
+        let (res, out) = run(prompt, &config);
+        assert!(out.contains("slender"));
+        assert!(out.contains("thin legs"));
+        assert!(!out.contains("thick thighs"));
+        assert!(!out.contains("skindentation"));
+        assert!(!out.contains("muffin top"));
+        assert!(res.changes.iter().any(|c| c.original == "thick thighs" && c.action == ChangeAction::SizeConflict && c.reason.contains("force thick thighs")));
+    }
+
+    #[test]
+    fn muscular_toned_strips_chubby_and_flabby() {
+        let config = cfg(TargetView::None);
+        let prompt = "1girl, abs, toned, muscular, chubby, soft body, love handles";
+        let (res, out) = run(prompt, &config);
+        assert!(out.contains("abs"));
+        assert!(out.contains("toned"));
+        assert!(!out.contains("chubby"));
+        assert!(!out.contains("soft body"));
+        assert!(!out.contains("love handles"));
+        assert!(res.changes.iter().any(|c| c.original == "chubby" && c.action == ChangeAction::SizeConflict && c.reason.contains("smoothing out muscle definition")));
+    }
+
+    #[test]
+    fn soft_chubby_strips_abs_and_slim_waist() {
+        let config = cfg(TargetView::None);
+        let prompt = "1girl, chubby, belly, abs, six pack, slim waist";
+        let (res, out) = run(prompt, &config);
+        assert!(out.contains("chubby"));
+        assert!(out.contains("belly"));
+        assert!(!out.contains("abs"));
+        assert!(!out.contains("six pack"));
+        assert!(!out.contains("slim waist"));
+        assert!(res.changes.iter().any(|c| c.original == "abs" && c.action == ChangeAction::SizeConflict && c.reason.contains("erasing soft midsection anatomy")));
+    }
+
+    #[test]
+    fn lora_overrides_kemonomimi_closed_eyes_and_dark_skin() {
+        let mut config = cfg(TargetView::None);
+        config.lora_tags_raw = "<lora:neko:1>, cat ears, closed eyes, dark skin, abs".into();
+        let prompt = "1girl, human ears, furry, blue eyes, pale skin, chubby";
+        let (res, out) = run(prompt, &config);
+        let finished = insert_lora_block(&out, &config, false);
+        assert!(finished.contains("cat ears"));
+        assert!(finished.contains("closed eyes"));
+        assert!(finished.contains("dark skin"));
+        assert!(finished.contains("abs"));
+        assert!(!finished.contains("human ears"));
+        assert!(!finished.contains("furry"));
+        assert!(!finished.contains("blue eyes"));
+        assert!(!finished.contains("pale skin"));
+        assert!(!finished.contains("chubby"));
+        assert!(res.changes.iter().any(|c| c.original.contains("human ears") && c.action == ChangeAction::KeptEmphasized));
+        assert!(res.changes.iter().any(|c| c.original.contains("blue eyes") && c.action == ChangeAction::KeptEmphasized));
+        assert!(res.changes.iter().any(|c| c.original.contains("pale skin") && c.action == ChangeAction::KeptEmphasized));
+        assert!(res.changes.iter().any(|c| c.original.contains("chubby") && c.action == ChangeAction::KeptEmphasized));
+    }
+
+    #[test]
+    fn apply_proportion_lock_locks_tier_and_returns_recommendations() {
+        let current_tags = vec![
+            "1girl".to_string(),
+            "flat chest".to_string(),
+            "large breasts".to_string(),
+            "cleavage".to_string(),
+            "smile".to_string(),
+        ];
+        let lock_res = apply_proportion_lock(&current_tags, ProportionTier::FlatChest, true, 1.2);
+        assert!(lock_res.final_positive_tags.iter().any(|t| t == "(flat chest:1.20)"));
+        assert!(lock_res.final_positive_tags.contains(&"aa cup".to_string()));
+        assert!(lock_res.final_positive_tags.contains(&"small underbust".to_string()));
+        assert!(lock_res.final_positive_tags.contains(&"slender torso".to_string()));
+        assert!(!lock_res.final_positive_tags.contains(&"large breasts".to_string()));
+        assert!(!lock_res.final_positive_tags.contains(&"cleavage".to_string()));
+        assert!(lock_res.removed_conflicts.contains(&"large breasts".to_string()));
+        assert!(lock_res.removed_conflicts.contains(&"cleavage".to_string()));
+        assert!(lock_res.recommended_clothing.contains(&"loose_shirt".to_string()));
+        assert!(lock_res.recommended_physics_poses.contains(&"collarbone".to_string()));
+        assert!(lock_res.auto_negative_additions.contains(&"cleavage".to_string()));
+    }
+
+    #[test]
+    fn recommended_negative_auto_locks_detected_proportion_tiers() {
+        use crate::condenser::recommended_negative;
+        let config = cfg(TargetView::None);
+        let neg = recommended_negative(&config, "1girl, flat chest, thick thighs, smile");
+        assert!(neg.contains("breasts"));
+        assert!(neg.contains("cleavage"));
+        assert!(neg.contains("large breasts"));
+        assert!(neg.contains("thin legs"));
+        assert!(neg.contains("stick legs"));
+        assert!(neg.contains("thigh gap"));
+    }
+
+    #[test]
+    fn proportion_chain_recommendations_generate_cards_and_can_be_applied() {
+        let config = cfg(TargetView::None);
+        let prompt = "1girl, flat chest, smile";
+        let (res, _out) = run(prompt, &config);
+        assert!(res.changes.iter().any(|c| c.action == ChangeAction::Recommendation && c.reason.contains("flat chest")));
+        let rec_card = res.changes.iter().find(|c| c.action == ChangeAction::Recommendation).unwrap();
+        assert_eq!(rec_card.mode, 2);
+
+        // When user applies the recommendation card (mode 0)
+        let mut applied_card = rec_card.clone();
+        applied_card.mode = 0;
+        let condensed = crate::condenser::build_condensed_output(
+            prompt,
+            &res.processed_tokens,
+            &[applied_card],
+            &config,
+        );
+        assert!(
+            condensed.final_prompt.contains("loose shirt")
+                || condensed.final_prompt.contains("sarashi")
+                || condensed.final_prompt.contains("baggy clothes")
+                || condensed.final_prompt.contains("collarbone")
+        );
     }
 }
 

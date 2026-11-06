@@ -646,6 +646,7 @@ component PromptColumn inherits VerticalLayout {
     callback edited();
     callback after-view-changed(int);
     callback copy();
+    callback copy-section-blocks();
     callback copy-negative();
 
     spacing: 0px;
@@ -944,8 +945,15 @@ component PromptColumn inherits VerticalLayout {
             // Copy Prompt Button
             PillButton {
                 text: "📋 Copy Prompt";
-                primary: true;
+                primary: root.after-view != 3 && root.after-view != 4;
                 clicked => { root.copy(); }
+            }
+
+            // Copy Section Blocks Button
+            PillButton {
+                text: root.after-view == 4 ? "📦 Copy AI Blocks" : "📦 Copy Section Blocks";
+                primary: root.after-view == 3 || root.after-view == 4;
+                clicked => { root.copy-section-blocks(); }
             }
 
             // Copy Negative Button (On the exact same line!)
@@ -982,23 +990,33 @@ component PromptColumn inherits VerticalLayout {
                     HorizontalLayout {
                         spacing: 8px;
                         Text {
-                            text: root.after-view == 2 ? "AFTER — DYNAMIC PROMPT" : (root.after-view == 1 ? "AFTER — AI IMPROVED" : "AFTER — CONDENSED & CONFLICT-FREE");
+                            text: root.after-view == 4 ? "AFTER — AI SECTION BLOCKS (DEEP AI SCAN)" : (root.after-view == 3 ? "AFTER — SECTION BLOCKS (MODULAR LAYOUT)" : (root.after-view == 2 ? "AFTER — DYNAMIC PROMPT" : (root.after-view == 1 ? "AFTER — AI IMPROVED" : "AFTER — CONDENSED & CONFLICT-FREE")));
                             font-size: 11px;
                             font-weight: 700;
                             color: M3.success;
                             vertical-alignment: center;
                         }
-                        if root.ai-improved-available || root.dynamic-enabled : HorizontalLayout {
+                        HorizontalLayout {
                             spacing: 4px;
                             PillButton {
                                 text: "Rule-based";
                                 primary: root.after-view == 0;
                                 clicked => { root.after-view-changed(0); }
                             }
+                            PillButton {
+                                text: "Section Blocks";
+                                primary: root.after-view == 3;
+                                clicked => { root.after-view-changed(3); }
+                            }
                             if root.ai-improved-available : PillButton {
                                 text: "AI Improved";
                                 primary: root.after-view == 1;
                                 clicked => { root.after-view-changed(1); }
+                            }
+                            if root.ai-improved-available : PillButton {
+                                text: "AI Section Blocks";
+                                primary: root.after-view == 4;
+                                clicked => { root.after-view-changed(4); }
                             }
                             if root.dynamic-enabled : PillButton {
                                 text: "Dynamic";
@@ -1009,9 +1027,15 @@ component PromptColumn inherits VerticalLayout {
                         Rectangle { horizontal-stretch: 1; }
                         Text { text: root.after-stats; font-size: 11px; color: M3.success; vertical-alignment: center; }
                         PillButton {
-                            text: "📋 Copy";
+                            text: (root.after-view == 3 || root.after-view == 4) ? "📋 Copy Blocks" : "📋 Copy";
                             primary: true;
-                            clicked => { root.copy(); }
+                            clicked => {
+                                if root.after-view == 3 || root.after-view == 4 {
+                                    root.copy-section-blocks();
+                                } else {
+                                    root.copy();
+                                }
+                            }
                         }
                     }
                     after-scroll := ScrollView {
@@ -1139,6 +1163,8 @@ export component AppWindow inherits Window {
     in-out property <int> angle_index: 0;      // index into profiles::CAMERA_ANGLES
     in-out property <[string]> pose_labels: [];
     in-out property <int> pose_index: 0;       // index into profiles::POSES
+    in-out property <[string]> proportion_labels: [];
+    in-out property <int> proportion_index: 0; // index into profiles::PROPORTIONS
     in-out property <bool> dynamic_enabled: false;
     in-out property <bool> arranged_enabled: false;   // After as grouped lines
     in-out property <bool> natural_enabled: false;    // natural-language sentences (NL checkpoints only)
@@ -1282,7 +1308,10 @@ export component AppWindow inherits Window {
     callback image_mode_changed();
     in-out property <bool> image_identity_only: false;   // images supply only who + outfit
     callback identity_changed();
+    in-out property <bool> image_second_pass: true;     // 2nd pass visual check with vision-capable model
+    callback second_pass_changed();
     callback read_image_requested();
+    callback redo_image_requested();
     in-out property <bool> images_pending: false;   // reference images picked, not read yet
 
     /// prompt vs LoRA split inside each character's card (saved in settings)
@@ -1308,6 +1337,7 @@ export component AppWindow inherits Window {
     callback download_tagger_requested();
     callback tag_threshold_changed();
     callback copy_output_requested();
+    callback copy_section_blocks_requested();
     callback card_mode_changed(int, int); // (card_id, new_mode)
     callback after_view_changed(int);
     callback copy_recommended_negative_requested();
@@ -1513,6 +1543,14 @@ export component AppWindow inherits Window {
                         horizontal-stretch: 1;
                         model: root.pose_labels;
                         current-index <=> root.pose_index;
+                        selected => { root.analyze_requested(); }
+                    }
+
+                    SectionLabel { text: "Body:"; vertical-alignment: center; }
+                    ComboBox {
+                        horizontal-stretch: 1;
+                        model: root.proportion_labels;
+                        current-index <=> root.proportion_index;
                         selected => { root.analyze_requested(); }
                     }
 
@@ -1818,12 +1856,19 @@ export component AppWindow inherits Window {
                                 clicked => { root.load_image_requested(); }
                             }
 
-                            // Read button (Tagger or Deep AI Vision Analysis)
+                            // Read button (Tagger or Combined AI Vision Analysis)
                             PillButton {
                                 primary: root.image_loaded || root.images_pending || root.scene_ref_loaded;
-                                text: root.tagger_busy ? "Reading…" : (root.image_use_ai ? "🧠 Read (AI)" : "⚡ Read (Tagger)");
+                                text: root.tagger_busy ? "Reading…" : (root.image_use_ai ? "✨ Read (Combined)" : "⚡ Read (Tagger)");
                                 enabled: !root.tagger_busy && (root.image_loaded || root.images_pending || root.scene_ref_loaded || root.char1_image_loaded);
                                 clicked => { root.read_image_requested(); }
+                            }
+
+                            // Dedicated Redo Vision button to force re-running the Vision Encoder
+                            PillButton {
+                                text: root.tagger_busy ? "…" : "↻ Redo Vision";
+                                enabled: !root.tagger_busy && root.ollama_connected && (root.image_loaded || root.images_pending || root.scene_ref_loaded || root.char1_image_loaded);
+                                clicked => { root.redo_image_requested(); }
                             }
 
                             // 1-Click Auto Scene Button (Fast scan of scene & poses)
@@ -1849,7 +1894,7 @@ export component AppWindow inherits Window {
                                 clicked => { root.image_use_ai = false; root.image_mode_changed(); }
                             }
                             PillButton {
-                                text: "AI";
+                                text: "Combined AI";
                                 primary: root.image_use_ai;
                                 enabled: !root.tagger_busy;
                                 clicked => { root.image_use_ai = true; root.image_mode_changed(); }
@@ -1859,6 +1904,12 @@ export component AppWindow inherits Window {
                                 checked <=> root.image_identity_only;
                                 enabled: !root.tagger_busy;
                                 toggled => { root.identity_changed(); }
+                            }
+                            FilterChip {
+                                text: "2nd Pass Visual Check";
+                                checked <=> root.image_second_pass;
+                                enabled: !root.tagger_busy;
+                                toggled => { root.second_pass_changed(); }
                             }
                         }
                     }
@@ -2188,9 +2239,9 @@ export component AppWindow inherits Window {
                 scene-summary: root.scene_summary;
                 scene-details: root.scene_details;
                 scene-issues: root.scene_issues;
-                show-ai-button: root.ai_improved_available && root.after_view == 0;
+                show-ai-button: root.ai_improved_available && (root.after_view == 0 || root.after_view == 3);
                 mode-changed(id, mode) => { root.card_mode_changed(id, mode); }
-                show-ai => { root.after_view_changed(1); }
+                show-ai => { if root.after_view == 3 { root.after_view_changed(4); } else { root.after_view_changed(1); } }
             }
             Splitter {
                 height: 10px;
@@ -2232,6 +2283,7 @@ export component AppWindow inherits Window {
                 edited => { root.analyze_requested(); }
                 after-view-changed(v) => { root.after_view_changed(v); }
                 copy => { root.copy_output_requested(); }
+                copy-section-blocks => { root.copy_section_blocks_requested(); }
                 copy-negative => { root.copy_recommended_negative_requested(); }
                 output-collapsed <=> root.output_collapsed;
             }

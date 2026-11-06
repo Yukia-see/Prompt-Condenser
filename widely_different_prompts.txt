@@ -1,0 +1,33 @@
+# Widely Different Attributes - High Contrast Separation Prompts
+Optimized for: Anima Pencil-XL (SDXL) in ComfyUI using the BREAK command.
+
+These prompts use maximum attribute divergence across all three figures:
+- Colors: Crimson Red vs Pristine Silver vs Neon Pink (zero color confusion)
+- Builds: Tall & Voluptuous vs Graceful & Medium vs Petite & Flat-Chested with Wide Hips
+- Archetypes: Cyber/Demon Warrior vs Celestial Priestess vs Pastel Techwear Catgirl
+- Poses & Expressions: Fierce battle grin vs Serene prayer vs Playful dynamic wink
+
+================================================================================
+Theme 1: Fantasy / Sci-Fi Extreme Contrast Trio (The Ultimate Separation Test)
+================================================================================
+
+masterpiece, best quality, 3girls, contrasting themes, different hair colors, contrasting skin tones, alternate breast size, contrasting poses, wide shot, dynamic lighting, anime style, highly detailed, BREAK,
+1girl, on the left, tanned skin, crimson red hair, long spiky ponytail, black demon horns, red eyes, fierce grin, sharp teeth, tall stature, (gigantic breasts:1.25), toned figure, black leather combat jacket, torn dark shorts, fingerless gloves, combat boots, holding mechanical greatsword over shoulder, dynamic combat stance, BREAK,
+1girl, in the middle, pale skin, silver hair, straight hime cut, pointed elf ears, golden halo, emerald green eyes, serene calm smile, standing upright, normal height, (medium breasts:1.15), slender frame, flowing white and gold ceremonial silk robes, detached bell sleeves, gold embroidery, white stockings, sandals, hands clasped together holding holy staff, BREAK,
+1girl, on the right, fair skin, blush stickers, bubblegum pink hair, short messy bob, twin buns, black cat ears, fluffy black cat tail, aqua blue eyes, winking, playful open mouth, :3, petite stature, short height, (flat chest:1.3), petite bust, (large ass:1.25), (wide hips:1.25), (thick thighs:1.25), oversized turquoise techwear hoodie, pink micro skirt, loose socks, chunky platform sneakers, neck headphones, peace sign, leaning forward
+
+Negative Prompt:
+worst quality, low quality, score_1, score_2, score_3, blurry, jpeg artifacts, identical faces, identical hair, color bleeding, attribute crossover, symmetrical pose, deformed hands, bad anatomy
+
+
+================================================================================
+Theme 2: Modern School / Urban High-Contrast Trio (Punk vs Class Rep vs Gyaru)
+================================================================================
+
+masterpiece, best quality, 3girls, contrasting personalities, different hair colors, alternate breast size, contrasting poses, school hallway, daytime, sunlight through window, anime style, highly detailed, BREAK,
+1girl, on the left, jet black wolf cut, messy hair, red streaks, skull hairpin, dark eyeliner, piercing amber eyes, bored smirk, chewing bubblegum, tall stature, (gigantic breasts:1.25), curvy silhouette, unbuttoned black gakuran jacket, dark bandeau top, long black pleated skirt, biker boots, bandaged knuckles, slouching with hand in pocket, BREAK,
+1girl, in the middle, navy blue neat bob, blunt bangs, red frame glasses, hazel eyes, serious focused expression, standing upright, normal height, (medium breasts:1.15), slender posture, pristine navy blazer, white collared shirt, red necktie, pleated grey skirt, black knee socks, brown leather loafers, holding clipboard against chest, dignified posture, BREAK,
+1girl, on the right, platinum blonde hair, high twin-tails, colorful star hairpins, bright purple eyes, cheerful wide open-mouth smile, fang, tanned skin, short petite stature, (flat chest:1.3), petite bust, (large ass:1.25), (wide hips:1.25), (thick thighs:1.25), bright yellow track jacket tied around waist, white polo shirt, denim shorts, striped athletic socks, high-top sneakers, jumping pose, pointing at camera, energetic
+
+Negative Prompt:
+worst quality, low quality, score_1, score_2, score_3, blurry, jpeg artifacts, identical faces, identical uniforms, color bleed, symmetrical body, bad anatomy

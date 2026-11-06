@@ -73,8 +73,7 @@ pub fn download(progress: Sender<String>) -> Result<()> {
             }
             out.write_all(&buf[..n])?;
             done += n as u64;
-            if total > 0 {
-                let pct = done * 100 / total;
+            if let Some(pct) = (done * 100).checked_div(total) {
                 if pct != last_pct {
                     last_pct = pct;
                     let _ = progress.send(format!(
@@ -179,6 +178,9 @@ fn tag_many(imgs: &[&image::DynamicImage]) -> Result<Vec<Vec<ScoredTag>>> {
         let outputs = loaded.session.run(ort::inputs![tensor])?;
         let (_, scores) = outputs[0].try_extract_tensor::<f32>()?;
         let per = loaded.tags.len();
+        if scores.len() < n * per {
+            return Err(anyhow!("Tagger model returned {} scores, expected {}", scores.len(), n * per));
+        }
         Ok((0..n)
             .map(|i| {
                 loaded

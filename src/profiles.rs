@@ -49,6 +49,10 @@ impl CheckpointProfile {
         matches!(self, Self::Anima | Self::Sdxl | Self::Flux)
     }
 
+    pub fn is_2d_anime_checkpoint(&self) -> bool {
+        matches!(self, Self::Anima | Self::PonyV6 | Self::Illustrious | Self::Sd15)
+    }
+
     pub fn uses_explicit_weights(&self) -> bool {
         !matches!(self, Self::Flux)
     }
@@ -253,25 +257,29 @@ impl TargetView {
             }
             Self::UpperBody => {
                 "The user wants an Upper Body / Cowboy Shot framing. \
-                 Remove conflicting crops like 'full body, feet out of frame, extreme close-up, portrait'. \
-                 CRITICAL: If the prompt contains lower/rear body tags like 'ass, butt, huge ass, feet' that pull the camera down/back, \
-                 replace them with FRAMING-SAFE upper-body equivalents like 'curvy, voluptuous, hourglass figure, narrow waist, arched back' \
-                 so the character keeps the exact same curvy appeal without breaking Upper Body framing!"
+                 Remove conflicting crops like 'full body, lower body, wide shot'. \
+                 Remove lower body, leg, footwear, and action tags ('feet, barefoot, toes, shoes, boots, high heels, sneakers, sandals, footwear, ankles, anklet, socks, kneehighs, thighhighs, thighs, thick thighs, knees, calves, shins, standing, walking, running, squatting') \
+                 or replace them with upper-body poise tags ('slender build, graceful posture, poised stance'). \
+                 If the prompt contains lower/rear body tags like 'ass, butt, huge ass' that pull the camera down/back, \
+                 replace them with FRAMING-SAFE upper-body equivalents like 'curvy, voluptuous, hourglass figure, narrow waist, arched back'."
             }
             Self::CloseUpPortrait => {
                 "The user wants a Close-Up / Portrait shot. \
-                 Remove 'full body, cowboy shot, wide shot' and replace lower/mid-body physique tags (like 'abs, thick thighs, ass, legs') \
-                 with portrait-safe equivalents ('athletic build, toned shoulders, defined collarbone, expressive face')."
+                 Remove 'full body, cowboy shot, wide shot, lower body' and replace lower-body physique, clothing, footwear, and action tags \
+                 ('feet, barefoot, toes, shoes, boots, high heels, sneakers, sandals, footwear, ankles, anklet, socks, kneehighs, thighhighs, pantyhose, legwear, thighs, thick thighs, thigh gap, hips, wide hips, butt, ass, panties, skirt, shorts, pants, navel, midriff, standing, walking, running, sitting, squatting') \
+                 with portrait-safe equivalents ('athletic build, toned shoulders, defined collarbone, expressive face, styled hair')."
             }
             Self::FrontView => {
                 "The user wants a Front View shot. \
-                 Remove 'from behind, back view' and replace rear-only anatomical tags (like 'ass, butt, back tattoo') \
-                 with front-compatible silhouette tags ('wide hips, curvy, hourglass figure, thick thighs')."
+                 Remove 'from behind, back view, rear view, back focus, over the shoulder, looking back, profile, from side, side view' \
+                 and replace rear-only anatomical and outfit tags ('from behind, back, bare back, shoulder blades, scapulae, nape, spine, back dimples, sacral dimples, butt, ass, ass focus, butt crack, backless dress, backless outfit, back bow, tailplug, buttplug, back tattoo, reverse bunnysuit, sideboob') \
+                 with front-compatible silhouette tags ('defined collarbone, toned shoulders, wide hips, curvy, hourglass figure, thick thighs, cleavage cutout')."
             }
             Self::FromBehind => {
                 "The user wants a From Behind / Back View shot. \
-                 Remove 'front view, straight-on' and replace front-only torso tags (like 'cleavage, front chest') \
-                 with rear-compatible equivalents ('sideboob, breasts from behind, curvy silhouette, arched back, looking back')."
+                 Remove 'front view, straight-on' and replace front-only torso tags \
+                 ('navel, stomach, midriff, abs, cleavage, underboob, cameltoe, bulge, collarbone, chest, breasts, large breasts, medium breasts, small breasts, flat chest') \
+                 with rear-compatible equivalents ('sideboob, breasts from behind, curvy silhouette, arched back, toned back, curvy hips, back dimples, defined spine')."
             }
             Self::SideProfile => {
                 "The user wants a Side Profile / From Side view. \
@@ -279,7 +287,9 @@ impl TargetView {
             }
             Self::FullBody => {
                 "The user wants a Full Body shot showing head to toe. \
-                 Remove 'portrait, close-up, upper body, cowboy shot, cropped' and suggest 'full body, standing, head to toe'."
+                 Remove 'portrait, close-up, face focus, eye focus, cropped' and replace micro-facial detail tags \
+                 ('detailed eyes, pupils, slit pupils, sclera, lip gloss, uvula, mole under eye') \
+                 with full-body safe equivalents ('expressive face, clear facial features, head to toe, standing')."
             }
         }
     }
@@ -312,54 +322,50 @@ impl AiMode {
     }
 }
 
-/// The AI models the app offers: all Gemma 4, uncensored, registered in Ollama
-/// under short names. (Qwen2.5 / Qwen3 / Qwen3.5 were tried and lost to Gemma.)
+/// The AI models the app offers: Good, Better, Best, uncensored, registered in Ollama.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AiModelTier {
-    /// Gemma 4 E2B (~2B active) at Q8: small models lose more to compression, and Q8
-    /// fixed Q4's habit of softening explicit prompts, for under 1 GB more.
-    GemmaE2B,
-    /// Gemma 4 E4B (~4B active).
-    GemmaE4B,
-    /// Gemma 4 12B Q4: the recommended default.
-    Gemma12,
+    /// Good: Gemma 4 E4B (~4B active) Q4_K_M (~3.5 GB VRAM).
+    Good,
+    /// Better: Llama 3.1 8B Instruct Abliterated (~5 GB VRAM).
+    Better,
+    /// Best: Gemma 4 12B Abliterated (~8 GB VRAM).
+    Best,
 }
 
 impl AiModelTier {
-    /// Dropdown order, lightest to best: the app selects the last installed one by default.
-    pub const ALL: [AiModelTier; 3] = [Self::GemmaE2B, Self::GemmaE4B, Self::Gemma12];
+    /// Dropdown order, Good to Best: the app selects the last installed one by default.
+    pub const ALL: [AiModelTier; 3] = [Self::Good, Self::Better, Self::Best];
 
     pub fn label(&self) -> &'static str {
         match self {
-            Self::GemmaE2B => "Light — Gemma 4 E2B Q8 (~3 GB VRAM)",
-            Self::GemmaE4B => "Balanced — Gemma 4 E4B (~3.5 GB VRAM)",
-            Self::Gemma12 => "Maximum Fast — Gemma 4 12B Q4 (~8 GB VRAM)",
+            Self::Good => "Good — Gemma 4 E4B (~3.5 GB VRAM)",
+            Self::Better => "Better — Llama 3.1 8B Abliterated (~5 GB VRAM)",
+            Self::Best => "Best — Gemma 4 12B Abliterated (~8 GB VRAM)",
         }
     }
 
     /// Name the model has inside Ollama (set by `install.sh` or the in-app download).
     pub fn ollama_name(&self) -> &'static str {
         match self {
-            Self::GemmaE2B => "prompt-condenser-gemma4-e2b-q8",
-            Self::GemmaE4B => "prompt-condenser-gemma4-e4b",
-            Self::Gemma12 => "prompt-condenser-gemma4-12b",
+            Self::Good => "prompt-condenser-gemma4-e4b",
+            Self::Better => "richardyoung/llama-3.1-8b-instruct-abliterated",
+            Self::Best => "huihui_ai/gemma-4-abliterated:12b",
         }
     }
 
     /// How long Ollama keeps the model loaded after a scan, so the next scan starts
-    /// instantly. (All current tiers fit comfortably; shorten this for bigger models on
-    /// shared-memory GPUs, where a loaded model takes system RAM.)
+    /// instantly.
     pub fn keep_alive(&self) -> &'static str {
         "30m"
     }
 
-    /// Where Ollama downloads it from. The E2B/E4B builds are text-only (no 1 GB image
-    /// projector), which keeps their memory use down.
+    /// Where Ollama downloads it from.
     pub fn hf_ref(&self) -> &'static str {
         match self {
-            Self::GemmaE2B => "hf.co/TrevorJS/gemma-4-E2B-it-uncensored-GGUF:Q8_0",
-            Self::GemmaE4B => "hf.co/TrevorJS/gemma-4-E4B-it-uncensored-GGUF:Q4_K_M",
-            Self::Gemma12 => "hf.co/culturerevolt/gemma-4-12b-heretic-abliterated-GGUF:Q4_K_M",
+            Self::Good => "hf.co/TrevorJS/gemma-4-E4B-it-uncensored-GGUF:Q4_K_M",
+            Self::Better => "richardyoung/llama-3.1-8b-instruct-abliterated:latest",
+            Self::Best => "huihui_ai/gemma-4-abliterated:12b",
         }
     }
 }
@@ -439,6 +445,19 @@ pub const POSES: &[(&str, &str)] = &[
     ("Sleeping", "sleeping, closed eyes"),
     ("Candid (natural, unposed)", "candid, natural pose"),
     ("Random pose (dynamic prompt)", "{standing|sitting|leaning against wall|dynamic pose|looking back|arms up}"),
+];
+
+/// Body proportion presets (dropdown label, tags). Index 0 = none.
+pub const PROPORTIONS: &[(&str, &str)] = &[
+    ("None (keep prompt's proportion)", ""),
+    ("Flat chest (slender, aa-cup)", "flat chest, aa cup, small underbust, slender torso"),
+    ("Small breasts (perky, a/b-cup)", "small breasts, a cup, perky breasts"),
+    ("Medium breasts (full, c/d-cup)", "medium breasts, c cup, proportionate body"),
+    ("Large breasts (curvy, e/f-cup)", "large breasts, e cup, curvy, voluptuous"),
+    ("Huge breasts (heavy, g/h-cup)", "huge breasts, g cup, heavy breasts, deep cleavage"),
+    ("Gigantic breasts (hyper, massive)", "gigantic breasts, massive breasts, voluptuous"),
+    ("Thick thighs & wide hips (curvy)", "thick thighs, wide hips, plump thighs, curvy"),
+    ("Muscular & athletic (toned, abs)", "muscular female, abs, toned, athletic, defined muscles"),
 ];
 
 /// Every tag that belongs to a list above (lowercase), used to spot existing angle /

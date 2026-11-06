@@ -1,0 +1,46 @@
+# Composed Multi-Character Prompt: Test Scene 2 + 2 Distinct Characters
+# Scene Reference: /home/yukia/Pictures/HWP1dffawAA5Y7K.jpg (Cozy Room, Red Couch & Bookshelf)
+# Character 1 Reference: Emerald Green Hair / White Dress Persona (Mewson-2.png)
+# Character 2 Reference: Platinum Silver Hair / Gothic Uniform Persona
+# Base Checkpoint: Anima-based Community Checkpoints (Anima Pencil-XL / Animagine XL / SDXL)
+# Rule: Single-line format includes BREAK; Line-separated format uses clean newlines without BREAK.
+
+================================================================================
+1. Single-Line Prompt (Includes BREAK for Single Text Box / CLIPTextEncodeWithBreak):
+================================================================================
+
+masterpiece, best quality, 2girls, indoors, cozy room, dark background, wooden bookshelf, books on shelves, red couch, sitting together, soft lighting, warm atmosphere, medium shot, eye level, anime style, BREAK, 1girl, on the left, emerald green hair, messy bob cut, green eyes, confident smile, (large breasts:1.2), curvy figure, elegant white collared dress, black thighhighs, sitting on red couch, looking at viewer, eating lollipop, lollipop in mouth, holding candy, BREAK, 1girl, on the right, platinum silver hair, long side ponytail, dark blue hair ribbon, amber eyes, subtle smirk, (flat chest:1.25), petite bust, slender build, dark navy sailor uniform, black neckerchief, pleated skirt, white over-knee socks, sitting on red couch, crossed legs, looking at viewer, holding lollipop, leaning back
+
+================================================================================
+2. Line-Separated Prompt (Clean Line Separation — NO BREAK Needed):
+================================================================================
+
+masterpiece, best quality, 2girls, indoors, cozy room, dark background, wooden bookshelf, books on shelves, red couch, sitting together, soft lighting, warm atmosphere, medium shot, eye level, anime style,
+1girl, on the left, emerald green hair, messy bob cut, green eyes, confident smile, (large breasts:1.2), curvy figure, elegant white collared dress, black thighhighs, sitting on red couch, looking at viewer, eating lollipop, lollipop in mouth, holding candy,
+1girl, on the right, platinum silver hair, long side ponytail, dark blue hair ribbon, amber eyes, subtle smirk, (flat chest:1.25), petite bust, slender build, dark navy sailor uniform, black neckerchief, pleated skirt, white over-knee socks, sitting on red couch, crossed legs, looking at viewer, holding lollipop, leaning back
+
+================================================================================
+3. Section-by-Section Blocks (Modular Node Layout — NO BREAK Needed):
+================================================================================
+
+[Scene / Environment & Shared Framing]:
+masterpiece, best quality, 2girls, indoors, cozy room, dark background, 
+wooden bookshelf, books on shelves, red couch, sitting together, soft lighting, 
+warm atmosphere, medium shot, eye level, anime style
+
+[Left Character (Character 1 Identity + Scene 2 Action)]:
+1girl, on the left, emerald green hair, messy bob cut, green eyes, confident smile, 
+(large breasts:1.2), curvy figure, elegant white collared dress, black thighhighs, 
+sitting on red couch, looking at viewer, eating lollipop, lollipop in mouth, holding candy
+
+[Right Character (Character 2 Identity + Scene 2 Action)]:
+1girl, on the right, platinum silver hair, long side ponytail, dark blue hair ribbon, 
+amber eyes, subtle smirk, (flat chest:1.25), petite bust, slender build, dark navy sailor uniform, 
+black neckerchief, pleated skirt, white over-knee socks, sitting on red couch, crossed legs, 
+looking at viewer, holding lollipop, leaning back
+
+================================================================================
+Recommended Negative Prompt:
+================================================================================
+
+worst quality, low quality, score_1, score_2, score_3, blurry, jpeg artifacts, identical faces, identical hairstyles, attribute crossover, color bleed, symmetrical pose, deformed hands, bad anatomy, bad fingers, extra limbs
