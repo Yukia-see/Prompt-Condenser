@@ -421,6 +421,45 @@ def test_pure_zone_boxes_skips_lower_zone_for_half_body():
         assert z["y0"] >= 0.0 and z["y1"] <= 1000.0
 
 
+def test_two_source_rule_drops_single_mention_vlm_tags_when_enabled():
+    wd = "1girl, solo, blue_dress"
+    pass1 = "she is standing in a bedroom with a desk."
+    # pass2 mentions glasses which WD14 never saw and pass1 never saw
+    pass2 = "she has blonde hair and glasses and a blue dress."
+    vocab = {"glasses", "desk", "standing", "bedroom", "blonde hair", "blue dress"}
+
+    # Default (require_two_sources=False): glasses is logged in dropped_unconfirmed but kept in output
+    m_default = p.merge_tags(wd, pass1, pass2, "scene_shape", vocab, require_two_sources=False)
+    assert "glasses" in m_default["pass2_tags"]
+    assert "glasses" in m_default["dropped_unconfirmed"]
+
+    # When require_two_sources=True: single-mention unconfirmed VLM tags are pruned from prompt
+    m_strict = p.merge_tags(wd, pass1, pass2, "scene_shape", vocab, require_two_sources=True)
+    assert "glasses" not in m_strict["pass2_tags"]
+    assert "glasses" in m_strict["dropped_unconfirmed"]
+    # But blonde hair in pass 2 was also not in WD and not in pass 1 -> pruned
+    assert "blonde hair" not in m_strict["pass2_tags"]
+    # blue dress was in WD14 -> confirmed and kept!
+    assert "blue dress" in m_strict["pass2_tags"]
+    # standing is a pose override in EXCLUSIVE_GROUPS -> kept!
+    assert "standing" in m_strict["pass1_tags"]
+
+
+def test_two_source_rule_retains_when_second_pass_agrees():
+    wd = "1girl, solo"
+    pass1 = "she is wearing a butterfly hairpin and a red ribbon."
+    pass2 = "she has a butterfly hairpin in her hair."
+    vocab = {"butterfly hairpin", "red ribbon"}
+
+    m = p.merge_tags(wd, pass1, pass2, "scene_shape", vocab, require_two_sources=True)
+    # butterfly hairpin appeared in BOTH pass1 and pass2 (2 sources) -> retained!
+    assert "butterfly hairpin" in m["pass2_tags"]
+    assert "butterfly hairpin" not in m["dropped_unconfirmed"]
+    # red ribbon appeared in pass1 only and not in WD14 (1 source) -> dropped as unconfirmed!
+    assert "red ribbon" not in m["pass2_tags"]
+    assert "red ribbon" in m["dropped_unconfirmed"]
+
+
 if __name__ == "__main__":  # zero-dependency runner
     import inspect
     import sys

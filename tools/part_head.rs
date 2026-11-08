@@ -71,6 +71,8 @@ pub struct Config {
     pub escape_parentheses: bool,
     /// Mechanical path only: also append VLM wording that matched no tag.
     pub keep_unmatched_prose: bool,
+    /// Two-source rule: prune VLM tags that have only 1 source and were not in WD14.
+    pub require_two_sources: bool,
     pub vlm_temperature: f32,
     pub vlm_retries: u32,
     pub vlm_retry_temp_bump: f32,
@@ -88,6 +90,7 @@ impl Default for Config {
             quality_prefix: QUALITY_PREFIX_DEFAULT.to_string(),
             escape_parentheses: false,
             keep_unmatched_prose: false,
+            require_two_sources: false,
             vlm_temperature: VLM_TEMPERATURE,
             vlm_retries: VLM_RETRIES,
             vlm_retry_temp_bump: VLM_RETRY_TEMP_BUMP,

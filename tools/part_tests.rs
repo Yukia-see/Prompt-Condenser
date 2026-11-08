@@ -463,4 +463,45 @@ mod tests {
         let bust_names: Vec<&str> = bust.iter().map(|b| b.name).collect();
         assert_eq!(bust_names, vec!["Upper"]);
     }
+
+    #[test]
+    fn two_source_rule_drops_single_mention_vlm_tags_when_enabled() {
+        let wd = "1girl, solo, blue_dress";
+        let pass1 = "she is standing in a bedroom with a desk.";
+        let pass2 = "she has blonde hair and glasses and a blue dress.";
+        let vocab: HashSet<String> = ["glasses", "desk", "standing", "bedroom", "blonde hair", "blue dress"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        // Default: glasses logged in dropped_unconfirmed but kept
+        let m_def = merge_tags_with_options(wd, pass1, pass2, Mode::SceneShape, Some(&vocab), false);
+        assert!(m_def.pass2_tags.contains(&"glasses".to_string()));
+        assert!(m_def.dropped_unconfirmed.contains(&"glasses".to_string()));
+
+        // Strict (require_two_sources=true): glasses pruned
+        let m_strict = merge_tags_with_options(wd, pass1, pass2, Mode::SceneShape, Some(&vocab), true);
+        assert!(!m_strict.pass2_tags.contains(&"glasses".to_string()));
+        assert!(m_strict.dropped_unconfirmed.contains(&"glasses".to_string()));
+        assert!(!m_strict.pass2_tags.contains(&"blonde hair".to_string()));
+        assert!(m_strict.pass2_tags.contains(&"blue dress".to_string()));
+        assert!(m_strict.pass1_tags.contains(&"standing".to_string()));
+    }
+
+    #[test]
+    fn two_source_rule_retains_when_second_pass_agrees() {
+        let wd = "1girl, solo";
+        let pass1 = "she is wearing a butterfly hairpin and a red ribbon.";
+        let pass2 = "she has a butterfly hairpin in her hair.";
+        let vocab: HashSet<String> = ["butterfly hairpin", "red ribbon"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        let m = merge_tags_with_options(wd, pass1, pass2, Mode::SceneShape, Some(&vocab), true);
+        assert!(m.pass2_tags.contains(&"butterfly hairpin".to_string()));
+        assert!(!m.dropped_unconfirmed.contains(&"butterfly hairpin".to_string()));
+        assert!(!m.pass2_tags.contains(&"red ribbon".to_string()));
+        assert!(m.dropped_unconfirmed.contains(&"red ribbon".to_string()));
+    }
 }

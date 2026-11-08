@@ -71,7 +71,10 @@ pub fn read(path: &Path, n: usize, close_ups: bool) -> Result<TagSplit> {
             }
             let mut chars = Vec::new();
             for b in bs {
-                let crop = detector::crop(&image, b);
+                let (crop, warn) = detector::crop_with_overlap_mask(&image, b, bs);
+                if let Some(w) = warn {
+                    eprintln!("Warning: {}", w);
+                }
                 let mut tags = tagger::tag_dynamic(&crop)?;
                 if zoom {
                     for (_, zone_img) in detector::three_zone_crops(&image, b) {
@@ -127,17 +130,7 @@ pub fn tag_one_fast(path: &Path, progress: &(dyn Fn(String) + Sync)) -> Result<V
         return tag_one(path, progress);
     }
     let image = image::open(path).with_context(|| format!("Couldn't open {}", path.display()))?;
-    let mut boxes = detector::detect(&image).unwrap_or_default();
-    if boxes.is_empty() {
-        // Fallback to full-frame bounding box when anime person detector finds no box (e.g. realistic/cosplay photos)
-        boxes.push(PersonBox {
-            x0: 0.0,
-            y0: 0.0,
-            x1: image.width() as f32,
-            y1: image.height() as f32,
-            score: 1.0,
-        });
-    }
+    let boxes = detector::detect(&image).unwrap_or_default();
     let full = tagger::tag_dynamic(&image)?;
     let mut merged = full;
     // 1. Scan 4 Overlapping Quadrants (TL, TR, BL, BR) for environmental objects & props (plants, lamps, furniture)
@@ -145,6 +138,11 @@ pub fn tag_one_fast(path: &Path, progress: &(dyn Fn(String) + Sync)) -> Result<V
         if let Ok(q_tags) = tagger::tag_dynamic(&quad) {
             merged = tagger::merge_quadrant_scene_crop(&merged, &q_tags);
         }
+    }
+
+    if boxes.is_empty() {
+        progress("Warning: No figure detected; processed full frame and scene quadrants only.".to_string());
+        return Ok(merged);
     }
 
     // 2. Universal 3-Zone Anatomical Scan (Upper, Middle, Lower) for EVERY character

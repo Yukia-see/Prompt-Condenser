@@ -444,6 +444,7 @@ pub struct Merged {
     pub dropped_vlm: Vec<String>,
     pub dropped_wd14: Vec<String>,
     pub dropped_hedged: Vec<String>,
+    pub dropped_unconfirmed: Vec<String>,
     pub negated_vlm: Vec<String>,
     /// WD14 tags that matched no scene keyword and defaulted to Pass 2; grow the
     /// keyword lists from these.
@@ -458,6 +459,17 @@ pub fn merge_tags(
     pass2_txt: &str,
     mode: Mode,
     vocab: Option<&HashSet<String>>,
+) -> Merged {
+    merge_tags_with_options(raw_wd14_tags, pass1_txt, pass2_txt, mode, vocab, false)
+}
+
+pub fn merge_tags_with_options(
+    raw_wd14_tags: &str,
+    pass1_txt: &str,
+    pass2_txt: &str,
+    mode: Mode,
+    vocab: Option<&HashSet<String>>,
+    require_two_sources: bool,
 ) -> Merged {
     let wd_all = normalized_tags(raw_wd14_tags);
     let (wd1, wd2) = sort_tag_lists(raw_wd14_tags, mode);
@@ -479,8 +491,8 @@ pub fn merge_tags(
         .map(|t| (*t).clone())
         .collect();
 
-    let md1: Vec<String> = a1.tags.iter().filter(|t| !hedged_unconfirmed.contains(*t)).cloned().collect();
-    let md2: Vec<String> = a2.tags.iter().filter(|t| !hedged_unconfirmed.contains(*t)).cloned().collect();
+    let mut md1: Vec<String> = a1.tags.iter().filter(|t| !hedged_unconfirmed.contains(*t)).cloned().collect();
+    let mut md2: Vec<String> = a2.tags.iter().filter(|t| !hedged_unconfirmed.contains(*t)).cloned().collect();
     let mut negated: Vec<String> = a1
         .negated
         .iter()
@@ -490,6 +502,30 @@ pub fn merge_tags(
         .into_iter()
         .collect();
     negated.sort();
+
+    // Phase 3: Two-Source Rule
+    let mut exclusive_all = HashSet::new();
+    for group in EXCLUSIVE_GROUPS {
+        for item in *group {
+            exclusive_all.insert(*item);
+        }
+    }
+    let mut unconfirmed = BTreeSet::new();
+    let md1_set: HashSet<String> = md1.iter().cloned().collect();
+    let md2_set: HashSet<String> = md2.iter().cloned().collect();
+
+    for t in md1.iter().chain(md2.iter()) {
+        if !wd_set.contains(t) && !exclusive_all.contains(t.as_str()) {
+            let in_both = md1_set.contains(t) && md2_set.contains(t);
+            if !in_both {
+                unconfirmed.insert(t.clone());
+            }
+        }
+    }
+    if require_two_sources {
+        md1.retain(|t| !unconfirmed.contains(t));
+        md2.retain(|t| !unconfirmed.contains(t));
+    }
 
     let all_md: Vec<String> = md1.iter().chain(md2.iter()).cloned().collect();
     let all_wd: Vec<String> = wd1.iter().chain(wd2.iter()).cloned().collect();
@@ -515,6 +551,7 @@ pub fn merge_tags(
         dropped_vlm: drop_vlm_sorted.clone(),
         dropped_wd14: sorted(&drop_wd),
         dropped_hedged: hedged_unconfirmed.into_iter().collect(),
+        dropped_unconfirmed: unconfirmed.into_iter().collect(),
         negated_vlm: negated.clone(),
         unrouted_wd14: wd2,
         dropped_moondream: drop_vlm_sorted,
@@ -539,7 +576,7 @@ pub fn process_direct(
     vocab: Option<&HashSet<String>>,
     cfg: &Config,
 ) -> Prompts {
-    let m = merge_tags(raw_wd14_tags, pass1_txt, pass2_txt, mode, vocab);
+    let m = merge_tags_with_options(raw_wd14_tags, pass1_txt, pass2_txt, mode, vocab, cfg.require_two_sources);
     let (extra1, extra2) = if cfg.keep_unmatched_prose {
         (flatten_zones(pass1_txt), flatten_zones(pass2_txt))
     } else {

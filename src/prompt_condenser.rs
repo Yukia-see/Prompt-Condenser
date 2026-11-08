@@ -71,6 +71,8 @@ pub struct Config {
     pub escape_parentheses: bool,
     /// Mechanical path only: also append VLM wording that matched no tag.
     pub keep_unmatched_prose: bool,
+    /// Two-source rule: prune VLM tags that have only 1 source and were not in WD14.
+    pub require_two_sources: bool,
     pub vlm_temperature: f32,
     pub vlm_retries: u32,
     pub vlm_retry_temp_bump: f32,
@@ -88,6 +90,7 @@ impl Default for Config {
             quality_prefix: QUALITY_PREFIX_DEFAULT.to_string(),
             escape_parentheses: false,
             keep_unmatched_prose: false,
+            require_two_sources: false,
             vlm_temperature: VLM_TEMPERATURE,
             vlm_retries: VLM_RETRIES,
             vlm_retry_temp_bump: VLM_RETRY_TEMP_BUMP,
@@ -1333,6 +1336,7 @@ pub struct Merged {
     pub dropped_vlm: Vec<String>,
     pub dropped_wd14: Vec<String>,
     pub dropped_hedged: Vec<String>,
+    pub dropped_unconfirmed: Vec<String>,
     pub negated_vlm: Vec<String>,
     /// WD14 tags that matched no scene keyword and defaulted to Pass 2; grow the
     /// keyword lists from these.
@@ -1347,6 +1351,17 @@ pub fn merge_tags(
     pass2_txt: &str,
     mode: Mode,
     vocab: Option<&HashSet<String>>,
+) -> Merged {
+    merge_tags_with_options(raw_wd14_tags, pass1_txt, pass2_txt, mode, vocab, false)
+}
+
+pub fn merge_tags_with_options(
+    raw_wd14_tags: &str,
+    pass1_txt: &str,
+    pass2_txt: &str,
+    mode: Mode,
+    vocab: Option<&HashSet<String>>,
+    require_two_sources: bool,
 ) -> Merged {
     let wd_all = normalized_tags(raw_wd14_tags);
     let (wd1, wd2) = sort_tag_lists(raw_wd14_tags, mode);
@@ -1368,8 +1383,8 @@ pub fn merge_tags(
         .map(|t| (*t).clone())
         .collect();
 
-    let md1: Vec<String> = a1.tags.iter().filter(|t| !hedged_unconfirmed.contains(*t)).cloned().collect();
-    let md2: Vec<String> = a2.tags.iter().filter(|t| !hedged_unconfirmed.contains(*t)).cloned().collect();
+    let mut md1: Vec<String> = a1.tags.iter().filter(|t| !hedged_unconfirmed.contains(*t)).cloned().collect();
+    let mut md2: Vec<String> = a2.tags.iter().filter(|t| !hedged_unconfirmed.contains(*t)).cloned().collect();
     let mut negated: Vec<String> = a1
         .negated
         .iter()
@@ -1379,6 +1394,30 @@ pub fn merge_tags(
         .into_iter()
         .collect();
     negated.sort();
+
+    // Phase 3: Two-Source Rule
+    let mut exclusive_all = HashSet::new();
+    for group in EXCLUSIVE_GROUPS {
+        for item in *group {
+            exclusive_all.insert(*item);
+        }
+    }
+    let mut unconfirmed = BTreeSet::new();
+    let md1_set: HashSet<String> = md1.iter().cloned().collect();
+    let md2_set: HashSet<String> = md2.iter().cloned().collect();
+
+    for t in md1.iter().chain(md2.iter()) {
+        if !wd_set.contains(t) && !exclusive_all.contains(t.as_str()) {
+            let in_both = md1_set.contains(t) && md2_set.contains(t);
+            if !in_both {
+                unconfirmed.insert(t.clone());
+            }
+        }
+    }
+    if require_two_sources {
+        md1.retain(|t| !unconfirmed.contains(t));
+        md2.retain(|t| !unconfirmed.contains(t));
+    }
 
     let all_md: Vec<String> = md1.iter().chain(md2.iter()).cloned().collect();
     let all_wd: Vec<String> = wd1.iter().chain(wd2.iter()).cloned().collect();
@@ -1404,6 +1443,7 @@ pub fn merge_tags(
         dropped_vlm: drop_vlm_sorted.clone(),
         dropped_wd14: sorted(&drop_wd),
         dropped_hedged: hedged_unconfirmed.into_iter().collect(),
+        dropped_unconfirmed: unconfirmed.into_iter().collect(),
         negated_vlm: negated.clone(),
         unrouted_wd14: wd2,
         dropped_moondream: drop_vlm_sorted,
@@ -1428,7 +1468,7 @@ pub fn process_direct(
     vocab: Option<&HashSet<String>>,
     cfg: &Config,
 ) -> Prompts {
-    let m = merge_tags(raw_wd14_tags, pass1_txt, pass2_txt, mode, vocab);
+    let m = merge_tags_with_options(raw_wd14_tags, pass1_txt, pass2_txt, mode, vocab, cfg.require_two_sources);
     let (extra1, extra2) = if cfg.keep_unmatched_prose {
         (flatten_zones(pass1_txt), flatten_zones(pass2_txt))
     } else {
@@ -2719,5 +2759,46 @@ mod tests {
         let bust = compute_zone_boxes(1000.0, 1000.0, 300.0, 100.0, 500.0, 250.0);
         let bust_names: Vec<&str> = bust.iter().map(|b| b.name).collect();
         assert_eq!(bust_names, vec!["Upper"]);
+    }
+
+    #[test]
+    fn two_source_rule_drops_single_mention_vlm_tags_when_enabled() {
+        let wd = "1girl, solo, blue_dress";
+        let pass1 = "she is standing in a bedroom with a desk.";
+        let pass2 = "she has blonde hair and glasses and a blue dress.";
+        let vocab: HashSet<String> = ["glasses", "desk", "standing", "bedroom", "blonde hair", "blue dress"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        // Default: glasses logged in dropped_unconfirmed but kept
+        let m_def = merge_tags_with_options(wd, pass1, pass2, Mode::SceneShape, Some(&vocab), false);
+        assert!(m_def.pass2_tags.contains(&"glasses".to_string()));
+        assert!(m_def.dropped_unconfirmed.contains(&"glasses".to_string()));
+
+        // Strict (require_two_sources=true): glasses pruned
+        let m_strict = merge_tags_with_options(wd, pass1, pass2, Mode::SceneShape, Some(&vocab), true);
+        assert!(!m_strict.pass2_tags.contains(&"glasses".to_string()));
+        assert!(m_strict.dropped_unconfirmed.contains(&"glasses".to_string()));
+        assert!(!m_strict.pass2_tags.contains(&"blonde hair".to_string()));
+        assert!(m_strict.pass2_tags.contains(&"blue dress".to_string()));
+        assert!(m_strict.pass1_tags.contains(&"standing".to_string()));
+    }
+
+    #[test]
+    fn two_source_rule_retains_when_second_pass_agrees() {
+        let wd = "1girl, solo";
+        let pass1 = "she is wearing a butterfly hairpin and a red ribbon.";
+        let pass2 = "she has a butterfly hairpin in her hair.";
+        let vocab: HashSet<String> = ["butterfly hairpin", "red ribbon"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        let m = merge_tags_with_options(wd, pass1, pass2, Mode::SceneShape, Some(&vocab), true);
+        assert!(m.pass2_tags.contains(&"butterfly hairpin".to_string()));
+        assert!(!m.dropped_unconfirmed.contains(&"butterfly hairpin".to_string()));
+        assert!(!m.pass2_tags.contains(&"red ribbon".to_string()));
+        assert!(m.dropped_unconfirmed.contains(&"red ribbon".to_string()));
     }
 }

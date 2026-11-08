@@ -719,7 +719,7 @@ class WD14DualPassRouter:
 # MERGE: convert prose to tags, then let WD14 adjust them
 # ---------------------------------------------------------------------------
 def merge_tags(raw_wd14_tags: str, pass1_txt: str, pass2_txt: str, mode: str,
-               vocab: Optional[set] = None) -> dict:
+               vocab: Optional[set] = None, require_two_sources: bool = False) -> dict:
     router = WD14DualPassRouter()
     wd_all = router.normalized_tags(raw_wd14_tags)
     wd1, wd2 = router.sort_tag_lists(raw_wd14_tags, mode)
@@ -735,6 +735,19 @@ def merge_tags(raw_wd14_tags: str, pass1_txt: str, pass2_txt: str, mode: str,
     md1 = [t for t in md1 if t not in hedged_unconfirmed]
     md2 = [t for t in md2 if t not in hedged_unconfirmed]
     negated = sorted(set(a1["negated"]) | set(a2["negated"]))
+
+    # Phase 3: Two-Source Rule
+    # A tag reported solely by the VLM is retained only if WD14 confirms it or a second pass/crop agrees.
+    # Exclude pose/camera groups where VLM intentionally overrides WD14.
+    exclusive_all = {item for group in EXCLUSIVE_GROUPS for item in group}
+    all_vlm = set(md1) | set(md2)
+    unconfirmed = {
+        t for t in all_vlm
+        if (t not in wd_set) and (t not in exclusive_all) and not (t in md1 and t in md2)
+    }
+    if require_two_sources and unconfirmed:
+        md1 = [t for t in md1 if t not in unconfirmed]
+        md2 = [t for t in md2 if t not in unconfirmed]
 
     drop_md, drop_wd = reconcile(md1 + md2, wd1 + wd2)
     if drop_md or drop_wd:
@@ -758,6 +771,7 @@ def merge_tags(raw_wd14_tags: str, pass1_txt: str, pass2_txt: str, mode: str,
         "dropped_vlm": sorted(drop_md),
         "dropped_wd14": sorted(drop_wd),
         "dropped_hedged": sorted(hedged_unconfirmed),
+        "dropped_unconfirmed": sorted(unconfirmed),
         "negated_vlm": negated,
         "unrouted_wd14": list(wd2),
         "dropped_moondream": sorted(drop_md),
@@ -844,8 +858,9 @@ def parse_gemma_json_response(raw_llm_text: str) -> dict:
 # ---------------------------------------------------------------------------
 class AntigravityTagFilter_NoLLM:
     def process_direct(self, raw_wd14_tags: str, pass1_txt: str, pass2_txt: str, mode: str,
-                       vocab: Optional[set] = None, keep_unmatched_prose: bool = False) -> dict:
-        merged = merge_tags(raw_wd14_tags, pass1_txt, pass2_txt, mode, vocab)
+                       vocab: Optional[set] = None, keep_unmatched_prose: bool = False,
+                       require_two_sources: bool = False) -> dict:
+        merged = merge_tags(raw_wd14_tags, pass1_txt, pass2_txt, mode, vocab, require_two_sources=require_two_sources)
         extra1 = _flatten_zones(pass1_txt) if keep_unmatched_prose else ""
         extra2 = _flatten_zones(pass2_txt) if keep_unmatched_prose else ""
         scene = _clean_csv(QUALITY_PREFIX, ", ".join(merged["pass1_tags"]), extra1)

@@ -1726,20 +1726,17 @@ pub fn extract_visual_description_from_path(
         format!("\n\n### Quadrant Environment & Objects (Plants, Decor & Props):\n{}", quad_parts.join("\n"))
     };
 
-    // 3. Pass 3: Universal 3-Zone Anatomical Scan (Upper + Middle + Lower) for EVERY character
+    // 3. Pass 3: Universal Zone Anatomical Scan (Upper + Middle + Lower where valid) for detected characters
     let boxes = crate::detector::detect(&img).unwrap_or_default();
+    if boxes.is_empty() {
+        return Ok(format!(
+            "### Scene & Environment (Spatial Overview):\n{}{}\n\n*Warning: No figure detected; processed full frame and scene quadrants only.*",
+            scene_desc.trim(),
+            quad_section
+        ));
+    }
     let count = boxes.len().clamp(1, 4);
-    let chars = if boxes.is_empty() {
-        vec![crate::detector::PersonBox {
-            x0: 0.0,
-            y0: 0.0,
-            x1: img.width() as f32,
-            y1: img.height() as f32,
-            score: 1.0,
-        }]
-    } else {
-        crate::detector::main_n(&boxes, count).unwrap_or_else(|| boxes.clone())
-    };
+    let chars = crate::detector::main_n(&boxes, count).unwrap_or_else(|| boxes.clone());
 
     let pos_labels: &[&str] = match count {
         1 => &["Character"],
@@ -1752,28 +1749,33 @@ pub fn extract_visual_description_from_path(
     for (i, b) in chars.iter().enumerate() {
         let label = pos_labels.get(i).copied().unwrap_or("Character");
         let zones = crate::detector::three_zone_crops(&img, b);
-        let up_b64 = encode_dynamic_image_b64(&zones[0].1)?;
-        let mid_b64 = encode_dynamic_image_b64(&zones[1].1)?;
-        let low_b64 = encode_dynamic_image_b64(&zones[2].1)?;
+        let mut zone_lines = Vec::new();
 
-        let up_ask = format!(
-            "Pinpoint head, hair, and facial attributes for {label}: exact hair color, length, bangs/parting, specific type of hairpin or hair ornament (e.g. flower hairpin, butterfly ornament, hairclip, hair bow, ribbon, headband, tiara), eyewear (glasses, sunglasses on head), earrings, choker/necklace, animal ears or horns, eye color, and facial expression."
-        );
-        let mid_ask = format!(
-            "Pinpoint torso, neckline, pose, and held items for {label}: exact upper clothing cut, color, and print/logo; whether cleavage, sideboob, underboob, or a keyhole cutout is visible vs. a closed neckline; chest/torso proportions and waist; exact arm and hand pose; and pinpoint any specific item she is holding or touching (e.g. holding phone, cup, drink, book, bag, umbrella, weapon/sword, fan, flower)."
-        );
-        let low_ask = format!(
-            "Pinpoint lower body, leg pose, and footwear for {label}: exact lower clothing (skirt, shorts, pants, bikini bottoms), hip and thigh build, exact skeletal leg and knee posture (sitting, standing, kneeling, legs crossed, knee up), legwear and straps (thighhighs, socks, o-ring thigh strap, garter straps, skindentation), hand actions on legs/stockings, and specific footwear (shoes, sneakers, boots, heels, sandals, or barefoot)."
-        );
+        for (z_name, z_img) in &zones {
+            if let Ok(z_b64) = encode_dynamic_image_b64(z_img) {
+                let ask = if z_name.contains("Upper") {
+                    format!(
+                        "Pinpoint head, hair, and facial attributes for {label}: exact hair color, length, bangs/parting, specific type of hairpin or hair ornament (e.g. flower hairpin, butterfly ornament, hairclip, hair bow, ribbon, headband, tiara), eyewear (glasses, sunglasses on head), earrings, choker/necklace, animal ears or horns, eye color, and facial expression."
+                    )
+                } else if z_name.contains("Middle") {
+                    format!(
+                        "Pinpoint torso, neckline, pose, and held items for {label}: exact upper clothing cut, color, and print/logo; whether cleavage, sideboob, underboob, or a keyhole cutout is visible vs. a closed neckline; chest/torso proportions and waist; exact arm and hand pose; and pinpoint any specific item she is holding or touching (e.g. holding phone, cup, drink, book, bag, umbrella, weapon/sword, fan, flower)."
+                    )
+                } else {
+                    format!(
+                        "Pinpoint lower body, leg pose, and footwear for {label}: exact lower clothing (skirt, shorts, pants, bikini bottoms), hip and thigh build, exact skeletal leg and knee posture (sitting, standing, kneeling, legs crossed, knee up), legwear and straps (thighhighs, socks, o-ring thigh strap, garter straps, skindentation), hand actions on legs/stockings, and specific footwear (shoes, sneakers, boots, heels, sandals, or barefoot)."
+                    )
+                };
+                let desc = ask_vision_encoder(&base, mode, encoder, z_b64, &ask).unwrap_or_default();
+                if !desc.trim().is_empty() {
+                    zone_lines.push(format!("- **{}**: {}", z_name, desc.trim()));
+                }
+            }
+        }
 
-        let up_desc = ask_vision_encoder(&base, mode, encoder, up_b64, &up_ask).unwrap_or_default();
-        let mid_desc = ask_vision_encoder(&base, mode, encoder, mid_b64, &mid_ask).unwrap_or_default();
-        let low_desc = ask_vision_encoder(&base, mode, encoder, low_b64, &low_ask).unwrap_or_default();
-
-        char_sections.push(format!(
-            "### Character: {}\n- **Head, Hair, Hairpins & Face (Upper Zone)**: {}\n- **Torso, Neckline/Cleavage, Arms & Held Items (Middle Zone)**: {}\n- **Hips, Legs, Straps & Footwear (Lower Zone)**: {}",
-            label, up_desc.trim(), mid_desc.trim(), low_desc.trim()
-        ));
+        if !zone_lines.is_empty() {
+            char_sections.push(format!("### Character: {}\n{}", label, zone_lines.join("\n")));
+        }
     }
 
     Ok(format!(
@@ -2022,21 +2024,27 @@ fn split_image_pipelined(req: &TwoImageRequest, encoder: &str) -> Result<(crate:
     if let Some(ref boxes) = req.split.boxes {
         for (i, b) in boxes.iter().take(n).enumerate() {
             let zones = crate::detector::three_zone_crops(&req.split.image, b);
-            let up_b64 = encode_dynamic_image_b64(&zones[0].1).unwrap_or_default();
-            let mid_b64 = encode_dynamic_image_b64(&zones[1].1).unwrap_or_default();
-            let low_b64 = encode_dynamic_image_b64(&zones[2].1).unwrap_or_default();
+            let mut zone_lines = Vec::new();
 
-            let up_ask = format!("Describe head, hair color and style, specific hairpins/hair ornaments, eyewear, earrings, choker, and expression for character {}.", i + 1);
-            let mid_ask = format!("Describe torso, neckline (verify cleavage vs closed top), chest proportions, clothing cut/color, arm pose, and any items held for character {}.", i + 1);
-            let low_ask = format!("Describe lower body, skirt/shorts/pants, leg posture, thigh straps, and footwear (shoes, socks, barefoot) for character {}.", i + 1);
-
-            let up_desc = ask_vision_encoder(&base, req.mode, encoder, up_b64, &up_ask).unwrap_or_default();
-            let mid_desc = ask_vision_encoder(&base, req.mode, encoder, mid_b64, &mid_ask).unwrap_or_default();
-            let low_desc = ask_vision_encoder(&base, req.mode, encoder, low_b64, &low_ask).unwrap_or_default();
+            for (z_name, z_img) in &zones {
+                if let Ok(z_b64) = encode_dynamic_image_b64(z_img) {
+                    let ask = if z_name.contains("Upper") {
+                        format!("Describe head, hair color and style, specific hairpins/hair ornaments, eyewear, earrings, choker, and expression for character {}.", i + 1)
+                    } else if z_name.contains("Middle") {
+                        format!("Describe torso, neckline (verify cleavage vs closed top), chest proportions, clothing cut/color, arm pose, and any items held for character {}.", i + 1)
+                    } else {
+                        format!("Describe lower body, skirt/shorts/pants, leg posture, thigh straps, and footwear (shoes, socks, barefoot) for character {}.", i + 1)
+                    };
+                    let desc = ask_vision_encoder(&base, req.mode, encoder, z_b64, &ask).unwrap_or_default();
+                    if !desc.trim().is_empty() {
+                        zone_lines.push(format!("- **{}**: {}", z_name, desc.trim()));
+                    }
+                }
+            }
 
             vision_parts.push(format!(
-                "### Character {} ({} box):\n- **Upper (Hair/Hairpin/Face)**: {}\n- **Middle (Torso/Neckline/Held Items)**: {}\n- **Lower (Legs/Straps/Footwear)**: {}",
-                i + 1, BOX_COLORS[i].1, up_desc.trim(), mid_desc.trim(), low_desc.trim()
+                "### Character {} ({} box):\n{}",
+                i + 1, BOX_COLORS[i].1, zone_lines.join("\n")
             ));
         }
         let scene_b64 = crate::twoimg::encode(&req.split.image, 768)?;

@@ -213,6 +213,61 @@ pub fn crop(img: &image::DynamicImage, b: &PersonBox) -> image::DynamicImage {
     img.crop_imm(x0 as u32, y0 as u32, cw.max(1), ch.max(1))
 }
 
+/// Crops a bounding box, optionally masking out overlapping regions from other detected figures
+/// to prevent visual bleed of neighboring outfits/hair/limbs into the crop.
+/// If overlap is extreme (>65%), returns a warning recommending full-frame fallback.
+pub fn crop_with_overlap_mask(
+    img: &image::DynamicImage,
+    b: &PersonBox,
+    others: &[PersonBox],
+) -> (image::DynamicImage, Option<String>) {
+    let mut warning = None;
+    let mut cropped = crop(img, b);
+
+    let (w, h) = (img.width() as f32, img.height() as f32);
+    let (mx, my) = ((b.x1 - b.x0) * 0.06, (b.y1 - b.y0) * 0.04);
+    let x0 = (b.x0 - mx).max(0.0).min((w - 1.0).max(0.0));
+    let y0 = (b.y0 - my).max(0.0).min((h - 1.0).max(0.0));
+    let cw = cropped.width();
+    let ch = cropped.height();
+
+    for o in others {
+        if b.x0 == o.x0 && b.y0 == o.y0 && b.x1 == o.x1 && b.y1 == o.y1 {
+            continue;
+        }
+        let ov = b.overlap(o);
+        if ov > 0.65 {
+            warning = Some(format!(
+                "Extreme figure overlap ({:.1}%); neighboring figure dominates the crop region. Fallback to full-frame recommended.",
+                ov * 100.0
+            ));
+        } else if ov > 0.10 {
+            let ix0 = ((o.x0 - x0).max(0.0).min(cw as f32)) as u32;
+            let iy0 = ((o.y0 - y0).max(0.0).min(ch as f32)) as u32;
+            let ix1 = ((o.x1 - x0).max(0.0).min(cw as f32)) as u32;
+            let iy1 = ((o.y1 - y0).max(0.0).min(ch as f32)) as u32;
+
+            if ix1 > ix0 && iy1 > iy0 {
+                let slice_w = ix1 - ix0;
+                let slice_h = iy1 - iy0;
+                let is_peripheral = ix0 == 0 || ix1 == cw || iy0 == 0 || iy1 == ch;
+                if is_peripheral && (slice_w * slice_h) < (cw * ch / 2) {
+                    let mut rgba = cropped.to_rgba8();
+                    let neutral_pixel = image::Rgba([128, 128, 128, 255]);
+                    for py in iy0..iy1 {
+                        for px in ix0..ix1 {
+                            rgba.put_pixel(px, py, neutral_pixel);
+                        }
+                    }
+                    cropped = image::DynamicImage::ImageRgba8(rgba);
+                }
+            }
+        }
+    }
+
+    (cropped, warning)
+}
+
 /// The top 55% of a character's box (face, hair, eyes, the top of the outfit), so the
 /// tagger sees those details bigger.
 pub fn upper_crop(img: &image::DynamicImage, b: &PersonBox) -> image::DynamicImage {
@@ -322,6 +377,23 @@ mod tests {
         assert!(main_n(&boxes[..1], 2).is_none());
         let three = main_n(&boxes, 3).unwrap();
         assert_eq!(three.iter().map(|b| b.x0).collect::<Vec<_>>(), vec![0.0, 500.0, 800.0]);
+    }
+
+    #[test]
+    fn crop_overlap_masking_and_warning() {
+        let img = image::DynamicImage::new_rgb8(1000, 1000);
+        let b1 = PersonBox { x0: 100.0, y0: 100.0, x1: 500.0, y1: 900.0, score: 0.9 };
+        // Moderate peripheral overlap (b2 overlaps b1 by ~20%)
+        let b2 = PersonBox { x0: 450.0, y0: 100.0, x1: 850.0, y1: 900.0, score: 0.85 };
+        let (crop1, warn1) = crop_with_overlap_mask(&img, &b1, &[b1, b2]);
+        assert!(warn1.is_none());
+        assert!(crop1.width() > 300);
+
+        // Extreme overlap (>65%)
+        let b3 = PersonBox { x0: 120.0, y0: 110.0, x1: 490.0, y1: 890.0, score: 0.88 };
+        let (_crop_ext, warn_ext) = crop_with_overlap_mask(&img, &b1, &[b1, b3]);
+        assert!(warn_ext.is_some());
+        assert!(warn_ext.unwrap().contains("Extreme figure overlap"));
     }
 
     /// `DETECT_TEST=a.png cargo test live_detect -- --ignored --nocapture`
