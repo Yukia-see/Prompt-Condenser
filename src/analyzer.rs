@@ -3289,6 +3289,7 @@ pub fn size_conflict(a: &str, b: &str) -> bool {
 
 /// A body size or proportion tag ("large breasts", "thick thighs", "wide hips"), not
 /// a face detail like "thick eyebrows".
+#[allow(dead_code)]
 pub fn is_size_tag(tag: &str) -> bool {
     const BODY: &[&str] = &[
         "breasts", "ass", "hips", "thighs", "waist", "figure", "body", "belly", "stomach", "penis", "testicles",

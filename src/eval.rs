@@ -63,6 +63,7 @@ impl EvalArm {
     }
 }
 
+#[allow(dead_code)]
 pub struct TagTaxonomy {
     pub ratings: HashSet<String>,
     pub characters: HashSet<String>,
@@ -140,6 +141,7 @@ impl TagTaxonomy {
     }
 }
 
+#[allow(dead_code)]
 pub struct ImageMetrics {
     pub image_name: String,
     pub is_tuning_set: bool,
@@ -209,6 +211,11 @@ pub fn run_arm_on_image(
 
             let mut merged = wd14_prompt;
             for pt in &prose_tags {
+                if crate::prompt_condenser::is_crop_artifact_tag(pt)
+                    || crate::prompt_condenser::is_rating_tag(pt)
+                {
+                    continue;
+                }
                 if !merged.to_lowercase().contains(&pt.to_lowercase()) {
                     merged.push_str(", ");
                     merged.push_str(pt);
@@ -230,6 +237,11 @@ pub fn run_arm_on_image(
 
             let mut merged = wd14_prompt;
             for pt in &prose_tags {
+                if crate::prompt_condenser::is_crop_artifact_tag(pt)
+                    || crate::prompt_condenser::is_rating_tag(pt)
+                {
+                    continue;
+                }
                 if !merged.to_lowercase().contains(&pt.to_lowercase()) {
                     merged.push_str(", ");
                     merged.push_str(pt);
@@ -250,6 +262,11 @@ pub fn run_arm_on_image(
 
             let mut merged = wd14_prompt;
             for pt in &prose_tags {
+                if crate::prompt_condenser::is_crop_artifact_tag(pt)
+                    || crate::prompt_condenser::is_rating_tag(pt)
+                {
+                    continue;
+                }
                 if !merged.to_lowercase().contains(&pt.to_lowercase()) {
                     merged.push_str(", ");
                     merged.push_str(pt);

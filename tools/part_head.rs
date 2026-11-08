@@ -31,9 +31,9 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 // ---------------------------------------------------------------------------
 // Constants (Phase 0)
 // ---------------------------------------------------------------------------
-pub const VLM_TEMPERATURE: f32 = 0.1;
+pub const VLM_TEMPERATURE: f32 = 0.05;
 pub const MOONDREAM_TEMPERATURE: f32 = VLM_TEMPERATURE;
-pub const GEMMA_TEMPERATURE: f32 = 0.35;
+pub const GEMMA_TEMPERATURE: f32 = 0.10;
 /// Pass these to your WD14 tagger; this module only receives the tag string.
 pub const WD14_GENERAL_THRESHOLD: f32 = 0.22;
 pub const WD14_CHARACTER_THRESHOLD: f32 = 0.85;
@@ -46,6 +46,21 @@ pub const VLM_RETRIES: u32 = 1;
 pub const MOONDREAM_RETRIES: u32 = VLM_RETRIES;
 pub const VLM_RETRY_TEMP_BUMP: f32 = 0.2;
 pub const MOONDREAM_RETRY_TEMP_BUMP: f32 = VLM_RETRY_TEMP_BUMP;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ZoneBox {
+    pub name: &'static str,
+    pub x0: f32,
+    pub y0: f32,
+    pub x1: f32,
+    pub y1: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CropType {
+    CharacterZone,
+    Quadrant,
+}
 
 /// Runtime settings; `Config::default()` matches the Python constants.
 #[derive(Clone, Debug)]

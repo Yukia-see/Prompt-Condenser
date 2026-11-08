@@ -221,6 +221,7 @@ pub fn upper_crop(img: &image::DynamicImage, b: &PersonBox) -> image::DynamicIma
 }
 
 /// The middle 40% of a character's box (30% to 70%: torso, waist, hands, hips, tail root, belts).
+#[allow(dead_code)]
 pub fn middle_crop(img: &image::DynamicImage, b: &PersonBox) -> image::DynamicImage {
     let h = b.y1 - b.y0;
     let mid = PersonBox {
@@ -232,6 +233,7 @@ pub fn middle_crop(img: &image::DynamicImage, b: &PersonBox) -> image::DynamicIm
 }
 
 /// The lower 45% of a character's box (55% to 100%: legs, knees, calves, feet, shoes, claws, tail tip).
+#[allow(dead_code)]
 pub fn lower_crop(img: &image::DynamicImage, b: &PersonBox) -> image::DynamicImage {
     let h = b.y1 - b.y0;
     let low = PersonBox {
@@ -241,14 +243,31 @@ pub fn lower_crop(img: &image::DynamicImage, b: &PersonBox) -> image::DynamicIma
     crop(img, &low)
 }
 
-/// Returns all 3 overlapping anatomical zones (Upper: 0-55%, Middle: 30-70%, Lower: 55-100%)
-/// for a character bounding box as the universal norm for character inspection.
-pub fn three_zone_crops(img: &image::DynamicImage, b: &PersonBox) -> [(&'static str, image::DynamicImage); 3] {
-    [
-        ("Upper (Head, Hair & Face)", upper_crop(img, b)),
-        ("Middle (Torso, Neckline, Arms & Held Items)", middle_crop(img, b)),
-        ("Lower (Hips, Legs, Straps & Footwear)", lower_crop(img, b)),
-    ]
+/// Returns the valid overlapping anatomical zones for a character bounding box using
+/// pure zone geometry (Upper: 0-55%, Middle: 30-70%, Lower: 55-100%).
+/// Skips the Lower zone for half-body, bust, or bottom-edge-clipped figures.
+pub fn three_zone_crops(img: &image::DynamicImage, b: &PersonBox) -> Vec<(&'static str, image::DynamicImage)> {
+    let (w, h) = (img.width() as f32, img.height() as f32);
+    let zone_boxes = crate::prompt_condenser::compute_zone_boxes(w, h, b.x0, b.y0, b.x1, b.y1);
+    zone_boxes
+        .into_iter()
+        .map(|zb| {
+            let label = match zb.name {
+                "Upper" => "Upper (Head, Hair & Face)",
+                "Middle" => "Middle (Torso, Neckline, Arms & Held Items)",
+                "Lower" => "Lower (Hips, Legs, Straps & Footwear)",
+                _ => zb.name,
+            };
+            let z_box = PersonBox {
+                x0: zb.x0,
+                y0: zb.y0,
+                x1: zb.x1,
+                y1: zb.y1,
+                score: b.score,
+            };
+            (label, crop(img, &z_box))
+        })
+        .collect()
 }
 
 /// Slices the full image into 4 overlapping quadrants (Top-Left, Top-Right, Bottom-Left, Bottom-Right)

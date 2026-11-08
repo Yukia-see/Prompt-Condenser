@@ -283,6 +283,144 @@ def test_check_ollama_reports_missing_model_and_unreachable():
     assert not ok3 and "not reachable" in msg3
 
 
+def test_crop_artifacts_are_strictly_rejected():
+    candidate_crop_tags = [
+        ("close-up", 0.95),
+        ("portrait", 0.90),
+        ("solo focus", 0.88),
+        ("breast focus", 0.85),
+        ("eye focus", 0.70),
+        ("head out of frame", 0.80),
+        ("cropped legs", 0.75),
+        ("out of frame", 0.90),
+        ("feet out of frame", 0.65),
+        ("partially submerged", 0.60),
+        ("full body", 0.92),
+        ("cowboy shot", 0.85),
+        ("hair ornament", 0.85),
+        ("holding spoon", 0.75),
+    ]
+    accepted = p.filter_crop_tags(candidate_crop_tags, crop_type="character_zone")
+    accepted_names = [t[0] for t in accepted]
+    assert "hair ornament" in accepted_names
+    assert "holding spoon" in accepted_names
+    assert "close-up" not in accepted_names
+    assert "portrait" not in accepted_names
+    assert "solo focus" not in accepted_names
+    assert "breast focus" not in accepted_names
+    assert "eye focus" not in accepted_names
+    assert "head out of frame" not in accepted_names
+    assert "cropped legs" not in accepted_names
+    assert "out of frame" not in accepted_names
+    assert "feet out of frame" not in accepted_names
+    assert "partially submerged" not in accepted_names
+    assert "full body" not in accepted_names
+    assert "cowboy shot" not in accepted_names
+
+
+def test_ratings_and_characters_rejected_from_crops():
+    tags = [
+        ("general", 0.99),
+        ("sensitive", 0.95),
+        ("questionable", 0.90),
+        ("explicit", 0.85),
+        ("pyra (xenoblade)", 0.95),
+        ("mythra (xenoblade)", 0.90),
+        ("golden tiara", 0.80),
+    ]
+    accepted = p.filter_crop_tags(
+        tags,
+        crop_type="character_zone",
+        character_names={"pyra (xenoblade)", "mythra (xenoblade)"},
+    )
+    accepted_names = [t[0] for t in accepted]
+    assert accepted_names == ["golden tiara"]
+
+
+def test_body_sizes_and_counts_rejected_from_crops():
+    tags = [
+        ("solo", 0.95),
+        ("1girl", 0.98),
+        ("large breasts", 0.85),
+        ("flat chest", 0.80),
+        ("ribbon choker", 0.75),
+    ]
+    accepted = p.filter_crop_tags(tags, crop_type="character_zone")
+    accepted_names = [t[0] for t in accepted]
+    assert accepted_names == ["ribbon choker"]
+
+
+def test_micro_attribute_threshold_enforced():
+    tags = [
+        ("butterfly hairpin", 0.54),
+        ("silver brooch", 0.55),
+        ("earrings", 0.60),
+    ]
+    accepted = p.filter_crop_tags(tags, crop_type="character_zone", min_attribute_threshold=0.55)
+    accepted_names = [t[0] for t in accepted]
+    assert "butterfly hairpin" not in accepted_names
+    assert "silver brooch" in accepted_names
+    assert "earrings" in accepted_names
+
+
+def test_quadrant_crop_concrete_objects_and_generic_backgrounds():
+    quad_tags = [
+        ("potted plant", 0.45),
+        ("bookshelf", 0.40),
+        ("simple background", 0.90),
+        ("white background", 0.85),
+        ("monochrome", 0.80),
+        ("solo focus", 0.70),
+        ("close-up", 0.75),
+        ("wooden chair", 0.50),
+    ]
+    accepted = p.filter_crop_tags(quad_tags, crop_type="quadrant")
+    accepted_names = [t[0] for t in accepted]
+    assert "potted plant" in accepted_names
+    assert "bookshelf" in accepted_names
+    assert "wooden chair" in accepted_names
+    assert "simple background" not in accepted_names
+    assert "white background" not in accepted_names
+    assert "monochrome" not in accepted_names
+    assert "solo focus" not in accepted_names
+    assert "close-up" not in accepted_names
+
+
+def test_merge_crop_tags_deduplicates_and_takes_max_score():
+    base = [("blue dress", 0.60), ("black boots", 0.70)]
+    crop = [("blue dress", 0.85), ("black boots", 0.65), ("silver necklace", 0.80)]
+    merged = p.merge_crop_tags(base, crop, crop_type="character_zone")
+    merged_dict = dict(merged)
+    assert merged_dict["blue dress"] == 0.85
+    assert merged_dict["black boots"] == 0.70
+    assert merged_dict["silver necklace"] == 0.80
+    assert len(merged) == 3
+
+
+def test_pure_zone_boxes_skips_lower_zone_for_half_body():
+    # 1. Full body character: 1000x1000 image, figure box from 100 to 950 (height = 850, ratio = 0.85)
+    boxes = p.compute_zone_boxes(1000.0, 1000.0, 200.0, 100.0, 500.0, 950.0)
+    names = [b["name"] for b in boxes]
+    assert names == ["Upper", "Middle", "Lower"]
+
+    # 2. Half body touching bottom: box from 100 to 1000 (height = 500, ratio = 0.50, touches bottom edge >= 980)
+    half_boxes = p.compute_zone_boxes(1000.0, 1000.0, 200.0, 500.0, 500.0, 1000.0)
+    half_names = [b["name"] for b in half_boxes]
+    assert "Lower" not in half_names
+    assert half_names == ["Upper", "Middle"]
+
+    # 3. Small head / bust: height = 150 (ratio = 0.15)
+    bust_boxes = p.compute_zone_boxes(1000.0, 1000.0, 300.0, 100.0, 500.0, 250.0)
+    bust_names = [b["name"] for b in bust_boxes]
+    assert bust_names == ["Upper"]
+
+    # 4. Clipping: coordinates clamped strictly within [0, img_w] x [0, img_h]
+    clipped = p.compute_zone_boxes(1000.0, 1000.0, -50.0, -20.0, 1050.0, 1020.0)
+    for z in clipped:
+        assert z["x0"] >= 0.0 and z["x1"] <= 1000.0
+        assert z["y0"] >= 0.0 and z["y1"] <= 1000.0
+
+
 if __name__ == "__main__":  # zero-dependency runner
     import inspect
     import sys

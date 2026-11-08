@@ -42,7 +42,10 @@ def zone_text(n):
     return "\n".join(lines)
 
 
-cases = {"router": [], "analyze": [], "merge": [], "nollm": [], "parse": [], "flatten": [], "payload": [], "style": []}
+cases = {
+    "router": [], "analyze": [], "merge": [], "nollm": [], "parse": [],
+    "flatten": [], "payload": [], "style": [], "filter_crop": [], "zone_boxes": []
+}
 
 # ---- hand-picked
 hand_wd = [WD for WD in [
@@ -72,6 +75,47 @@ for t in ["1. **Scene & Lighting**: soft light\n2) Camera - low angle", "1. A: x
 
 for s in ["a (b) c", "a \\(b\\) (c)", "((x))", "", "(", "\\)"]:
     cases["style"].append({"text": s})
+
+crop_tag_candidates = [
+    "close-up", "portrait", "solo focus", "breast focus", "eye focus", "head out of frame",
+    "cropped legs", "out of frame", "feet out of frame", "partially submerged", "full body", "cowboy shot",
+    "general", "sensitive", "questionable", "explicit",
+    "1girl", "solo", "2boys", "large breasts", "flat chest",
+    "hair ornament", "holding spoon", "silver brooch", "blue dress", "black boots",
+    "potted plant", "bookshelf", "wooden chair", "simple background", "white background", "monochrome",
+    "pyra (xenoblade)", "mythra (xenoblade)",
+]
+
+for _ in range(50):
+    k = random.randint(1, 10)
+    sample_tags = random.sample(crop_tag_candidates, k)
+    tags_with_scores = [[t, round(random.uniform(0.3, 0.95), 2)] for t in sample_tags]
+    ctype = random.choice(["character_zone", "quadrant"])
+    cnames = random.sample(["pyra (xenoblade)", "mythra (xenoblade)"], random.randint(0, 2))
+    min_thresh = random.choice([0.55, 0.50])
+    sc_thresh = random.choice([0.40, 0.35])
+    cases["filter_crop"].append({
+        "tags": tags_with_scores,
+        "crop_type": ctype,
+        "character_names": cnames,
+        "min_attribute_threshold": min_thresh,
+        "scene_object_threshold": sc_thresh,
+    })
+
+for _ in range(50):
+    img_w = float(random.choice([800, 1024, 1920]))
+    img_h = float(random.choice([600, 1024, 1080]))
+    x0 = round(random.uniform(0, img_w * 0.4), 1)
+    y0 = round(random.uniform(0, img_h * 0.4), 1)
+    x1 = round(random.uniform(x0 + 50, img_w), 1)
+    if random.random() < 0.4:
+        y1 = img_h
+    else:
+        y1 = round(random.uniform(y0 + 50, img_h), 1)
+    cases["zone_boxes"].append({
+        "img_w": img_w, "img_h": img_h,
+        "x0": x0, "y0": y0, "x1": x1, "y1": y1,
+    })
 
 # ---- random
 for _ in range(250):
@@ -114,5 +158,20 @@ for c in cases["payload"]:
     llm = p.AntigravityTagFilter_LLM()
     pl = llm.build_payload(c["wd"], c["md1"], c["md2"], c["mode"], set(c["vocab"]), vision=c["vision"])
     c["expect"] = llm.payload_to_text(pl)
+for c in cases["filter_crop"]:
+    res = p.filter_crop_tags(
+        c["tags"],
+        crop_type=c["crop_type"],
+        character_names=c["character_names"],
+        min_attribute_threshold=c["min_attribute_threshold"],
+        scene_object_threshold=c["scene_object_threshold"],
+    )
+    c["expect"] = res
+for c in cases["zone_boxes"]:
+    res = p.compute_zone_boxes(
+        c["img_w"], c["img_h"],
+        c["x0"], c["y0"], c["x1"], c["y1"],
+    )
+    c["expect"] = res
 
 json.dump(cases, sys.stdout, ensure_ascii=False)

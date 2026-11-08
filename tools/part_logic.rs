@@ -1151,3 +1151,218 @@ pub fn run_dual_pass(
         _ => mechanical(Some("Gemma output unusable; used the mechanical merge".to_string()), warnings),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Phase 2: Pure Crop Tag Policy & Zone Math
+// ---------------------------------------------------------------------------
+
+pub fn is_crop_artifact_tag(tag: &str) -> bool {
+    let norm = norm_tag(tag);
+    if CROP_ARTIFACT_TAGS.iter().any(|&c| c == norm) {
+        return true;
+    }
+    if norm.ends_with(" focus") {
+        return true;
+    }
+    if norm.ends_with(" out of frame") {
+        return true;
+    }
+    if norm.starts_with("cropped ") || norm.ends_with(" cropped") {
+        return true;
+    }
+    false
+}
+
+pub fn is_rating_tag(tag: &str) -> bool {
+    let norm = norm_tag(tag);
+    RATING_TAGS.iter().any(|&r| r == norm)
+}
+
+pub fn is_body_size_or_count_tag(tag: &str) -> bool {
+    let norm = norm_tag(tag);
+    BODY_SIZE_AND_COUNT_TAGS.iter().any(|&b| b == norm)
+}
+
+pub fn is_concrete_scene_object(tag: &str) -> bool {
+    let norm = norm_tag(tag);
+    CONCRETE_SCENE_OBJECTS.iter().any(|&obj| norm == obj || norm.contains(obj))
+}
+
+pub fn is_global_framing_tag(tag: &str) -> bool {
+    let norm = norm_tag(tag);
+    if is_crop_artifact_tag(&norm) {
+        return true;
+    }
+    if SCENE_KEYWORDS.iter().any(|&k| k == norm) {
+        return true;
+    }
+    norm.ends_with(" shot") || norm.ends_with(" view") || norm.ends_with(" angle") || norm.ends_with(" background")
+}
+
+pub fn filter_crop_tags(
+    crop_tags: &[(String, f32)],
+    crop_type: CropType,
+    character_names: &[String],
+    min_attribute_threshold: f32,
+    scene_object_threshold: f32,
+) -> Vec<(String, f32)> {
+    let char_set: HashSet<String> = character_names.iter().map(|c| norm_tag(c)).collect();
+    let mut accepted = Vec::new();
+
+    for (tag, score) in crop_tags {
+        let norm = norm_tag(tag);
+        if norm.is_empty() {
+            continue;
+        }
+
+        // 1. Reject crop artifacts (boundary & zoom artifacts)
+        if is_crop_artifact_tag(&norm) {
+            continue;
+        }
+
+        // 2. Reject ratings
+        if is_rating_tag(&norm) {
+            continue;
+        }
+
+        // 3. Reject character names
+        if char_set.contains(&norm) {
+            continue;
+        }
+
+        // 4. Reject body size & count tags
+        if is_body_size_or_count_tag(&norm) {
+            continue;
+        }
+
+        match crop_type {
+            CropType::CharacterZone => {
+                // Reject global framing/scene
+                if is_global_framing_tag(&norm) {
+                    continue;
+                }
+                // Micro-attributes require confidence >= 0.55
+                if *score >= min_attribute_threshold {
+                    accepted.push((tag.clone(), *score));
+                }
+            }
+            CropType::Quadrant => {
+                // Reject generic backgrounds
+                if norm == "simple background"
+                    || norm == "white background"
+                    || norm == "grey background"
+                    || norm == "monochrome"
+                    || norm == "blurry background"
+                {
+                    continue;
+                }
+                if is_concrete_scene_object(&norm) {
+                    if *score >= scene_object_threshold {
+                        accepted.push((tag.clone(), *score));
+                    }
+                } else if !is_global_framing_tag(&norm) && *score >= min_attribute_threshold {
+                    accepted.push((tag.clone(), *score));
+                }
+            }
+        }
+    }
+
+    accepted
+}
+
+pub fn merge_crop_tags(
+    base_tags: &[(String, f32)],
+    crop_tags: &[(String, f32)],
+    crop_type: CropType,
+    character_names: &[String],
+    min_attribute_threshold: f32,
+    scene_object_threshold: f32,
+) -> Vec<(String, f32)> {
+    let filtered = filter_crop_tags(
+        crop_tags,
+        crop_type,
+        character_names,
+        min_attribute_threshold,
+        scene_object_threshold,
+    );
+
+    let mut out: Vec<(String, f32)> = base_tags.to_vec();
+
+    for (c_tag, c_score) in filtered {
+        let norm_c = norm_tag(&c_tag);
+        let mut found = false;
+        for (b_tag, b_score) in out.iter_mut() {
+            if norm_tag(b_tag) == norm_c {
+                *b_score = b_score.max(c_score);
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            out.push((c_tag, c_score));
+        }
+    }
+    out
+}
+
+pub fn compute_zone_boxes(
+    img_w: f32,
+    img_h: f32,
+    box_x0: f32,
+    box_y0: f32,
+    box_x1: f32,
+    box_y1: f32,
+) -> Vec<ZoneBox> {
+    if img_w <= 0.0 || img_h <= 0.0 {
+        return Vec::new();
+    }
+
+    let x0 = box_x0.max(0.0).min(img_w);
+    let y0 = box_y0.max(0.0).min(img_h);
+    let x1 = box_x1.max(x0).min(img_w);
+    let y1 = box_y1.max(y0).min(img_h);
+
+    let w = x1 - x0;
+    let h = y1 - y0;
+    if w <= 1.0 || h <= 1.0 {
+        return Vec::new();
+    }
+
+    let bottom_edge = y1 >= (0.98 * img_h);
+    let height_ratio = h / img_h;
+
+    let mx = w * 0.06;
+    let my = h * 0.04;
+
+    let make_box = |name: &'static str, zy0: f32, zy1: f32| -> ZoneBox {
+        let cx0 = (x0 - mx).max(0.0).min(img_w - 1.0);
+        let cy0 = (zy0 - my).max(0.0).min(img_h - 1.0);
+        let cx1 = (x1 + mx).min(img_w).max(cx0 + 1.0);
+        let cy1 = (zy1 + my).min(img_h).max(cy0 + 1.0);
+        ZoneBox {
+            name,
+            x0: (cx0 * 100.0).round() / 100.0,
+            y0: (cy0 * 100.0).round() / 100.0,
+            x1: (cx1 * 100.0).round() / 100.0,
+            y1: (cy1 * 100.0).round() / 100.0,
+        }
+    };
+
+    let mut zones = Vec::new();
+    // 1. Upper (0 - 55%): Head, Hair, Face - Always valid
+    zones.push(make_box("Upper", y0, y0 + h * 0.55));
+
+    // 2. Middle (30% - 70%): Torso, Arms, Held Items
+    if height_ratio >= 0.25 {
+        zones.push(make_box("Middle", y0 + h * 0.30, y0 + h * 0.70));
+    }
+
+    // 3. Lower (55% - 100%): Hips, Legs, Footwear
+    // Skip lower zone if figure touches the bottom frame and height ratio < 0.72 (half-body/cowboy shot cut off)
+    let is_cut_off_bottom = bottom_edge && (height_ratio < 0.72);
+    if !is_cut_off_bottom && (height_ratio >= 0.40) {
+        zones.push(make_box("Lower", y0 + h * 0.55, y1));
+    }
+
+    zones
+}

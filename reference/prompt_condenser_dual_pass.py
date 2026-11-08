@@ -40,9 +40,9 @@ log = logging.getLogger("prompt_condenser")
 # WD14 thresholds are consumed by the upstream WD14 tagger node
 # (pass them to it when you call it; this file only receives the tag string).
 # ---------------------------------------------------------------------------
-VLM_TEMPERATURE = 0.1
+VLM_TEMPERATURE = 0.05
 MOONDREAM_TEMPERATURE = VLM_TEMPERATURE
-GEMMA_TEMPERATURE = 0.35
+GEMMA_TEMPERATURE = 0.10
 GEMMA_OLLAMA_MODEL = "huihui_ai/gemma-4-abliterated:12b"
 GEMMA_CONTEXT_WINDOW = 131072   # 128K: the context the model page lists for the 12b tag
 GEMMA_MAX_TOKENS = 768          # normal output cap
@@ -290,6 +290,259 @@ ATTRIBUTE_GROUPS = [
     {"flat chest", "small breasts", "medium breasts", "large breasts", "huge breasts",
      "gigantic breasts"},
 ]
+
+# ---------------------------------------------------------------------------
+# PHASE 2: CROP TAG POLICY & ZONE GEOMETRY
+# ---------------------------------------------------------------------------
+CROP_ARTIFACT_TAGS = {
+    # boundary cut-off tags
+    "head out of frame", "face out of frame", "feet out of frame",
+    "arm out of frame", "legs out of frame", "hands out of frame",
+    "out of frame", "cropped legs", "partially submerged",
+    # camera & framing tags
+    "full body", "upper body", "lower body", "cowboy shot", "wide shot",
+    "close-up", "portrait",
+    # zoom focus tags
+    "solo focus", "breast focus", "eye focus", "face focus",
+    "navel focus", "foot focus", "hip focus", "back focus", "armpit focus",
+    "focus",
+}
+
+RATING_TAGS = {
+    "general", "sensitive", "questionable", "explicit",
+}
+
+BODY_SIZE_AND_COUNT_TAGS = {
+    "solo", "1girl", "2girls", "3girls", "4girls", "5girls", "6+girls", "multiple girls",
+    "1boy", "2boys", "3boys", "4boys", "5boys", "6+boys", "multiple boys",
+    "large breasts", "small breasts", "medium breasts", "huge breasts", "gigantic breasts",
+    "flat chest", "tall", "short", "petite", "chibi",
+}
+
+CONCRETE_SCENE_OBJECTS = {
+    "plant", "potted plant", "houseplant", "flower", "flowers", "bouquet", "petal", "rose",
+    "sunflower", "lily", "tulip", "cherry blossoms", "tree", "leaf", "leaves", "foliage",
+    "fern", "vines", "ivy", "grass", "bush", "hedge", "cactus", "succulent", "vase",
+    "flowerpot", "flower pot", "window", "curtain", "curtains", "drapes", "chair", "armchair",
+    "couch", "sofa", "table", "desk", "bookshelf", "bookcase", "shelf", "lamp", "lantern",
+    "chandelier", "street lamp", "mirror", "clock", "poster", "painting", "picture frame",
+    "signboard", "pillow", "cushion", "carpet", "rug", "mat", "bed", "television", "monitor",
+    "laptop", "computer", "cup", "mug", "teacup", "bottle", "wine glass", "book", "umbrella",
+    "parasol", "weapon", "sword", "gun", "staff", "wand", "fan", "food", "drink", "phone",
+    "cellphone", "smartphone", "camera", "plushie", "doll", "instrument", "guitar", "violin",
+}
+
+
+def is_crop_artifact_tag(tag: str) -> bool:
+    norm = _norm_tag(tag)
+    if norm in CROP_ARTIFACT_TAGS:
+        return True
+    if norm.endswith(" focus"):
+        return True
+    if norm.endswith(" out of frame"):
+        return True
+    if norm.startswith("cropped ") or norm.endswith(" cropped"):
+        return True
+    return False
+
+
+def is_rating_tag(tag: str) -> bool:
+    return _norm_tag(tag) in RATING_TAGS
+
+
+def is_body_size_or_count_tag(tag: str) -> bool:
+    return _norm_tag(tag) in BODY_SIZE_AND_COUNT_TAGS
+
+
+def is_concrete_scene_object(norm: str) -> bool:
+    n = _norm_tag(norm)
+    return any(obj == n or obj in n for obj in CONCRETE_SCENE_OBJECTS)
+
+
+def is_global_framing_tag(tag: str) -> bool:
+    norm = _norm_tag(tag)
+    if is_crop_artifact_tag(norm):
+        return True
+    if norm in SCENE_KEYWORDS:
+        return True
+    if any(norm.endswith(sfx) for sfx in (" shot", " view", " angle", " background")):
+        return True
+    return False
+
+
+def filter_crop_tags(
+    crop_tags: Iterable,
+    crop_type: str = "character_zone",
+    character_names: Optional[Iterable[str]] = None,
+    min_attribute_threshold: float = 0.55,
+    scene_object_threshold: float = 0.40,
+) -> list[tuple[str, float]]:
+    """Pure per-crop tag policy filtering.
+
+    Filters out crop-boundary artifacts, ratings, character names, body sizes/counts,
+    and framing tags, retaining only confident micro-attributes and concrete scene objects.
+    """
+    items = []
+    if isinstance(crop_tags, dict):
+        items = [(k, _norm_tag(k), float(v)) for k, v in crop_tags.items()]
+    else:
+        for entry in crop_tags:
+            if isinstance(entry, (tuple, list)) and len(entry) >= 2:
+                items.append((entry[0], _norm_tag(entry[0]), float(entry[1])))
+            elif isinstance(entry, str):
+                items.append((entry, _norm_tag(entry), 1.0))
+            elif hasattr(entry, "name") and hasattr(entry, "score"):
+                items.append((entry.name, _norm_tag(entry.name), float(entry.score)))
+
+    char_set = {_norm_tag(c) for c in (character_names or [])}
+    accepted = []
+
+    for orig_tag, norm, score in items:
+        if not norm:
+            continue
+
+        # 1. Reject crop artifacts (boundary & zoom artifacts)
+        if is_crop_artifact_tag(norm):
+            continue
+
+        # 2. Reject ratings
+        if is_rating_tag(norm):
+            continue
+
+        # 3. Reject character names
+        if norm in char_set:
+            continue
+
+        # 4. Reject body size & count tags
+        if is_body_size_or_count_tag(norm):
+            continue
+
+        if crop_type == "character_zone":
+            # 5a. Character zones reject global framing/scene
+            if is_global_framing_tag(norm):
+                continue
+            # Micro-attributes require confidence >= 0.55
+            if score >= min_attribute_threshold:
+                accepted.append((orig_tag, score))
+
+        elif crop_type == "quadrant":
+            # 5b. Quadrants reject generic backgrounds that contradict full frame
+            if norm in {"simple background", "white background", "grey background", "monochrome", "blurry background"}:
+                continue
+            # Concrete scene objects admitted at >= 0.40
+            if is_concrete_scene_object(norm):
+                if score >= scene_object_threshold:
+                    accepted.append((orig_tag, score))
+            else:
+                # Other props or micro-attributes admitted at >= 0.55
+                if not is_global_framing_tag(norm) and score >= min_attribute_threshold:
+                    accepted.append((orig_tag, score))
+
+    return accepted
+
+
+def merge_crop_tags(
+    base_tags: Iterable,
+    crop_tags: Iterable,
+    crop_type: str = "character_zone",
+    character_names: Optional[Iterable[str]] = None,
+    min_attribute_threshold: float = 0.55,
+    scene_object_threshold: float = 0.40,
+) -> list[tuple[str, float]]:
+    """Merges candidate tags from a crop into base tags using pure tag policy."""
+    filtered = filter_crop_tags(
+        crop_tags,
+        crop_type=crop_type,
+        character_names=character_names,
+        min_attribute_threshold=min_attribute_threshold,
+        scene_object_threshold=scene_object_threshold,
+    )
+
+    out = []
+    if isinstance(base_tags, dict):
+        out = [(k, float(v)) for k, v in base_tags.items()]
+    else:
+        for entry in base_tags:
+            if isinstance(entry, (tuple, list)) and len(entry) >= 2:
+                out.append((entry[0], float(entry[1])))
+            elif isinstance(entry, str):
+                out.append((entry, 1.0))
+            elif hasattr(entry, "name") and hasattr(entry, "score"):
+                out.append((entry.name, float(entry.score)))
+
+    for c_orig, c_score in filtered:
+        norm_c = _norm_tag(c_orig)
+        found = False
+        for idx, (b_orig, b_score) in enumerate(out):
+            if _norm_tag(b_orig) == norm_c:
+                out[idx] = (b_orig, max(b_score, c_score))
+                found = True
+                break
+        if not found:
+            out.append((c_orig, c_score))
+    return out
+
+
+def compute_zone_boxes(
+    img_w: float,
+    img_h: float,
+    box_x0: float,
+    box_y0: float,
+    box_x1: float,
+    box_y1: float,
+) -> list[dict]:
+    """Pure zone box function:
+    figure box, image size and edge contact in -> valid zones out.
+    Skips lower zone for half-body or edge-clipped figures.
+    """
+    if img_w <= 0.0 or img_h <= 0.0:
+        return []
+
+    x0 = max(0.0, min(float(box_x0), float(img_w)))
+    y0 = max(0.0, min(float(box_y0), float(img_h)))
+    x1 = max(x0, min(float(box_x1), float(img_w)))
+    y1 = max(y0, min(float(box_y1), float(img_h)))
+
+    w = x1 - x0
+    h = y1 - y0
+    if w <= 1.0 or h <= 1.0:
+        return []
+
+    bottom_edge = y1 >= (0.98 * img_h)
+    height_ratio = h / img_h
+
+    # Margins (6% horiz, 4% vert)
+    mx = w * 0.06
+    my = h * 0.04
+
+    def make_box(name: str, zy0: float, zy1: float) -> dict:
+        cx0 = max(0.0, min(x0 - mx, img_w - 1.0))
+        cy0 = max(0.0, min(zy0 - my, img_h - 1.0))
+        cx1 = min(img_w, max(x1 + mx, cx0 + 1.0))
+        cy1 = min(img_h, max(zy1 + my, cy0 + 1.0))
+        return {
+            "name": name,
+            "x0": round(cx0, 2),
+            "y0": round(cy0, 2),
+            "x1": round(cx1, 2),
+            "y1": round(cy1, 2),
+        }
+
+    zones = []
+    # 1. Upper (0 - 55%): Head, Hair, Face - Always valid
+    zones.append(make_box("Upper", y0, y0 + h * 0.55))
+
+    # 2. Middle (30% - 70%): Torso, Arms, Held Items
+    if height_ratio >= 0.25:
+        zones.append(make_box("Middle", y0 + h * 0.30, y0 + h * 0.70))
+
+    # 3. Lower (55% - 100%): Hips, Legs, Footwear
+    # Skip lower zone if figure touches the bottom frame and height ratio < 0.72 (half-body/cowboy shot cut off)
+    is_cut_off_bottom = bottom_edge and (height_ratio < 0.72)
+    if not is_cut_off_bottom and (height_ratio >= 0.40):
+        zones.append(make_box("Lower", y0 + h * 0.55, y1))
+
+    return zones
 
 _SINGLE_STOP = {
     "light", "hand", "left", "right", "front", "back", "side", "top", "one", "two",

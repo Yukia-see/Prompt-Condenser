@@ -31,9 +31,9 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 // ---------------------------------------------------------------------------
 // Constants (Phase 0)
 // ---------------------------------------------------------------------------
-pub const VLM_TEMPERATURE: f32 = 0.1;
+pub const VLM_TEMPERATURE: f32 = 0.05;
 pub const MOONDREAM_TEMPERATURE: f32 = VLM_TEMPERATURE;
-pub const GEMMA_TEMPERATURE: f32 = 0.35;
+pub const GEMMA_TEMPERATURE: f32 = 0.10;
 /// Pass these to your WD14 tagger; this module only receives the tag string.
 pub const WD14_GENERAL_THRESHOLD: f32 = 0.22;
 pub const WD14_CHARACTER_THRESHOLD: f32 = 0.85;
@@ -46,6 +46,21 @@ pub const VLM_RETRIES: u32 = 1;
 pub const MOONDREAM_RETRIES: u32 = VLM_RETRIES;
 pub const VLM_RETRY_TEMP_BUMP: f32 = 0.2;
 pub const MOONDREAM_RETRY_TEMP_BUMP: f32 = VLM_RETRY_TEMP_BUMP;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ZoneBox {
+    pub name: &'static str,
+    pub x0: f32,
+    pub y0: f32,
+    pub x1: f32,
+    pub y1: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CropType {
+    CharacterZone,
+    Quadrant,
+}
 
 /// Runtime settings; `Config::default()` matches the Python constants.
 #[derive(Clone, Debug)]
@@ -591,6 +606,277 @@ pub const NEW_STATEMENT_VERBS: &[&str] = &[
     "is",
     "shows",
     "wears",
+];
+pub const CROP_ARTIFACT_TAGS: &[&str] = &[
+    "arm out of frame",
+    "armpit focus",
+    "back focus",
+    "breast focus",
+    "close-up",
+    "cowboy shot",
+    "cropped legs",
+    "eye focus",
+    "face focus",
+    "face out of frame",
+    "feet out of frame",
+    "focus",
+    "foot focus",
+    "full body",
+    "hands out of frame",
+    "head out of frame",
+    "hip focus",
+    "legs out of frame",
+    "lower body",
+    "navel focus",
+    "out of frame",
+    "partially submerged",
+    "portrait",
+    "solo focus",
+    "upper body",
+    "wide shot",
+];
+pub const RATING_TAGS: &[&str] = &[
+    "explicit",
+    "general",
+    "questionable",
+    "sensitive",
+];
+pub const BODY_SIZE_AND_COUNT_TAGS: &[&str] = &[
+    "1boy",
+    "1girl",
+    "2boys",
+    "2girls",
+    "3boys",
+    "3girls",
+    "4boys",
+    "4girls",
+    "5boys",
+    "5girls",
+    "6+boys",
+    "6+girls",
+    "chibi",
+    "flat chest",
+    "gigantic breasts",
+    "huge breasts",
+    "large breasts",
+    "medium breasts",
+    "multiple boys",
+    "multiple girls",
+    "petite",
+    "short",
+    "small breasts",
+    "solo",
+    "tall",
+];
+pub const CONCRETE_SCENE_OBJECTS: &[&str] = &[
+    "armchair",
+    "bed",
+    "book",
+    "bookcase",
+    "bookshelf",
+    "bottle",
+    "bouquet",
+    "bush",
+    "cactus",
+    "camera",
+    "carpet",
+    "cellphone",
+    "chair",
+    "chandelier",
+    "cherry blossoms",
+    "clock",
+    "computer",
+    "couch",
+    "cup",
+    "curtain",
+    "curtains",
+    "cushion",
+    "desk",
+    "doll",
+    "drapes",
+    "drink",
+    "fan",
+    "fern",
+    "flower",
+    "flower pot",
+    "flowerpot",
+    "flowers",
+    "foliage",
+    "food",
+    "grass",
+    "guitar",
+    "gun",
+    "hedge",
+    "houseplant",
+    "instrument",
+    "ivy",
+    "lamp",
+    "lantern",
+    "laptop",
+    "leaf",
+    "leaves",
+    "lily",
+    "mat",
+    "mirror",
+    "monitor",
+    "mug",
+    "painting",
+    "parasol",
+    "petal",
+    "phone",
+    "picture frame",
+    "pillow",
+    "plant",
+    "plushie",
+    "poster",
+    "potted plant",
+    "rose",
+    "rug",
+    "shelf",
+    "signboard",
+    "smartphone",
+    "sofa",
+    "staff",
+    "street lamp",
+    "succulent",
+    "sunflower",
+    "sword",
+    "table",
+    "teacup",
+    "television",
+    "tree",
+    "tulip",
+    "umbrella",
+    "vase",
+    "vines",
+    "violin",
+    "wand",
+    "weapon",
+    "window",
+    "wine glass",
+];
+pub const SCENE_KEYWORDS: &[&str] = &[
+    "alley",
+    "background",
+    "backlighting",
+    "balcony",
+    "bathroom",
+    "beach",
+    "bed",
+    "bedroom",
+    "bench",
+    "blurry",
+    "bokeh",
+    "bookshelf",
+    "bridge",
+    "building",
+    "cafe",
+    "carpet",
+    "castle",
+    "cave",
+    "ceiling",
+    "chair",
+    "chromatic aberration",
+    "city",
+    "cityscape",
+    "classroom",
+    "close-up",
+    "cloud",
+    "clouds",
+    "couch",
+    "cowboy shot",
+    "curtains",
+    "dawn",
+    "depth of field",
+    "desert",
+    "desk",
+    "door",
+    "dusk",
+    "dutch angle",
+    "dynamic angle",
+    "evening",
+    "field",
+    "film grain",
+    "fisheye",
+    "floor",
+    "fog",
+    "foreshortening",
+    "forest",
+    "from above",
+    "from behind",
+    "from below",
+    "from side",
+    "full body",
+    "garden",
+    "grass",
+    "gym",
+    "hill",
+    "indoor",
+    "indoors",
+    "kitchen",
+    "lake",
+    "lamp",
+    "lens flare",
+    "library",
+    "light particles",
+    "light rays",
+    "lighting",
+    "locker room",
+    "lower body",
+    "mist",
+    "moon",
+    "moonlight",
+    "motion blur",
+    "mountain",
+    "night",
+    "ocean",
+    "out of frame",
+    "outdoor",
+    "outdoors",
+    "park",
+    "pool",
+    "poolside",
+    "portrait",
+    "pov",
+    "rain",
+    "raining",
+    "restaurant",
+    "river",
+    "road",
+    "rooftop",
+    "room",
+    "ruins",
+    "sea",
+    "selfie",
+    "shadow",
+    "shelf",
+    "shrine",
+    "silhouette",
+    "sky",
+    "skyscraper",
+    "snow",
+    "snowing",
+    "sofa",
+    "stage",
+    "stairs",
+    "starry sky",
+    "street",
+    "sunbeam",
+    "sunlight",
+    "sunrise",
+    "sunset",
+    "table",
+    "temple",
+    "tree",
+    "trees",
+    "underwater",
+    "upper body",
+    "vignetting",
+    "wall",
+    "waterfall",
+    "wide angle",
+    "wide shot",
+    "window",
 ];
 pub const EXCLUSIVE_GROUPS: &[&[&str]] = &[
     &["kneeling", "lying", "sitting", "squatting", "standing"],
@@ -1756,6 +2042,221 @@ pub fn run_dual_pass(
 }
 
 // ---------------------------------------------------------------------------
+// Phase 2: Pure Crop Tag Policy & Zone Math
+// ---------------------------------------------------------------------------
+
+pub fn is_crop_artifact_tag(tag: &str) -> bool {
+    let norm = norm_tag(tag);
+    if CROP_ARTIFACT_TAGS.iter().any(|&c| c == norm) {
+        return true;
+    }
+    if norm.ends_with(" focus") {
+        return true;
+    }
+    if norm.ends_with(" out of frame") {
+        return true;
+    }
+    if norm.starts_with("cropped ") || norm.ends_with(" cropped") {
+        return true;
+    }
+    false
+}
+
+pub fn is_rating_tag(tag: &str) -> bool {
+    let norm = norm_tag(tag);
+    RATING_TAGS.iter().any(|&r| r == norm)
+}
+
+pub fn is_body_size_or_count_tag(tag: &str) -> bool {
+    let norm = norm_tag(tag);
+    BODY_SIZE_AND_COUNT_TAGS.iter().any(|&b| b == norm)
+}
+
+pub fn is_concrete_scene_object(tag: &str) -> bool {
+    let norm = norm_tag(tag);
+    CONCRETE_SCENE_OBJECTS.iter().any(|&obj| norm == obj || norm.contains(obj))
+}
+
+pub fn is_global_framing_tag(tag: &str) -> bool {
+    let norm = norm_tag(tag);
+    if is_crop_artifact_tag(&norm) {
+        return true;
+    }
+    if SCENE_KEYWORDS.iter().any(|&k| k == norm) {
+        return true;
+    }
+    norm.ends_with(" shot") || norm.ends_with(" view") || norm.ends_with(" angle") || norm.ends_with(" background")
+}
+
+pub fn filter_crop_tags(
+    crop_tags: &[(String, f32)],
+    crop_type: CropType,
+    character_names: &[String],
+    min_attribute_threshold: f32,
+    scene_object_threshold: f32,
+) -> Vec<(String, f32)> {
+    let char_set: HashSet<String> = character_names.iter().map(|c| norm_tag(c)).collect();
+    let mut accepted = Vec::new();
+
+    for (tag, score) in crop_tags {
+        let norm = norm_tag(tag);
+        if norm.is_empty() {
+            continue;
+        }
+
+        // 1. Reject crop artifacts (boundary & zoom artifacts)
+        if is_crop_artifact_tag(&norm) {
+            continue;
+        }
+
+        // 2. Reject ratings
+        if is_rating_tag(&norm) {
+            continue;
+        }
+
+        // 3. Reject character names
+        if char_set.contains(&norm) {
+            continue;
+        }
+
+        // 4. Reject body size & count tags
+        if is_body_size_or_count_tag(&norm) {
+            continue;
+        }
+
+        match crop_type {
+            CropType::CharacterZone => {
+                // Reject global framing/scene
+                if is_global_framing_tag(&norm) {
+                    continue;
+                }
+                // Micro-attributes require confidence >= 0.55
+                if *score >= min_attribute_threshold {
+                    accepted.push((tag.clone(), *score));
+                }
+            }
+            CropType::Quadrant => {
+                // Reject generic backgrounds
+                if norm == "simple background"
+                    || norm == "white background"
+                    || norm == "grey background"
+                    || norm == "monochrome"
+                    || norm == "blurry background"
+                {
+                    continue;
+                }
+                if is_concrete_scene_object(&norm) {
+                    if *score >= scene_object_threshold {
+                        accepted.push((tag.clone(), *score));
+                    }
+                } else if !is_global_framing_tag(&norm) && *score >= min_attribute_threshold {
+                    accepted.push((tag.clone(), *score));
+                }
+            }
+        }
+    }
+
+    accepted
+}
+
+pub fn merge_crop_tags(
+    base_tags: &[(String, f32)],
+    crop_tags: &[(String, f32)],
+    crop_type: CropType,
+    character_names: &[String],
+    min_attribute_threshold: f32,
+    scene_object_threshold: f32,
+) -> Vec<(String, f32)> {
+    let filtered = filter_crop_tags(
+        crop_tags,
+        crop_type,
+        character_names,
+        min_attribute_threshold,
+        scene_object_threshold,
+    );
+
+    let mut out: Vec<(String, f32)> = base_tags.to_vec();
+
+    for (c_tag, c_score) in filtered {
+        let norm_c = norm_tag(&c_tag);
+        let mut found = false;
+        for (b_tag, b_score) in out.iter_mut() {
+            if norm_tag(b_tag) == norm_c {
+                *b_score = b_score.max(c_score);
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            out.push((c_tag, c_score));
+        }
+    }
+    out
+}
+
+pub fn compute_zone_boxes(
+    img_w: f32,
+    img_h: f32,
+    box_x0: f32,
+    box_y0: f32,
+    box_x1: f32,
+    box_y1: f32,
+) -> Vec<ZoneBox> {
+    if img_w <= 0.0 || img_h <= 0.0 {
+        return Vec::new();
+    }
+
+    let x0 = box_x0.max(0.0).min(img_w);
+    let y0 = box_y0.max(0.0).min(img_h);
+    let x1 = box_x1.max(x0).min(img_w);
+    let y1 = box_y1.max(y0).min(img_h);
+
+    let w = x1 - x0;
+    let h = y1 - y0;
+    if w <= 1.0 || h <= 1.0 {
+        return Vec::new();
+    }
+
+    let bottom_edge = y1 >= (0.98 * img_h);
+    let height_ratio = h / img_h;
+
+    let mx = w * 0.06;
+    let my = h * 0.04;
+
+    let make_box = |name: &'static str, zy0: f32, zy1: f32| -> ZoneBox {
+        let cx0 = (x0 - mx).max(0.0).min(img_w - 1.0);
+        let cy0 = (zy0 - my).max(0.0).min(img_h - 1.0);
+        let cx1 = (x1 + mx).min(img_w).max(cx0 + 1.0);
+        let cy1 = (zy1 + my).min(img_h).max(cy0 + 1.0);
+        ZoneBox {
+            name,
+            x0: (cx0 * 100.0).round() / 100.0,
+            y0: (cy0 * 100.0).round() / 100.0,
+            x1: (cx1 * 100.0).round() / 100.0,
+            y1: (cy1 * 100.0).round() / 100.0,
+        }
+    };
+
+    let mut zones = Vec::new();
+    // 1. Upper (0 - 55%): Head, Hair, Face - Always valid
+    zones.push(make_box("Upper", y0, y0 + h * 0.55));
+
+    // 2. Middle (30% - 70%): Torso, Arms, Held Items
+    if height_ratio >= 0.25 {
+        zones.push(make_box("Middle", y0 + h * 0.30, y0 + h * 0.70));
+    }
+
+    // 3. Lower (55% - 100%): Hips, Legs, Footwear
+    // Skip lower zone if figure touches the bottom frame and height ratio < 0.72 (half-body/cowboy shot cut off)
+    let is_cut_off_bottom = bottom_edge && (height_ratio < 0.72);
+    if !is_cut_off_bottom && (height_ratio >= 0.40) {
+        zones.push(make_box("Lower", y0 + h * 0.55, y1));
+    }
+
+    zones
+}
+
+// ---------------------------------------------------------------------------
 // Tests (ports of test_prompt_condenser.py)
 // ---------------------------------------------------------------------------
 #[cfg(test)]
@@ -2141,5 +2642,82 @@ mod tests {
         for t in ["girl", "1 girl", "solo focus", "1girls x", ""] {
             assert!(!is_subject_tag(t), "{}", t);
         }
+    }
+
+    #[test]
+    fn crop_tag_policy_rejects_artifacts_ratings_sizes_counts() {
+        let crop = vec![
+            ("close-up".to_string(), 0.95),
+            ("portrait".to_string(), 0.90),
+            ("solo focus".to_string(), 0.88),
+            ("breast focus".to_string(), 0.85),
+            ("head out of frame".to_string(), 0.80),
+            ("cropped legs".to_string(), 0.75),
+            ("out of frame".to_string(), 0.90),
+            ("feet out of frame".to_string(), 0.65),
+            ("partially submerged".to_string(), 0.60),
+            ("general".to_string(), 0.99),
+            ("sensitive".to_string(), 0.95),
+            ("1girl".to_string(), 0.98),
+            ("large breasts".to_string(), 0.85),
+            ("pyra (xenoblade)".to_string(), 0.95),
+            ("silver brooch".to_string(), 0.55),
+            ("hair ornament".to_string(), 0.54), // below 0.55
+        ];
+        let char_names = vec!["pyra (xenoblade)".to_string()];
+        let filtered = filter_crop_tags(&crop, CropType::CharacterZone, &char_names, 0.55, 0.40);
+        let names: Vec<String> = filtered.into_iter().map(|(t, _)| t).collect();
+        assert_eq!(names, vec!["silver brooch"]);
+    }
+
+    #[test]
+    fn crop_tag_policy_quadrant_concrete_objects() {
+        let quad = vec![
+            ("potted plant".to_string(), 0.45),
+            ("bookshelf".to_string(), 0.40),
+            ("simple background".to_string(), 0.90),
+            ("white background".to_string(), 0.85),
+            ("solo focus".to_string(), 0.70),
+            ("close-up".to_string(), 0.75),
+            ("wooden chair".to_string(), 0.50),
+        ];
+        let filtered = filter_crop_tags(&quad, CropType::Quadrant, &[], 0.55, 0.40);
+        let names: Vec<String> = filtered.into_iter().map(|(t, _)| t).collect();
+        assert!(names.contains(&"potted plant".to_string()));
+        assert!(names.contains(&"bookshelf".to_string()));
+        assert!(names.contains(&"wooden chair".to_string()));
+        assert!(!names.contains(&"simple background".to_string()));
+        assert!(!names.contains(&"white background".to_string()));
+        assert!(!names.contains(&"solo focus".to_string()));
+        assert!(!names.contains(&"close-up".to_string()));
+    }
+
+    #[test]
+    fn merge_crop_tags_takes_max_score() {
+        let base = vec![("blue dress".to_string(), 0.60), ("black boots".to_string(), 0.70)];
+        let crop = vec![("blue dress".to_string(), 0.85), ("silver necklace".to_string(), 0.80)];
+        let merged = merge_crop_tags(&base, &crop, CropType::CharacterZone, &[], 0.55, 0.40);
+        let m_map: HashMap<String, f32> = merged.into_iter().collect();
+        assert_eq!(m_map.get("blue dress"), Some(&0.85));
+        assert_eq!(m_map.get("black boots"), Some(&0.70));
+        assert_eq!(m_map.get("silver necklace"), Some(&0.80));
+    }
+
+    #[test]
+    fn pure_zone_boxes_geometry() {
+        // Full body: 1000x1000 image, box height = 850 (ratio = 0.85)
+        let boxes = compute_zone_boxes(1000.0, 1000.0, 200.0, 100.0, 500.0, 950.0);
+        let names: Vec<&str> = boxes.iter().map(|b| b.name).collect();
+        assert_eq!(names, vec!["Upper", "Middle", "Lower"]);
+
+        // Half body touching bottom: box height = 500 (ratio = 0.50, touches bottom >= 980)
+        let half = compute_zone_boxes(1000.0, 1000.0, 200.0, 500.0, 500.0, 1000.0);
+        let half_names: Vec<&str> = half.iter().map(|b| b.name).collect();
+        assert_eq!(half_names, vec!["Upper", "Middle"]);
+
+        // Head/bust: height = 150 (ratio = 0.15)
+        let bust = compute_zone_boxes(1000.0, 1000.0, 300.0, 100.0, 500.0, 250.0);
+        let bust_names: Vec<&str> = bust.iter().map(|b| b.name).collect();
+        assert_eq!(bust_names, vec!["Upper"]);
     }
 }

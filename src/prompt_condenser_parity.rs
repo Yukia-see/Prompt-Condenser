@@ -152,6 +152,78 @@ fn rust_matches_python_reference() {
         );
     }
 
+    for c in cases(&root, "filter_crop") {
+        let tags: Vec<(String, f32)> = match c.get("tags") {
+            Some(Value::Arr(items)) => items
+                .iter()
+                .map(|item| match item {
+                    Value::Arr(pair) => (
+                        match &pair[0] { Value::Str(s) => s.clone(), _ => String::new() },
+                        match &pair[1] { Value::Num(n) => *n as f32, _ => 0.0 },
+                    ),
+                    _ => (String::new(), 0.0),
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        let ctype = match s(c, "crop_type").as_str() {
+            "quadrant" => CropType::Quadrant,
+            _ => CropType::CharacterZone,
+        };
+        let cnames = list(c, "character_names");
+        let min_t = match c.get("min_attribute_threshold") { Some(Value::Num(n)) => *n as f32, _ => 0.55 };
+        let sc_t = match c.get("scene_object_threshold") { Some(Value::Num(n)) => *n as f32, _ => 0.40 };
+
+        let got = filter_crop_tags(&tags, ctype, &cnames, min_t, sc_t);
+        let got_fmt: Vec<String> = got.iter().map(|(t, s)| format!("{}:{:.2}", t, s)).collect();
+
+        let want_fmt: Vec<String> = match c.get("expect") {
+            Some(Value::Arr(items)) => items
+                .iter()
+                .map(|item| match item {
+                    Value::Arr(pair) => {
+                        let tag = match &pair[0] { Value::Str(s) => s.clone(), _ => String::new() };
+                        let score = match &pair[1] { Value::Num(n) => *n as f32, _ => 0.0 };
+                        format!("{}:{:.2}", tag, score)
+                    }
+                    _ => String::new(),
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+
+        check("filter_crop", format!("{:?} {:?}", tags, ctype), got_fmt.join(", "), want_fmt.join(", "));
+    }
+
+    for c in cases(&root, "zone_boxes") {
+        let img_w = match c.get("img_w") { Some(Value::Num(n)) => *n as f32, _ => 0.0 };
+        let img_h = match c.get("img_h") { Some(Value::Num(n)) => *n as f32, _ => 0.0 };
+        let x0 = match c.get("x0") { Some(Value::Num(n)) => *n as f32, _ => 0.0 };
+        let y0 = match c.get("y0") { Some(Value::Num(n)) => *n as f32, _ => 0.0 };
+        let x1 = match c.get("x1") { Some(Value::Num(n)) => *n as f32, _ => 0.0 };
+        let y1 = match c.get("y1") { Some(Value::Num(n)) => *n as f32, _ => 0.0 };
+
+        let got = compute_zone_boxes(img_w, img_h, x0, y0, x1, y1);
+        let got_str: Vec<String> = got.iter().map(|b| format!("{}:{:.1},{:.1},{:.1},{:.1}", b.name, b.x0, b.y0, b.x1, b.y1)).collect();
+
+        let want_str: Vec<String> = match c.get("expect") {
+            Some(Value::Arr(items)) => items
+                .iter()
+                .map(|item| {
+                    let name = s(item, "name");
+                    let bx0 = match item.get("x0") { Some(Value::Num(n)) => *n as f32, _ => 0.0 };
+                    let by0 = match item.get("y0") { Some(Value::Num(n)) => *n as f32, _ => 0.0 };
+                    let bx1 = match item.get("x1") { Some(Value::Num(n)) => *n as f32, _ => 0.0 };
+                    let by1 = match item.get("y1") { Some(Value::Num(n)) => *n as f32, _ => 0.0 };
+                    format!("{}:{:.1},{:.1},{:.1},{:.1}", name, bx0, by0, bx1, by1)
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+
+        check("zone_boxes", format!("{}x{} box: {},{},{},{}", img_w, img_h, x0, y0, x1, y1), got_str.join(" | "), want_str.join(" | "));
+    }
+
     let shown: Vec<&String> = failures.iter().take(5).collect();
     assert!(
         failures.is_empty(),

@@ -386,4 +386,81 @@ mod tests {
             assert!(!is_subject_tag(t), "{}", t);
         }
     }
+
+    #[test]
+    fn crop_tag_policy_rejects_artifacts_ratings_sizes_counts() {
+        let crop = vec![
+            ("close-up".to_string(), 0.95),
+            ("portrait".to_string(), 0.90),
+            ("solo focus".to_string(), 0.88),
+            ("breast focus".to_string(), 0.85),
+            ("head out of frame".to_string(), 0.80),
+            ("cropped legs".to_string(), 0.75),
+            ("out of frame".to_string(), 0.90),
+            ("feet out of frame".to_string(), 0.65),
+            ("partially submerged".to_string(), 0.60),
+            ("general".to_string(), 0.99),
+            ("sensitive".to_string(), 0.95),
+            ("1girl".to_string(), 0.98),
+            ("large breasts".to_string(), 0.85),
+            ("pyra (xenoblade)".to_string(), 0.95),
+            ("silver brooch".to_string(), 0.55),
+            ("hair ornament".to_string(), 0.54), // below 0.55
+        ];
+        let char_names = vec!["pyra (xenoblade)".to_string()];
+        let filtered = filter_crop_tags(&crop, CropType::CharacterZone, &char_names, 0.55, 0.40);
+        let names: Vec<String> = filtered.into_iter().map(|(t, _)| t).collect();
+        assert_eq!(names, vec!["silver brooch"]);
+    }
+
+    #[test]
+    fn crop_tag_policy_quadrant_concrete_objects() {
+        let quad = vec![
+            ("potted plant".to_string(), 0.45),
+            ("bookshelf".to_string(), 0.40),
+            ("simple background".to_string(), 0.90),
+            ("white background".to_string(), 0.85),
+            ("solo focus".to_string(), 0.70),
+            ("close-up".to_string(), 0.75),
+            ("wooden chair".to_string(), 0.50),
+        ];
+        let filtered = filter_crop_tags(&quad, CropType::Quadrant, &[], 0.55, 0.40);
+        let names: Vec<String> = filtered.into_iter().map(|(t, _)| t).collect();
+        assert!(names.contains(&"potted plant".to_string()));
+        assert!(names.contains(&"bookshelf".to_string()));
+        assert!(names.contains(&"wooden chair".to_string()));
+        assert!(!names.contains(&"simple background".to_string()));
+        assert!(!names.contains(&"white background".to_string()));
+        assert!(!names.contains(&"solo focus".to_string()));
+        assert!(!names.contains(&"close-up".to_string()));
+    }
+
+    #[test]
+    fn merge_crop_tags_takes_max_score() {
+        let base = vec![("blue dress".to_string(), 0.60), ("black boots".to_string(), 0.70)];
+        let crop = vec![("blue dress".to_string(), 0.85), ("silver necklace".to_string(), 0.80)];
+        let merged = merge_crop_tags(&base, &crop, CropType::CharacterZone, &[], 0.55, 0.40);
+        let m_map: HashMap<String, f32> = merged.into_iter().collect();
+        assert_eq!(m_map.get("blue dress"), Some(&0.85));
+        assert_eq!(m_map.get("black boots"), Some(&0.70));
+        assert_eq!(m_map.get("silver necklace"), Some(&0.80));
+    }
+
+    #[test]
+    fn pure_zone_boxes_geometry() {
+        // Full body: 1000x1000 image, box height = 850 (ratio = 0.85)
+        let boxes = compute_zone_boxes(1000.0, 1000.0, 200.0, 100.0, 500.0, 950.0);
+        let names: Vec<&str> = boxes.iter().map(|b| b.name).collect();
+        assert_eq!(names, vec!["Upper", "Middle", "Lower"]);
+
+        // Half body touching bottom: box height = 500 (ratio = 0.50, touches bottom >= 980)
+        let half = compute_zone_boxes(1000.0, 1000.0, 200.0, 500.0, 500.0, 1000.0);
+        let half_names: Vec<&str> = half.iter().map(|b| b.name).collect();
+        assert_eq!(half_names, vec!["Upper", "Middle"]);
+
+        // Head/bust: height = 150 (ratio = 0.15)
+        let bust = compute_zone_boxes(1000.0, 1000.0, 300.0, 100.0, 500.0, 250.0);
+        let bust_names: Vec<&str> = bust.iter().map(|b| b.name).collect();
+        assert_eq!(bust_names, vec!["Upper"]);
+    }
 }

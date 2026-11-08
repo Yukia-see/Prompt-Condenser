@@ -11,7 +11,7 @@ from pathlib import Path
 
 def main():
     repo_root = Path(__file__).resolve().parent.parent
-    cmd = ["cargo", "run", "--", "eval"] + sys.argv[1:]
+    cmd = ["cargo", "run", "--release", "--", "eval"] + sys.argv[1:]
     
     print(f"Executing evaluation harness via cargo: {' '.join(cmd)}")
     result = subprocess.run(cmd, cwd=repo_root)
