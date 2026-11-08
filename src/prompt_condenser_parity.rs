@@ -224,6 +224,41 @@ fn rust_matches_python_reference() {
         check("zone_boxes", format!("{}x{} box: {},{},{},{}", img_w, img_h, x0, y0, x1, y1), got_str.join(" | "), want_str.join(" | "));
     }
 
+    for c in cases(&root, "layer_conflicts") {
+        let tags: Vec<String> = list(c, "tags");
+        let (kept, sup) = resolve_layer_conflicts(&tags);
+        let want = c.get("expect").unwrap();
+        let want_kept = list(want, "kept");
+        let want_sup: Vec<(String, String)> = match want.get("suppressed") {
+            Some(Value::Arr(pairs)) => pairs
+                .iter()
+                .map(|p| match p {
+                    Value::Arr(items) => (
+                        match &items[0] { Value::Str(s) => s.clone(), _ => String::new() },
+                        match &items[1] { Value::Str(s) => s.clone(), _ => String::new() },
+                    ),
+                    _ => (String::new(), String::new()),
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+
+        check(
+            "layer_conflicts_kept",
+            format!("{:?}", tags),
+            kept.join(", "),
+            want_kept.join(", "),
+        );
+        let got_sup_str: Vec<String> = sup.iter().map(|(a, b)| format!("{}>{}", a, b)).collect();
+        let want_sup_str: Vec<String> = want_sup.iter().map(|(a, b)| format!("{}>{}", a, b)).collect();
+        check(
+            "layer_conflicts_sup",
+            format!("{:?}", tags),
+            got_sup_str.join(", "),
+            want_sup_str.join(", "),
+        );
+    }
+
     let shown: Vec<&String> = failures.iter().take(5).collect();
     assert!(
         failures.is_empty(),

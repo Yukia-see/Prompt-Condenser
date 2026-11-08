@@ -57,6 +57,15 @@ pub struct ZoneBox {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClothingLayerDef {
+    pub tag: &'static str,
+    pub region: &'static str,
+    pub layer: &'static str,
+    pub rank: u8,
+    pub covers: &'static [&'static str],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CropType {
     CharacterZone,
     Quadrant,

@@ -57,6 +57,15 @@ pub struct ZoneBox {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClothingLayerDef {
+    pub tag: &'static str,
+    pub region: &'static str,
+    pub layer: &'static str,
+    pub rank: u8,
+    pub covers: &'static [&'static str],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CropType {
     CharacterZone,
     Quadrant,
@@ -889,6 +898,172 @@ pub const ATTRIBUTE_GROUPS: &[&[&str]] = &[
     &["long hair", "medium hair", "short hair", "very long hair", "very short hair"],
     &["flat chest", "gigantic breasts", "huge breasts", "large breasts", "medium breasts", "small breasts"],
 ];
+pub const COEXISTING_PAIRS: &[(&str, &str)] = &[
+    ("bare arms", "halterneck"),
+    ("bare arms", "sleeveless dress"),
+    ("bare arms", "sleeveless shirt"),
+    ("bare arms", "strapless dress"),
+    ("bare arms", "tube top"),
+    ("bare shoulders", "halterneck"),
+    ("bare shoulders", "off-shoulder shirt"),
+    ("bare shoulders", "strapless dress"),
+    ("bare shoulders", "tube top"),
+    ("bare stomach", "bikini"),
+    ("bikini", "bare stomach"),
+    ("bikini", "cleavage"),
+    ("bikini", "deep cleavage"),
+    ("bikini", "navel"),
+    ("boots", "kneehighs"),
+    ("boots", "socks"),
+    ("boots", "thighhighs"),
+    ("camisole", "cardigan"),
+    ("cardigan", "camisole"),
+    ("cleavage", "bikini"),
+    ("cleavage", "crop top"),
+    ("cleavage", "halterneck"),
+    ("cleavage", "jacket"),
+    ("cleavage", "open jacket"),
+    ("cleavage", "open shirt"),
+    ("cleavage", "plunge dress"),
+    ("cleavage", "strapless dress"),
+    ("cleavage", "tube top"),
+    ("cleavage", "unbuttoned shirt"),
+    ("coat", "dress"),
+    ("crop top", "cleavage"),
+    ("crop top", "midriff"),
+    ("crop top", "navel"),
+    ("deep cleavage", "bikini"),
+    ("deep cleavage", "open jacket"),
+    ("deep cleavage", "plunge dress"),
+    ("deep cleavage", "tube top"),
+    ("dress", "coat"),
+    ("gloves", "sleeveless"),
+    ("halterneck", "bare arms"),
+    ("halterneck", "bare shoulders"),
+    ("halterneck", "cleavage"),
+    ("jacket", "cleavage"),
+    ("jacket", "shirt"),
+    ("jacket", "t-shirt"),
+    ("kneehighs", "boots"),
+    ("midriff", "crop top"),
+    ("midriff", "open jacket"),
+    ("midriff", "open shirt"),
+    ("midriff", "tube top"),
+    ("navel", "bikini"),
+    ("navel", "crop top"),
+    ("navel", "open jacket"),
+    ("navel", "open shirt"),
+    ("navel", "tube top"),
+    ("off-shoulder shirt", "bare shoulders"),
+    ("open jacket", "cleavage"),
+    ("open jacket", "deep cleavage"),
+    ("open jacket", "midriff"),
+    ("open jacket", "navel"),
+    ("open jacket", "shirt"),
+    ("open jacket", "t-shirt"),
+    ("open shirt", "cleavage"),
+    ("open shirt", "midriff"),
+    ("open shirt", "navel"),
+    ("plunge dress", "cleavage"),
+    ("plunge dress", "deep cleavage"),
+    ("shirt", "jacket"),
+    ("shirt", "open jacket"),
+    ("shoes", "socks"),
+    ("shoes", "thighhighs"),
+    ("shorts", "thighhighs"),
+    ("skirt", "thighhighs"),
+    ("sleeveless", "gloves"),
+    ("sleeveless dress", "bare arms"),
+    ("sleeveless shirt", "bare arms"),
+    ("sneakers", "socks"),
+    ("socks", "boots"),
+    ("socks", "shoes"),
+    ("socks", "sneakers"),
+    ("strapless dress", "bare arms"),
+    ("strapless dress", "bare shoulders"),
+    ("strapless dress", "cleavage"),
+    ("t-shirt", "jacket"),
+    ("t-shirt", "open jacket"),
+    ("thighhighs", "boots"),
+    ("thighhighs", "shoes"),
+    ("thighhighs", "shorts"),
+    ("thighhighs", "skirt"),
+    ("tube top", "bare arms"),
+    ("tube top", "bare shoulders"),
+    ("tube top", "cleavage"),
+    ("tube top", "deep cleavage"),
+    ("tube top", "midriff"),
+    ("tube top", "navel"),
+    ("unbuttoned shirt", "cleavage"),
+];
+pub const OCCLUSION_SUPPRESSIONS: &[(&str, &str)] = &[
+    ("blindfold", "eyes"),
+    ("boots", "barefoot"),
+    ("burka", "face"),
+    ("closed eyes", "looking at viewer"),
+    ("faceless", "eyes"),
+    ("gloves", "bare hands"),
+    ("high heels", "barefoot"),
+    ("jeans", "bare legs"),
+    ("loafers", "barefoot"),
+    ("long pants", "bare legs"),
+    ("pants", "bare legs"),
+    ("sandals", "barefoot"),
+    ("shoes", "barefoot"),
+    ("sneakers", "barefoot"),
+    ("trousers", "bare legs"),
+    ("turtleneck", "bare shoulders"),
+    ("turtleneck", "cleavage"),
+    ("turtleneck", "collarbone"),
+    ("turtleneck", "deep cleavage"),
+];
+pub const CLOTHING_LAYER_DEFS: &[ClothingLayerDef] = &[
+    ClothingLayerDef { tag: "bare arms", region: "arms", layer: "skin", rank: 0, covers: &[] },
+    ClothingLayerDef { tag: "bare hands", region: "hands", layer: "skin", rank: 0, covers: &[] },
+    ClothingLayerDef { tag: "bare legs", region: "legs", layer: "skin", rank: 0, covers: &[] },
+    ClothingLayerDef { tag: "bare shoulders", region: "shoulders", layer: "skin", rank: 0, covers: &[] },
+    ClothingLayerDef { tag: "bare stomach", region: "stomach", layer: "skin", rank: 0, covers: &[] },
+    ClothingLayerDef { tag: "barefoot", region: "feet", layer: "skin", rank: 0, covers: &[] },
+    ClothingLayerDef { tag: "bikini", region: "chest", layer: "swimwear", rank: 1, covers: &[] },
+    ClothingLayerDef { tag: "blouse", region: "torso", layer: "inner", rank: 2, covers: &[] },
+    ClothingLayerDef { tag: "boots", region: "feet", layer: "footwear", rank: 4, covers: &["feet"] },
+    ClothingLayerDef { tag: "bra", region: "chest", layer: "underwear", rank: 1, covers: &[] },
+    ClothingLayerDef { tag: "camisole", region: "torso", layer: "inner", rank: 2, covers: &[] },
+    ClothingLayerDef { tag: "cardigan", region: "torso", layer: "middle", rank: 3, covers: &[] },
+    ClothingLayerDef { tag: "cleavage", region: "chest", layer: "skin", rank: 0, covers: &[] },
+    ClothingLayerDef { tag: "coat", region: "torso", layer: "outer", rank: 4, covers: &[] },
+    ClothingLayerDef { tag: "collarbone", region: "neck", layer: "skin", rank: 0, covers: &[] },
+    ClothingLayerDef { tag: "crop top", region: "torso", layer: "inner", rank: 2, covers: &[] },
+    ClothingLayerDef { tag: "deep cleavage", region: "chest", layer: "skin", rank: 0, covers: &[] },
+    ClothingLayerDef { tag: "gloves", region: "hands", layer: "outer", rank: 4, covers: &["hands"] },
+    ClothingLayerDef { tag: "high heels", region: "feet", layer: "footwear", rank: 4, covers: &["feet"] },
+    ClothingLayerDef { tag: "hoodie", region: "torso", layer: "outer", rank: 4, covers: &[] },
+    ClothingLayerDef { tag: "jacket", region: "torso", layer: "outer", rank: 4, covers: &[] },
+    ClothingLayerDef { tag: "jeans", region: "legs", layer: "outer", rank: 4, covers: &["legs"] },
+    ClothingLayerDef { tag: "kneehighs", region: "legs", layer: "inner", rank: 2, covers: &[] },
+    ClothingLayerDef { tag: "loafers", region: "feet", layer: "footwear", rank: 4, covers: &["feet"] },
+    ClothingLayerDef { tag: "long pants", region: "legs", layer: "outer", rank: 4, covers: &["legs"] },
+    ClothingLayerDef { tag: "midriff", region: "stomach", layer: "skin", rank: 0, covers: &[] },
+    ClothingLayerDef { tag: "navel", region: "stomach", layer: "skin", rank: 0, covers: &[] },
+    ClothingLayerDef { tag: "overcoat", region: "torso", layer: "outer", rank: 4, covers: &[] },
+    ClothingLayerDef { tag: "panties", region: "pelvis", layer: "underwear", rank: 1, covers: &[] },
+    ClothingLayerDef { tag: "pants", region: "legs", layer: "outer", rank: 4, covers: &["legs"] },
+    ClothingLayerDef { tag: "pantyhose", region: "legs", layer: "inner", rank: 2, covers: &[] },
+    ClothingLayerDef { tag: "sandals", region: "feet", layer: "footwear", rank: 4, covers: &["feet"] },
+    ClothingLayerDef { tag: "shirt", region: "torso", layer: "inner", rank: 2, covers: &[] },
+    ClothingLayerDef { tag: "shoes", region: "feet", layer: "footwear", rank: 4, covers: &["feet"] },
+    ClothingLayerDef { tag: "shorts", region: "legs", layer: "middle", rank: 3, covers: &[] },
+    ClothingLayerDef { tag: "skirt", region: "legs", layer: "middle", rank: 3, covers: &[] },
+    ClothingLayerDef { tag: "sneakers", region: "feet", layer: "footwear", rank: 4, covers: &["feet"] },
+    ClothingLayerDef { tag: "socks", region: "feet", layer: "inner", rank: 2, covers: &[] },
+    ClothingLayerDef { tag: "sweater", region: "torso", layer: "middle", rank: 3, covers: &[] },
+    ClothingLayerDef { tag: "t-shirt", region: "torso", layer: "inner", rank: 2, covers: &[] },
+    ClothingLayerDef { tag: "tank top", region: "torso", layer: "inner", rank: 2, covers: &[] },
+    ClothingLayerDef { tag: "thighhighs", region: "legs", layer: "inner", rank: 2, covers: &[] },
+    ClothingLayerDef { tag: "tube top", region: "torso", layer: "inner", rank: 2, covers: &[] },
+    ClothingLayerDef { tag: "turtleneck", region: "torso", layer: "outer", rank: 4, covers: &["neck", "chest", "shoulders"] },
+    ClothingLayerDef { tag: "underwear", region: "pelvis", layer: "underwear", rank: 1, covers: &[] },
+];
 // ---- END GENERATED ----
 
 // ---------------------------------------------------------------------------
@@ -1337,12 +1512,74 @@ pub struct Merged {
     pub dropped_wd14: Vec<String>,
     pub dropped_hedged: Vec<String>,
     pub dropped_unconfirmed: Vec<String>,
+    pub dropped_layer_conflicts: Vec<(String, String)>,
     pub negated_vlm: Vec<String>,
     /// WD14 tags that matched no scene keyword and defaulted to Pass 2; grow the
     /// keyword lists from these.
     pub unrouted_wd14: Vec<String>,
     pub dropped_moondream: Vec<String>,
     pub negated_moondream: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4: Layer-based conflict rules
+// ---------------------------------------------------------------------------
+pub fn can_coexist(tag_a: &str, tag_b: &str) -> bool {
+    let na = norm_tag(tag_a);
+    let nb = norm_tag(tag_b);
+    if na == nb {
+        return true;
+    }
+    COEXISTING_PAIRS
+        .iter()
+        .any(|&(a, b)| (a == na && b == nb) || (a == nb && b == na))
+}
+
+pub fn is_occluded_by(covering_tag: &str, inner_tag: &str) -> bool {
+    let nc = norm_tag(covering_tag);
+    let ni = norm_tag(inner_tag);
+    if nc == ni {
+        return false;
+    }
+    if can_coexist(&nc, &ni) {
+        return false;
+    }
+    if OCCLUSION_SUPPRESSIONS
+        .iter()
+        .any(|&(s, t)| s == nc && t == ni)
+    {
+        return true;
+    }
+    let rule_c = CLOTHING_LAYER_DEFS.iter().find(|d| d.tag == nc);
+    let rule_i = CLOTHING_LAYER_DEFS.iter().find(|d| d.tag == ni);
+    if let (Some(rc), Some(ri)) = (rule_c, rule_i) {
+        if rc.covers.contains(&ri.region) && rc.rank > ri.rank {
+            return true;
+        }
+    }
+    false
+}
+
+pub fn resolve_layer_conflicts(tags: &[String]) -> (Vec<String>, Vec<(String, String)>) {
+    let mut kept = Vec::new();
+    let mut suppressed = Vec::new();
+    for (i, tag) in tags.iter().enumerate() {
+        let mut is_suppressed = false;
+        for (j, other) in tags.iter().enumerate() {
+            if i == j {
+                continue;
+            }
+            if is_occluded_by(other, tag) {
+                suppressed.push((tag.clone(), other.clone()));
+                is_suppressed = true;
+                break;
+            }
+        }
+        if !is_suppressed {
+            kept.push(tag.clone());
+        }
+    }
+    (kept, suppressed)
 }
 
 pub fn merge_tags(
@@ -1430,6 +1667,16 @@ pub fn merge_tags_with_options(
     let md1: Vec<String> = md1.into_iter().filter(|t| !drop_md.contains(t)).collect();
     let md2: Vec<String> = md2.into_iter().filter(|t| !drop_md.contains(t)).collect();
 
+    // Phase 4: Layer-based conflict resolution
+    let all_combined: Vec<String> = md1.iter().chain(wd1.iter()).chain(md2.iter()).chain(wd2.iter()).cloned().collect();
+    let (_, mut layer_suppressed) = resolve_layer_conflicts(&all_combined);
+    layer_suppressed.sort();
+    let suppressed_norms: HashSet<String> = layer_suppressed.iter().map(|(sup, _)| norm_tag(sup)).collect();
+    let md1: Vec<String> = md1.into_iter().filter(|t| !suppressed_norms.contains(&norm_tag(t))).collect();
+    let wd1: Vec<String> = wd1.into_iter().filter(|t| !suppressed_norms.contains(&norm_tag(t))).collect();
+    let md2: Vec<String> = md2.into_iter().filter(|t| !suppressed_norms.contains(&norm_tag(t))).collect();
+    let wd2: Vec<String> = wd2.into_iter().filter(|t| !suppressed_norms.contains(&norm_tag(t))).collect();
+
     let sorted = |s: &HashSet<String>| {
         let mut v: Vec<String> = s.iter().cloned().collect();
         v.sort();
@@ -1444,6 +1691,7 @@ pub fn merge_tags_with_options(
         dropped_wd14: sorted(&drop_wd),
         dropped_hedged: hedged_unconfirmed.into_iter().collect(),
         dropped_unconfirmed: unconfirmed.into_iter().collect(),
+        dropped_layer_conflicts: layer_suppressed,
         negated_vlm: negated.clone(),
         unrouted_wd14: wd2,
         dropped_moondream: drop_vlm_sorted,
@@ -2800,5 +3048,62 @@ mod tests {
         assert!(!m.dropped_unconfirmed.contains(&"butterfly hairpin".to_string()));
         assert!(!m.pass2_tags.contains(&"red ribbon".to_string()));
         assert!(m.dropped_unconfirmed.contains(&"red ribbon".to_string()));
+    }
+
+    #[test]
+    fn layer_conflict_coexist_and_suppression() {
+        // 1. can_coexist checks
+        assert!(can_coexist("tube top", "cleavage"));
+        assert!(can_coexist("boots", "thighhighs"));
+        assert!(can_coexist("shoes", "socks"));
+        assert!(!can_coexist("turtleneck", "cleavage"));
+        assert!(!can_coexist("shoes", "barefoot"));
+
+        // 2. is_occluded_by checks
+        assert!(is_occluded_by("turtleneck", "cleavage"));
+        assert!(!is_occluded_by("tube top", "cleavage"));
+        assert!(!is_occluded_by("boots", "thighhighs"));
+        assert!(is_occluded_by("shoes", "barefoot"));
+        assert!(is_occluded_by("long pants", "bare legs"));
+
+        // 3. resolve_layer_conflicts
+        let tags_tt: Vec<String> = ["1girl", "tube top", "cleavage", "boots", "thighhighs"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let (kept_tt, sup_tt) = resolve_layer_conflicts(&tags_tt);
+        assert!(kept_tt.contains(&"tube top".to_string()));
+        assert!(kept_tt.contains(&"cleavage".to_string()));
+        assert!(kept_tt.contains(&"boots".to_string()));
+        assert!(kept_tt.contains(&"thighhighs".to_string()));
+        assert_eq!(sup_tt.len(), 0);
+
+        let tags_tn: Vec<String> = ["1girl", "turtleneck", "cleavage", "boots", "thighhighs"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let (kept_tn, sup_tn) = resolve_layer_conflicts(&tags_tn);
+        assert!(kept_tn.contains(&"turtleneck".to_string()));
+        assert!(!kept_tn.contains(&"cleavage".to_string()));
+        assert!(kept_tn.contains(&"boots".to_string()));
+        assert!(kept_tn.contains(&"thighhighs".to_string()));
+        assert!(sup_tn.contains(&("cleavage".to_string(), "turtleneck".to_string())));
+
+        // 4. merge_tags integration
+        let m_tt = merge_tags("1girl, tube_top, cleavage, boots, thighhighs", "", "", Mode::SceneShape, None);
+        let all_tt: Vec<String> = m_tt.pass1_tags.into_iter().chain(m_tt.pass2_tags).collect();
+        assert!(all_tt.contains(&"tube top".to_string()));
+        assert!(all_tt.contains(&"cleavage".to_string()));
+        assert!(all_tt.contains(&"boots".to_string()));
+        assert!(all_tt.contains(&"thighhighs".to_string()));
+        assert_eq!(m_tt.dropped_layer_conflicts.len(), 0);
+
+        let m_tn = merge_tags("1girl, turtleneck, cleavage, boots, thighhighs", "", "", Mode::SceneShape, None);
+        let all_tn: Vec<String> = m_tn.pass1_tags.into_iter().chain(m_tn.pass2_tags).collect();
+        assert!(all_tn.contains(&"turtleneck".to_string()));
+        assert!(!all_tn.contains(&"cleavage".to_string()));
+        assert!(all_tn.contains(&"boots".to_string()));
+        assert!(all_tn.contains(&"thighhighs".to_string()));
+        assert!(m_tn.dropped_layer_conflicts.contains(&("cleavage".to_string(), "turtleneck".to_string())));
     }
 }

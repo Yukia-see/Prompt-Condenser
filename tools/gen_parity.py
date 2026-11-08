@@ -44,7 +44,8 @@ def zone_text(n):
 
 cases = {
     "router": [], "analyze": [], "merge": [], "nollm": [], "parse": [],
-    "flatten": [], "payload": [], "style": [], "filter_crop": [], "zone_boxes": []
+    "flatten": [], "payload": [], "style": [], "filter_crop": [], "zone_boxes": [],
+    "layer_conflicts": []
 }
 
 # ---- hand-picked
@@ -130,6 +131,17 @@ for _ in range(250):
     cases["nollm"].append({"wd": wd, "md1": md1, "md2": md2, "mode": mode, "vocab": vocab, "keep": keep})
     cases["payload"].append({"wd": wd, "md1": md1, "md2": md2, "mode": mode, "vocab": vocab, "vision": random.random() < 0.5})
 
+conflict_test_samples = [
+    ["1girl", "tube top", "cleavage", "boots", "thighhighs"],
+    ["1girl", "turtleneck", "cleavage", "boots", "thighhighs"],
+    ["1girl", "shoes", "barefoot", "long pants", "bare legs"],
+    ["1girl", "open jacket", "cleavage", "midriff", "socks", "shoes"],
+    ["1girl", "gloves", "bare hands", "blindfold", "eyes"],
+    ["1girl", "turtleneck", "deep cleavage", "collarbone", "bare shoulders"],
+]
+for sample in conflict_test_samples:
+    cases["layer_conflicts"].append({"tags": sample})
+
 # ---- expected values from Python
 def vset(v): return set(v) if v else None
 
@@ -173,5 +185,8 @@ for c in cases["zone_boxes"]:
         c["x0"], c["y0"], c["x1"], c["y1"],
     )
     c["expect"] = res
+for c in cases["layer_conflicts"]:
+    kept, sup = p.resolve_layer_conflicts(c["tags"])
+    c["expect"] = {"kept": kept, "suppressed": sup}
 
 json.dump(cases, sys.stdout, ensure_ascii=False)

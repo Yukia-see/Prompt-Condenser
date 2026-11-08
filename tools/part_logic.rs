@@ -445,12 +445,74 @@ pub struct Merged {
     pub dropped_wd14: Vec<String>,
     pub dropped_hedged: Vec<String>,
     pub dropped_unconfirmed: Vec<String>,
+    pub dropped_layer_conflicts: Vec<(String, String)>,
     pub negated_vlm: Vec<String>,
     /// WD14 tags that matched no scene keyword and defaulted to Pass 2; grow the
     /// keyword lists from these.
     pub unrouted_wd14: Vec<String>,
     pub dropped_moondream: Vec<String>,
     pub negated_moondream: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4: Layer-based conflict rules
+// ---------------------------------------------------------------------------
+pub fn can_coexist(tag_a: &str, tag_b: &str) -> bool {
+    let na = norm_tag(tag_a);
+    let nb = norm_tag(tag_b);
+    if na == nb {
+        return true;
+    }
+    COEXISTING_PAIRS
+        .iter()
+        .any(|&(a, b)| (a == na && b == nb) || (a == nb && b == na))
+}
+
+pub fn is_occluded_by(covering_tag: &str, inner_tag: &str) -> bool {
+    let nc = norm_tag(covering_tag);
+    let ni = norm_tag(inner_tag);
+    if nc == ni {
+        return false;
+    }
+    if can_coexist(&nc, &ni) {
+        return false;
+    }
+    if OCCLUSION_SUPPRESSIONS
+        .iter()
+        .any(|&(s, t)| s == nc && t == ni)
+    {
+        return true;
+    }
+    let rule_c = CLOTHING_LAYER_DEFS.iter().find(|d| d.tag == nc);
+    let rule_i = CLOTHING_LAYER_DEFS.iter().find(|d| d.tag == ni);
+    if let (Some(rc), Some(ri)) = (rule_c, rule_i) {
+        if rc.covers.contains(&ri.region) && rc.rank > ri.rank {
+            return true;
+        }
+    }
+    false
+}
+
+pub fn resolve_layer_conflicts(tags: &[String]) -> (Vec<String>, Vec<(String, String)>) {
+    let mut kept = Vec::new();
+    let mut suppressed = Vec::new();
+    for (i, tag) in tags.iter().enumerate() {
+        let mut is_suppressed = false;
+        for (j, other) in tags.iter().enumerate() {
+            if i == j {
+                continue;
+            }
+            if is_occluded_by(other, tag) {
+                suppressed.push((tag.clone(), other.clone()));
+                is_suppressed = true;
+                break;
+            }
+        }
+        if !is_suppressed {
+            kept.push(tag.clone());
+        }
+    }
+    (kept, suppressed)
 }
 
 pub fn merge_tags(
@@ -538,6 +600,16 @@ pub fn merge_tags_with_options(
     let md1: Vec<String> = md1.into_iter().filter(|t| !drop_md.contains(t)).collect();
     let md2: Vec<String> = md2.into_iter().filter(|t| !drop_md.contains(t)).collect();
 
+    // Phase 4: Layer-based conflict resolution
+    let all_combined: Vec<String> = md1.iter().chain(wd1.iter()).chain(md2.iter()).chain(wd2.iter()).cloned().collect();
+    let (_, mut layer_suppressed) = resolve_layer_conflicts(&all_combined);
+    layer_suppressed.sort();
+    let suppressed_norms: HashSet<String> = layer_suppressed.iter().map(|(sup, _)| norm_tag(sup)).collect();
+    let md1: Vec<String> = md1.into_iter().filter(|t| !suppressed_norms.contains(&norm_tag(t))).collect();
+    let wd1: Vec<String> = wd1.into_iter().filter(|t| !suppressed_norms.contains(&norm_tag(t))).collect();
+    let md2: Vec<String> = md2.into_iter().filter(|t| !suppressed_norms.contains(&norm_tag(t))).collect();
+    let wd2: Vec<String> = wd2.into_iter().filter(|t| !suppressed_norms.contains(&norm_tag(t))).collect();
+
     let sorted = |s: &HashSet<String>| {
         let mut v: Vec<String> = s.iter().cloned().collect();
         v.sort();
@@ -552,6 +624,7 @@ pub fn merge_tags_with_options(
         dropped_wd14: sorted(&drop_wd),
         dropped_hedged: hedged_unconfirmed.into_iter().collect(),
         dropped_unconfirmed: unconfirmed.into_iter().collect(),
+        dropped_layer_conflicts: layer_suppressed,
         negated_vlm: negated.clone(),
         unrouted_wd14: wd2,
         dropped_moondream: drop_vlm_sorted,

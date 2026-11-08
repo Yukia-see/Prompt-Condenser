@@ -460,6 +460,56 @@ def test_two_source_rule_retains_when_second_pass_agrees():
     assert "red ribbon" in m["dropped_unconfirmed"]
 
 
+def test_layer_conflict_coexist_and_suppression():
+    # 1. can_coexist checks
+    assert p.can_coexist("tube top", "cleavage")
+    assert p.can_coexist("boots", "thighhighs")
+    assert p.can_coexist("shoes", "socks")
+    assert not p.can_coexist("turtleneck", "cleavage")
+    assert not p.can_coexist("shoes", "barefoot")
+
+    # 2. is_occluded_by checks
+    assert p.is_occluded_by("turtleneck", "cleavage")
+    assert not p.is_occluded_by("tube top", "cleavage")
+    assert not p.is_occluded_by("boots", "thighhighs")
+    assert p.is_occluded_by("shoes", "barefoot")
+    assert p.is_occluded_by("long pants", "bare legs")
+
+    # 3. resolve_layer_conflicts
+    tags_tt = ["1girl", "tube top", "cleavage", "boots", "thighhighs"]
+    kept_tt, sup_tt = p.resolve_layer_conflicts(tags_tt)
+    assert "tube top" in kept_tt
+    assert "cleavage" in kept_tt
+    assert "boots" in kept_tt
+    assert "thighhighs" in kept_tt
+    assert len(sup_tt) == 0
+
+    tags_tn = ["1girl", "turtleneck", "cleavage", "boots", "thighhighs"]
+    kept_tn, sup_tn = p.resolve_layer_conflicts(tags_tn)
+    assert "turtleneck" in kept_tn
+    assert "cleavage" not in kept_tn
+    assert "boots" in kept_tn
+    assert "thighhighs" in kept_tn
+    assert ("cleavage", "turtleneck") in sup_tn
+
+    # 4. merge_tags integration
+    m_tt = p.merge_tags("1girl, tube_top, cleavage, boots, thighhighs", "", "", "scene_shape")
+    all_tt = m_tt["pass1_tags"] + m_tt["pass2_tags"]
+    assert "tube top" in all_tt
+    assert "cleavage" in all_tt
+    assert "boots" in all_tt
+    assert "thighhighs" in all_tt
+    assert len(m_tt["dropped_layer_conflicts"]) == 0
+
+    m_tn = p.merge_tags("1girl, turtleneck, cleavage, boots, thighhighs", "", "", "scene_shape")
+    all_tn = m_tn["pass1_tags"] + m_tn["pass2_tags"]
+    assert "turtleneck" in all_tn
+    assert "cleavage" not in all_tn
+    assert "boots" in all_tn
+    assert "thighhighs" in all_tn
+    assert ("cleavage", "turtleneck") in m_tn["dropped_layer_conflicts"]
+
+
 if __name__ == "__main__":  # zero-dependency runner
     import inspect
     import sys

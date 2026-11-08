@@ -504,4 +504,61 @@ mod tests {
         assert!(!m.pass2_tags.contains(&"red ribbon".to_string()));
         assert!(m.dropped_unconfirmed.contains(&"red ribbon".to_string()));
     }
+
+    #[test]
+    fn layer_conflict_coexist_and_suppression() {
+        // 1. can_coexist checks
+        assert!(can_coexist("tube top", "cleavage"));
+        assert!(can_coexist("boots", "thighhighs"));
+        assert!(can_coexist("shoes", "socks"));
+        assert!(!can_coexist("turtleneck", "cleavage"));
+        assert!(!can_coexist("shoes", "barefoot"));
+
+        // 2. is_occluded_by checks
+        assert!(is_occluded_by("turtleneck", "cleavage"));
+        assert!(!is_occluded_by("tube top", "cleavage"));
+        assert!(!is_occluded_by("boots", "thighhighs"));
+        assert!(is_occluded_by("shoes", "barefoot"));
+        assert!(is_occluded_by("long pants", "bare legs"));
+
+        // 3. resolve_layer_conflicts
+        let tags_tt: Vec<String> = ["1girl", "tube top", "cleavage", "boots", "thighhighs"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let (kept_tt, sup_tt) = resolve_layer_conflicts(&tags_tt);
+        assert!(kept_tt.contains(&"tube top".to_string()));
+        assert!(kept_tt.contains(&"cleavage".to_string()));
+        assert!(kept_tt.contains(&"boots".to_string()));
+        assert!(kept_tt.contains(&"thighhighs".to_string()));
+        assert_eq!(sup_tt.len(), 0);
+
+        let tags_tn: Vec<String> = ["1girl", "turtleneck", "cleavage", "boots", "thighhighs"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let (kept_tn, sup_tn) = resolve_layer_conflicts(&tags_tn);
+        assert!(kept_tn.contains(&"turtleneck".to_string()));
+        assert!(!kept_tn.contains(&"cleavage".to_string()));
+        assert!(kept_tn.contains(&"boots".to_string()));
+        assert!(kept_tn.contains(&"thighhighs".to_string()));
+        assert!(sup_tn.contains(&("cleavage".to_string(), "turtleneck".to_string())));
+
+        // 4. merge_tags integration
+        let m_tt = merge_tags("1girl, tube_top, cleavage, boots, thighhighs", "", "", Mode::SceneShape, None);
+        let all_tt: Vec<String> = m_tt.pass1_tags.into_iter().chain(m_tt.pass2_tags).collect();
+        assert!(all_tt.contains(&"tube top".to_string()));
+        assert!(all_tt.contains(&"cleavage".to_string()));
+        assert!(all_tt.contains(&"boots".to_string()));
+        assert!(all_tt.contains(&"thighhighs".to_string()));
+        assert_eq!(m_tt.dropped_layer_conflicts.len(), 0);
+
+        let m_tn = merge_tags("1girl, turtleneck, cleavage, boots, thighhighs", "", "", Mode::SceneShape, None);
+        let all_tn: Vec<String> = m_tn.pass1_tags.into_iter().chain(m_tn.pass2_tags).collect();
+        assert!(all_tn.contains(&"turtleneck".to_string()));
+        assert!(!all_tn.contains(&"cleavage".to_string()));
+        assert!(all_tn.contains(&"boots".to_string()));
+        assert!(all_tn.contains(&"thighhighs".to_string()));
+        assert!(m_tn.dropped_layer_conflicts.contains(&("cleavage".to_string(), "turtleneck".to_string())));
+    }
 }

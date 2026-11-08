@@ -59,5 +59,20 @@ out.append("pub const ATTRIBUTE_GROUPS: &[&[&str]] = &[")
 for g in p.ATTRIBUTE_GROUPS:
     out.append("    &[" + ", ".join(rs_str(x) for x in sorted(g)) + "],")
 out.append("];")
+out.append("pub const COEXISTING_PAIRS: &[(&str, &str)] = &[")
+for a, b in sorted(p.COEXISTING_PAIRS):
+    out.append(f"    ({rs_str(a)}, {rs_str(b)}),")
+out.append("];")
+out.append("pub const OCCLUSION_SUPPRESSIONS: &[(&str, &str)] = &[")
+for a, b in sorted(p.SUPPRESSIONS):
+    out.append(f"    ({rs_str(a)}, {rs_str(b)}),")
+out.append("];")
+out.append("pub const CLOTHING_LAYER_DEFS: &[ClothingLayerDef] = &[")
+for tag, info in sorted(p.CLOTHING_LAYERS.items()):
+    covers = info.get("covers", [])
+    covers_str = "&[" + ", ".join(rs_str(c) for c in covers) + "]"
+    rank = p.LAYER_RANKS.get(info.get("layer", ""), 0)
+    out.append(f"    ClothingLayerDef {{ tag: {rs_str(tag)}, region: {rs_str(info.get('region', ''))}, layer: {rs_str(info.get('layer', ''))}, rank: {rank}, covers: {covers_str} }},")
+out.append("];")
 out.append("// ---- END GENERATED ----")
 print("\n".join(out))

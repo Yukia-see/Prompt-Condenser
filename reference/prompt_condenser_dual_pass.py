@@ -332,6 +332,98 @@ CONCRETE_SCENE_OBJECTS = {
     "cellphone", "smartphone", "camera", "plushie", "doll", "instrument", "guitar", "violin",
 }
 
+# ---------------------------------------------------------------------------
+# PHASE 4: LAYER-BASED CONFLICT RULES
+# ---------------------------------------------------------------------------
+_RULES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "conflict_rules.json")
+try:
+    with open(_RULES_FILE, "r", encoding="utf-8") as _f:
+        _CONFLICT_RULES_DATA = json.load(_f)
+except Exception:
+    _CONFLICT_RULES_DATA = {"coexists": [], "suppressions": [], "clothing_layers": {}}
+
+COEXISTING_PAIRS = {
+    (_norm_tag(a), _norm_tag(b))
+    for a, b in _CONFLICT_RULES_DATA.get("coexists", [])
+}
+# Add symmetric pairs
+COEXISTING_PAIRS |= {(b, a) for a, b in list(COEXISTING_PAIRS)}
+
+SUPPRESSIONS = {
+    (_norm_tag(a), _norm_tag(b))
+    for a, b in _CONFLICT_RULES_DATA.get("suppressions", [])
+}
+
+LAYER_RANKS = {
+    "skin": 0,
+    "underwear": 1,
+    "swimwear": 1,
+    "inner": 2,
+    "middle": 3,
+    "outer": 4,
+    "footwear": 4,
+}
+
+CLOTHING_LAYERS = {
+    _norm_tag(tag): {
+        "region": info.get("region", ""),
+        "layer": info.get("layer", ""),
+        "covers": [c for c in info.get("covers", [])],
+    }
+    for tag, info in _CONFLICT_RULES_DATA.get("clothing_layers", {}).items()
+}
+
+
+def can_coexist(tag_a: str, tag_b: str) -> bool:
+    """Return True if tag_a and tag_b are explicitly allowed to coexist."""
+    na, nb = _norm_tag(tag_a), _norm_tag(tag_b)
+    if na == nb:
+        return True
+    return (na, nb) in COEXISTING_PAIRS or (nb, na) in COEXISTING_PAIRS
+
+
+def is_occluded_by(covering_tag: str, inner_tag: str) -> bool:
+    """Return True if covering_tag occludes/suppresses inner_tag."""
+    nc, ni = _norm_tag(covering_tag), _norm_tag(inner_tag)
+    if nc == ni:
+        return False
+    if can_coexist(nc, ni):
+        return False
+    if (nc, ni) in SUPPRESSIONS:
+        return True
+    rule_c = CLOTHING_LAYERS.get(nc)
+    rule_i = CLOTHING_LAYERS.get(ni)
+    if rule_c and rule_i:
+        c_covers = rule_c.get("covers", [])
+        i_region = rule_i.get("region")
+        c_rank = LAYER_RANKS.get(rule_c.get("layer", ""), 0)
+        i_rank = LAYER_RANKS.get(rule_i.get("layer", ""), 0)
+        if i_region in c_covers and c_rank > i_rank:
+            return True
+    return False
+
+
+def resolve_layer_conflicts(tags: list[str]) -> tuple[list[str], list[tuple[str, str]]]:
+    """
+    Given a list of tags, resolve layer occlusions and suppressions.
+    Returns (retained_tags, suppressed_pairs) where each suppressed pair is (suppressed_tag, suppressor_tag).
+    Preserves original tag strings and original ordering.
+    """
+    kept = []
+    suppressed = []
+    for i, tag in enumerate(tags):
+        tag_suppressed = False
+        for j, other in enumerate(tags):
+            if i == j:
+                continue
+            if is_occluded_by(other, tag):
+                suppressed.append((tag, other))
+                tag_suppressed = True
+                break
+        if not tag_suppressed:
+            kept.append(tag)
+    return kept, suppressed
+
 
 def is_crop_artifact_tag(tag: str) -> bool:
     norm = _norm_tag(tag)
@@ -758,6 +850,17 @@ def merge_tags(raw_wd14_tags: str, pass1_txt: str, pass2_txt: str, mode: str,
     wd2 = [t for t in wd2 if t not in drop_wd and not _is_subject_tag(t)]
     md1 = [t for t in md1 if t not in drop_md]
     md2 = [t for t in md2 if t not in drop_md]
+
+    # Phase 4: Layer-based conflict resolution
+    all_combined = md1 + wd1 + md2 + wd2
+    _, layer_suppressed = resolve_layer_conflicts(all_combined)
+    suppressed_tags_norm = {_norm_tag(sup[0]) for sup in layer_suppressed}
+    if suppressed_tags_norm:
+        md1 = [t for t in md1 if _norm_tag(t) not in suppressed_tags_norm]
+        wd1 = [t for t in wd1 if _norm_tag(t) not in suppressed_tags_norm]
+        md2 = [t for t in md2 if _norm_tag(t) not in suppressed_tags_norm]
+        wd2 = [t for t in wd2 if _norm_tag(t) not in suppressed_tags_norm]
+
     if negated:
         log.info("Moondream explicitly denied: %s", negated)
     if wd2:
@@ -772,6 +875,7 @@ def merge_tags(raw_wd14_tags: str, pass1_txt: str, pass2_txt: str, mode: str,
         "dropped_wd14": sorted(drop_wd),
         "dropped_hedged": sorted(hedged_unconfirmed),
         "dropped_unconfirmed": sorted(unconfirmed),
+        "dropped_layer_conflicts": sorted(layer_suppressed),
         "negated_vlm": negated,
         "unrouted_wd14": list(wd2),
         "dropped_moondream": sorted(drop_md),

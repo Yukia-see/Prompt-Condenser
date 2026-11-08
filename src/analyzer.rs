@@ -3202,6 +3202,12 @@ fn head_word(word: &str) -> &str {
 /// "amber eyes" vs "grey eyes").
 /// Long clauses (prose) are never treated as conflicts.
 pub fn tags_conflict(keep: &str, tag: &str) -> bool {
+    if crate::prompt_condenser::can_coexist(keep, tag) {
+        return false;
+    }
+    if crate::prompt_condenser::is_occluded_by(keep, tag) {
+        return true;
+    }
     if attribute_conflict(keep, tag, &[SIZE_WORDS, LENGTH_WORDS, COLOR_WORDS]) {
         return true;
     }
