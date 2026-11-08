@@ -1,6 +1,6 @@
 [package]
 name = "prompt-condenser"
-version = "0.4.2"
+version = "0.5.0"
 edition = "2021"
 description = "ComfyUI Prompt Condenser, Organizer & Framing Conflict Scanner with Cross-Vendor AI"
 
