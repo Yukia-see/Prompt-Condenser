@@ -2,6 +2,7 @@
 //! another PC), which handles GPU offload itself (Vulkan via `ollama-vulkan`).
 
 use crate::analyzer::{ChangeAction, PromptChange, ScanConfig};
+pub use crate::parser::AntigravityTagFilter;
 use crate::profiles::{AiMode, AiModelTier, CheckpointProfile};
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -11,6 +12,49 @@ use std::io::{BufRead, BufReader};
 use std::process::Command;
 use std::sync::mpsc::Sender;
 use std::time::Duration;
+
+/// 7-Directive System Prompt for the AntigravityAI Prompt Compiler (Anima / Qwen).
+pub const ANTIGRAVITY_7_DIRECTIVE_PROMPT: &str = "\
+# ROLE
+You are the AntigravityAI Prompt Compiler for an Anima/Qwen diffusion pipeline. Convert pre-processed scanner tags (WD14/Moondream) and dual-image references into a collision-free hybrid prompt.
+
+# CORE OUTPUT STRUCTURE
+[Scene / Environment & Shared Framing]:
+(masterpiece, best quality, framing tags, lighting/environment tags, followed by 1-2 concise sentences locking subject, primary verb/posture, environment, and clothing layers.)
+
+[Character 1]:
+(Strictly comma-separated canonical Danbooru tags: count, framing, body proportions, hair, eyes, expression, layered garments, footwear, and pose/limb anchors. NO prose or abstract phrases like \"elegant pose\".)
+
+# DIRECTIVE 1: CAMERA & SUBMERSION FRAMING
+* **Conflict Purge:** If `full body` or `cowboy shot` is active, purge `close-up`, `portrait`, and `upper body`.
+* **Bottom-Up Inference:** If legwear/footwear is tagged without framing, inject `full body`.
+* **Submersion Crop:** If `cowboy shot` or `wading in water` hides the lower legs, strip footwear and legwear tags.
+
+# DIRECTIVE 2: STRICT DOMAIN & SYNTAX ISOLATION
+* **Sorting:** Route locations (`indoor`, `bed`, `beach`, `mansion`), particles (`floating petals`), and lighting (`warm tones`, `soft lighting`) exclusively to `[Scene]`. Route expressions (`smiling`, `serene expression`) and anatomy/apparel exclusively to `[Character 1]`.
+* **Syntax:** Split compound descriptors into canonical tags (`long black hair` -> `long hair, black hair`). Strip conversational parentheticals (`hands on hips (left hand)` -> `hand on own hip`).
+* **Subject-Verb Proximity:** In `[Scene]` prose, place the primary physical action (`sits upright on a bed`, `stands barefoot`) immediately after the subject before listing accessories.
+
+# DIRECTIVE 3: WARDROBE COMPLETENESS (`MISSING_BOTTOMS_FLAG`)
+* **Flag Resolution:** When `MISSING_BOTTOMS_FLAG` is present (or `full body` lacks lower wear), remove the flag and inject matching bottoms (`light blue bikini bottoms`, `denim shorts`, `skirt`) plus footwear (`barefoot`, `sandals`, `shoes`) into both prose and tags.
+* **Strap Completion:** Convert standalone strap tags (`spaghetti strap`) into complete garments (`spaghetti strap camisole`, `bra top`).
+
+# DIRECTIVE 4: GARMENT LAYERING, ARCHETYPES & TENSION
+* **Layer Resolution:** When two tops coexist (`white shirt` + `blue bikini`), inject state modifiers (`open shirt, unbuttoned, shirt over swimsuit`).
+* **Archetype Separation:** When animal ears (`rabbit ears`) pair with uniforms (`maid`, `plaid dress`), strip `bunny girl` to prevent strapless leotard fusion.
+* **Fabric Physics:** Use `form-fitting, taut clothes` by default to protect chest text (`clothes writing`). Reserve `impossible clothes` strictly for loose/baggy garments over extreme proportions (`huge breasts, small waist`).
+
+# DIRECTIVE 5: LIMB ROUTING & GROUNDING (`UNANCHORED_LIMBS_FLAG`)
+* **Flag Resolution:** When `UNANCHORED_LIMBS_FLAG` is present, remove the flag and inject resting limb tags (`hands in lap`, `arms resting at sides`, `hands on apron`).
+* **Void vs. Terrain:** When `white background` pairs with terrain (`beach sand`), ground the surface in prose (*\"stands barefoot on a shallow patch of sand in a white studio space\"*) and add `distinct outlines, drop shadow` if wearing white.
+
+# DIRECTIVE 6: DUAL-IMAGE REFERENCE MERGE (Image 1 = Scene/Pose | Image 2 = Character/Outfit)
+* **Image 1 Authority (World & Skeleton):** Extract ONLY framing, camera angle (`dutch angle`), environment, lighting, and skeletal pose (`leg lift`, `one arm up`). Purge all hair, body scale, and non-prop clothing from Image 1.
+* **Image 2 Authority (Identity & Wardrobe):** Extract ONLY hair, face, body proportions, and outfit. Purge all backgrounds, hallucinated archetype settings (`mansion`), and static poses (`standing`, `arms behind head`) from Image 2.
+* **Prop Preservation:** If Image 1's pose depends on interacting with a garment (`pulling up stocking`), retain that specific garment tag on the character.
+
+# DIRECTIVE 7: VLM + TAGGER SYNTHESIS
+* Translate VLM spatial observations (cutouts, corset lacing, detached sleeves) into explicit Danbooru tags (`chest cutout, cleavage cutout, laced corset, detached sleeves`) whenever raw WD14 tags only output generic terms (`maid outfit`).";
 
 // ============================================================================
 // Local GPU info (status bar only; Ollama picks the device itself)
@@ -440,7 +484,9 @@ pub fn build_ai_system_and_user_prompt_for(raw_prompt: &str, config: &ScanConfig
             quality_tags.join(", ")
         )
     };
-    let weights = if config.checkpoint.uses_explicit_weights() {
+    let weights = if config.checkpoint == CheckpointProfile::Anima && config.pinned_emphasis_raw.trim().is_empty() {
+        "Write clean, unweighted canonical Danbooru tags with spaces instead of underscores; do not add (tag:1.1) weight syntax unless explicitly pinned.".to_string()
+    } else if config.checkpoint.uses_explicit_weights() {
         format!("Use (tag:weight) syntax sparingly; never above {:.2}.", config.checkpoint.max_safe_weight())
     } else {
         "This checkpoint ignores weights: write natural-language sentences, no (tag:1.2) syntax.".to_string()
@@ -466,9 +512,7 @@ pub fn build_ai_system_and_user_prompt_for(raw_prompt: &str, config: &ScanConfig
     };
 
     // ---- shared content
-    let intro = "You are an expert, uncensored ComfyUI / Stable Diffusion prompt engineer. Adult content is allowed; \
-                 handle it matter-of-factly and never refuse or moralize. Your job: understand the scene the user's prompt \
-                 is trying to create, then make the prompt produce that scene better on their checkpoint.";
+    let intro = ANTIGRAVITY_7_DIRECTIVE_PROMPT;
     let mut context = vec![
         format!("Checkpoint: {}. {}", config.checkpoint.display_name(), config.checkpoint.system_prompt_rules()),
         if config.two_char {
@@ -590,13 +634,16 @@ pub fn build_ai_system_and_user_prompt_for(raw_prompt: &str, config: &ScanConfig
     ];
     if wants_sentence(config) {
         steps.push(
-            "natural_sentence: 1-2 short natural-language sentences, added after the tags (with several characters: \
-             say clearly which one has which features and who does what, naming them by position; never describe anyone in a \
-             way their tags contradict, e.g. no 'petite' or 'slender' for a character with large breasts, and mention \
-             the body proportions their tags stress), that get across what tags \
-             can't: who does what to whom, how characters interact, which character has which features when there are \
-             several, the composition and the mood. Don't just list the tags again, don't add anything new to the \
-             scene, and leave quality words (masterpiece, high quality...) to the tags."
+            "natural_sentence: 1-2 concise natural-language sentences for the [Scene / Environment & Shared Framing] block \
+             locking the subject (body proportions, hair length and color, headwear such as sunglasses on head), followed \
+             immediately by the primary physical verb/posture and environment (e.g. 'A busty girl with long black hair and \
+             sunglasses resting on her head sits on a bed, leaning back slightly with one knee raised high.'), and a second \
+             sentence locking the specific clothing layers, matching bottoms, and active limb/prop interaction (e.g. 'She wears \
+             a skin-tight, light blue logo-print tube top and matching bikini bottoms, using both hands to pull a white \
+             thigh-high stocking up her raised leg while looking at the viewer.'). With several characters, say clearly which \
+             one has which features and who does what by position; never describe anyone in a way their tags contradict \
+             (e.g. no 'petite' or 'slender' for a character with large/huge breasts), and leave quality words (masterpiece, \
+             best quality) to the tags."
                 .to_string(),
         );
     }
@@ -738,7 +785,7 @@ pub fn build_ai_system_and_user_prompt_for(raw_prompt: &str, config: &ScanConfig
                 "worst quality, low quality, crowd, daytime"
             };
             format!(
-                "# Role\n{intro}\n\n## Context\n{}\n\n## Task (fill these JSON fields, in this order)\n{}\n\n{}## Rules\n{}\n\n\
+                "{intro}\n\n## Context\n{}\n\n## Task (fill these JSON fields, in this order)\n{}\n\n{}## Rules\n{}\n\n\
                  ## Output format\nOne JSON object. Format example from an UNRELATED scene: copy its structure, never its content.\n\
                  ```json\n{{\n  \"scene_summary\": \"{ex_summary}\",\n  \
                  \"scene_breakdown\": {{\"subject\": \"{ex_subject}\", \"pose\": \"standing\", \"framing\": \
@@ -761,6 +808,8 @@ pub fn build_ai_system_and_user_prompt_for(raw_prompt: &str, config: &ScanConfig
         ),
     };
 
+    let tag_filter = AntigravityTagFilter::new();
+    let filtered_single;
     let two;
     let raw_prompt = if config.two_char {
         let n = config.char_count();
@@ -777,14 +826,20 @@ pub fn build_ai_system_and_user_prompt_for(raw_prompt: &str, config: &ScanConfig
             "SCENE (shared by all: setting, camera, lighting, mood, what they do together):\n{}",
             config.scene_prompt_raw.trim()
         )];
-        sections.push(format!("CHARACTER 1 ({}):\n{}", place(0), raw_prompt.trim()));
+        sections.push(format!("CHARACTER 1 ({}):\n{}", place(0), tag_filter.process_tags(raw_prompt)));
         for i in 1..n {
-            sections.push(format!("CHARACTER {} ({}):\n{}", i + 1, place(i), config.prompt_of(i).trim()));
+            sections.push(format!(
+                "CHARACTER {} ({}):\n{}",
+                i + 1,
+                place(i),
+                tag_filter.process_tags(config.prompt_of(i))
+            ));
         }
         two = sections.join("\n\n");
         two.as_str()
     } else {
-        raw_prompt
+        filtered_single = tag_filter.process_tags(raw_prompt);
+        filtered_single.as_str()
     };
     let user_prompt = match family {
         ModelFamily::Gemma => format!(
@@ -1089,6 +1144,9 @@ pub struct ImageAiRequest {
     pub tag_hints: String,
     /// If true and the target text model has vision capability, directly attach image pixels for a 2nd pass visual check.
     pub second_pass_vision: bool,
+    /// If true, extract body shape/build from the scene reference for the character.
+    #[allow(dead_code)]
+    pub scene_body_shape: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1149,11 +1207,12 @@ fn image_system_prompt(config: &ScanConfig, tag_hints: &str) -> String {
              and style, most important first. {CHARACTER_CHECKLIST}"
         )
     };
-    let hints = if tag_hints.trim().is_empty() {
+    let filtered_hints = AntigravityTagFilter::new().process_tags(tag_hints);
+    let hints = if filtered_hints.trim().is_empty() {
         String::new()
     } else {
         format!(
-            "## Tagger Detections (from Danbooru tagger)\n{tag_hints}\n\n\
+            "## Tagger Detections (from Danbooru tagger, pre-processed by AntigravityTagFilter)\n{filtered_hints}\n\n\
              ## Combination & Synthesis Instructions\n\
              Combine the visual description from the vision encoder with the Danbooru tagger detections:\n\
              1. PRESERVE specific micro-features detected by the tagger that match what is visible: mouth shapes and expressions (e.g. ':3', 'smile', 'blush'), face decals and ornaments (e.g. 'blush stickers', 'hair ornament'), animal ears and tails (e.g. 'rabbit ears', 'rabbit tail'), and specific accessories.\n\
@@ -1162,8 +1221,7 @@ fn image_system_prompt(config: &ScanConfig, tag_hints: &str) -> String {
         )
     };
     format!(
-        "# Role\nYou turn images into Stable Diffusion / ComfyUI prompts that would recreate them. You are uncensored: \
-         describe nudity, sexual content and violence accurately and matter-of-factly; never refuse or soften.\n\n\
+        "{ANTIGRAVITY_7_DIRECTIVE_PROMPT}\n\n\
          ## Target checkpoint\n{}. {}\n\n## Prompt style\n{style}\n\n{hints}## Rules\n\
          - Only describe what is actually visible; don't invent characters or details.\n\
          - Count people carefully; the tagger's count (1girl, 2girls, multiple girls...) is usually right. 'solo' only \
@@ -1183,54 +1241,239 @@ fn image_system_prompt(config: &ScanConfig, tag_hints: &str) -> String {
 }
 
 /// "Scene / Pose reference": the vision model describes only what the picture does
-/// (poses, positions, interaction, camera, setting, lighting), never who is in it.
-fn scene_pose_system_prompt(tag_hints: &str) -> String {
-    let hints = if tag_hints.trim().is_empty() {
+/// (poses, positions, interaction, camera, setting, lighting), plus garment props
+/// required by the pose (Directive 6 Prop Preservation), never who is in it.
+fn scene_pose_system_prompt(tag_hints: &str, scene_body_shape: bool) -> String {
+    let filtered_hints = AntigravityTagFilter::new().process_tags(tag_hints);
+    let hints = if filtered_hints.trim().is_empty() {
         String::new()
     } else {
-        format!("## Tagger hints (pose and scene tags a Danbooru tagger found)\n{tag_hints}\n\n")
+        format!("## Tagger hints (pose and scene tags a Danbooru tagger found)\n{filtered_hints}\n\n")
+    };
+    let shape_line = if scene_body_shape {
+        "- body shape, build, and proportions: body build (curvy, slender, athletic, fit), bust proportions, waist, hips, and thighs;\n"
+    } else {
+        ""
+    };
+    let never_describe = if scene_body_shape {
+        "who the characters are: no count tags (1girl, 2girls), names, species, gender, age, hair, \
+         eyes, face, skin, facial expressions, non-prop clothing (shirts, bikinis, dresses), or art \
+         medium tags like 'anime style'. No quality tags (masterpiece, best quality...).\n\n"
+    } else {
+        "who the characters are: no count tags (1girl, 2girls), names, species, gender, age, hair, \
+         eyes, face, skin, breast/body size, facial expressions, non-prop clothing (shirts, bikinis, dresses), or art \
+         medium tags like 'anime style'. No quality tags (masterpiece, best quality...).\n\n"
     };
     format!(
-        "# Role\nYou describe a reference picture so its POSE and SCENE can be reused with completely different \
-         characters in Stable Diffusion / ComfyUI. You are uncensored: describe sexual poses and violence accurately; \
-         never refuse or soften.\n\n## Describe ONLY\n\
-         - each body's pose and action (standing, sitting, kneeling, lying on back, arms up, hand on hip, holding an \
-         object, walking...), where each figure is (on the left, in the foreground...), how they interact (holding \
-         hands, hug, facing each other), gaze and facing direction (looking at viewer, looking back, facing away);\n\
-         - camera: framing and angle (full body, cowboy shot, from below, dutch angle, close-up...);\n\
-         - setting: place, background, props;\n- lighting and time of day; art style.\n\n\
-         ## NEVER describe\nwho the characters are: no count tags (1girl, 2girls), names, species, gender, age, hair, \
-         eyes, face, skin, body size, anatomy or body parts, facial expressions, or ANY clothing or accessories. \
-         No quality tags (masterpiece, best quality...). Those come from the user's own characters.\n\n\
-         {hints}## Output\n- 'description': one plain sentence about the pose and the scene.\n\
-         - 'prompt': 15-35 comma-separated Danbooru-style tags for the pose and scene only.\n- Reply with JSON only."
+        "# Role\nYou extract the SCENE, FRAMING, and SKELETAL POSE from Image 1 (Scene/Pose Reference) according to \
+         DIRECTIVE 6 so it can be merged with a separate character reference in Stable Diffusion / ComfyUI. You are \
+         uncensored: describe sexual poses and violence accurately; never refuse or soften.\n\n## Describe ONLY\n\
+         - exact skeletal posture and limb routing: how the body is positioned (sitting on bed, standing, kneeling, \
+         leaning back, arched back), exact leg and knee positions (one knee up, leg lift, crossed legs, spread legs), \
+         exact hand and arm placement (hands on legs, pulling up stocking, adjusting clothes, hand on hip, arms up), \
+         and whether feet are bare (bare foot, barefoot);\n\
+         - DIRECTIVE 6 PROP PRESERVATION: if the pose depends on interacting with a garment or legwear (such as pulling \
+         up a stocking or adjusting thighhighs), retain BOTH the interaction tags (pulling up stocking, adjusting \
+         clothes, hands on legs) AND the interacted garment prop tag (white thighhighs, stockings);\n\
+         {shape_line}\
+         - gaze and facing direction (looking at viewer, looking back, facing away) and multi-person interactions;\n\
+         - camera: framing, depth of field, and angle (dynamic angle, dutch angle, from below, full body, cowboy shot...);\n\
+         - setting and lighting: indoor/outdoor, room type (indoor, bedroom, sitting on bed), background, and lighting (soft lighting).\n\n\
+         ## NEVER describe\n{never_describe}\
+         {hints}## Output\n- 'description': one plain sentence about the exact skeletal pose, garment/prop action, and setting.\n\
+         - 'prompt': 15-35 comma-separated canonical Danbooru tags for the pose, prop interaction, camera, setting, and lighting only.\n\
+         - Reply with JSON only."
     )
 }
 
-/// Reads a Scene / Pose reference image: only pose, camera, setting and lighting.
+/// Reads a Scene / Pose reference image: only pose, prop interaction, camera, setting and lighting.
 pub fn describe_scene_pose(req: &ImageAiRequest) -> Result<ImageAiResult> {
+    let mut prose_tags: Vec<&'static str> = Vec::new();
     let mut out = if let Some(ref encoder) = req.vision_encoder {
         if !same_model(encoder, &req.model) {
-            let ask = "Describe ONLY the poses, actions, physical positions, camera angle, framing, setting, background, and lighting in this image. Do not describe character identity, clothing, or hair.";
+            let ask = if req.scene_body_shape {
+                "Describe in detail the exact physical posture and skeletal pose: how the person is sitting, standing, or leaning, exact leg and knee positions, exact hand and arm actions including any garment or prop interaction, whether a foot is bare or wearing footwear, gaze direction, camera angle and depth of field, room or environment setting, and lighting. Also describe the person's body shape, build, and proportions (such as curvy, slender, athletic, fit, waist, hips, thighs, bust size). Do not describe hair color, eye color, or clothing identity."
+            } else {
+                "Describe in detail the exact physical posture and skeletal pose: how the person is sitting, standing, or leaning, exact leg and knee positions, exact hand and arm actions including any garment or prop interaction, whether a foot is bare or wearing footwear, gaze direction, camera angle and depth of field, room or environment setting, and lighting. Do not describe hair color, eye color, or personal identity traits."
+            };
             let vision_desc = extract_visual_description(req, encoder, ask)?;
-            let system = scene_pose_system_prompt(&req.tag_hints);
-            let user_prompt = format!(
-                "## Visual description of the pose and scene from vision encoder ({encoder}):\n{vision_desc}\n\nDescribe only the pose and the scene."
-            );
-            describe_with_text_model(req, &system, &user_prompt)?
+            prose_tags = crate::danbooru::extract_tags_from_prose(&vision_desc);
+            let mut enriched_hints = req.tag_hints.clone();
+            for pt in &prose_tags {
+                if !enriched_hints.to_lowercase().contains(&pt.to_lowercase()) {
+                    if !enriched_hints.trim().is_empty() {
+                        enriched_hints.push_str(", ");
+                    }
+                    enriched_hints.push_str(pt);
+                }
+            }
+            if !req.second_pass_vision {
+                ImageAiResult {
+                    description: vision_desc,
+                    prompt: enriched_hints,
+                }
+            } else {
+                let system = scene_pose_system_prompt(&enriched_hints, req.scene_body_shape);
+                let user_prompt = format!(
+                    "## Visual description of the pose and scene from vision encoder ({encoder}):\n{vision_desc}\n\nExtract the skeletal pose, active garment-prop interactions (Directive 6), camera angle, setting, and lighting."
+                );
+                describe_with_text_model(req, &system, &user_prompt)?
+            }
         } else {
-            describe_image_with(req, &scene_pose_system_prompt(&req.tag_hints), "Describe only the pose and the scene.")?
+            describe_image_with(req, &scene_pose_system_prompt(&req.tag_hints, req.scene_body_shape), "Describe only the pose and the scene.")?
         }
     } else {
-        describe_image_with(req, &scene_pose_system_prompt(&req.tag_hints), "Describe only the pose and the scene.")?
+        describe_image_with(req, &scene_pose_system_prompt(&req.tag_hints, req.scene_body_shape), "Describe only the pose and the scene.")?
     };
-    // whatever slipped through about the characters themselves goes, and so do words the
-    // keyword lists don't know: they could be a name, species or clothing
-    out.prompt = crate::scene::filter_scene_and_pose_only(&out.prompt, false);
+    for pt in prose_tags {
+        if !out.prompt.to_lowercase().contains(&pt.to_lowercase()) {
+            out.prompt.push_str(", ");
+            out.prompt.push_str(pt);
+        }
+    }
+    // Filter out character identity and medium bleed ("anime style") while keeping AI pose/prop tags and body shape tags
+    let filtered = crate::scene::filter_scene_and_pose_only_with_shape(&out.prompt, true, true);
+    out.prompt = filtered
+        .split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty() && !t.eq_ignore_ascii_case("anime style") && !t.eq_ignore_ascii_case("anime"))
+        .collect::<Vec<_>>()
+        .join(", ");
     if out.prompt.trim().is_empty() {
         return Err(anyhow!("The model found no pose or scene to reuse. Try again."));
     }
     Ok(out)
+}
+
+// ===========================================================================
+// Dual-Pass Moondream + WD14 + Gemma 4 12B Pipeline
+// ===========================================================================
+
+/// Executes the full dual-pass vision pipeline according to ANTIGRAVITY_RUST_MISSION.md:
+/// 1. Runs Moondream pass 1 and pass 2 with temperature 0.1 (+0.2 on retry)
+/// 2. Converts prose descriptions to Danbooru tags using selected_tags.csv vocabulary
+/// 3. Reconciles WD14 tags (0.22 general, 0.85 character) with Moondream (WD14 wins attributes, Moondream wins pose)
+/// 4. Optionally performs LLM tag synthesis using Gemma 4 12B in Ollama (JSON mode, temp 0.35)
+/// 5. Automatically falls back to mechanical merge and generates warnings if Ollama is unreachable.
+pub fn run_dual_pass_pipeline(
+    host: &str,
+    mode_ai: AiMode,
+    vision_model: &str,
+    text_model: &str,
+    image_path: &std::path::Path,
+    raw_wd14_tags: &str,
+    opts: crate::prompt_condenser::PipelineOptions,
+) -> crate::prompt_condenser::PipelineResult {
+    use base64::Engine as _;
+    let base = match base_url(host) {
+        Ok(b) => b,
+        Err(e) => {
+            let mut res = crate::prompt_condenser::PipelineResult::default();
+            res.warnings.push(format!("Invalid Ollama host: {e}"));
+            return res;
+        }
+    };
+
+    let img_bytes = match shrink_for_vision(image_path) {
+        Ok(b) => b,
+        Err(e) => {
+            let mut res = crate::prompt_condenser::PipelineResult::default();
+            res.warnings.push(format!("Failed to read image for vision: {e}"));
+            return res;
+        }
+    };
+    let b64_image = base64::engine::general_purpose::STANDARD.encode(&img_bytes);
+
+    let moondream_fn = |prompt: &str, temp: f32| -> Result<String, String> {
+        let body = serde_json::json!({
+            "model": vision_model,
+            "prompt": prompt,
+            "images": [&b64_image],
+            "stream": false,
+            "think": false,
+            "keep_alive": "30m",
+            "options": {
+                "temperature": temp,
+                "num_predict": 500,
+                "num_ctx": 2048,
+                "num_gpu": if mode_ai == AiMode::CpuOnly { Some(0) } else { None::<i32> },
+            },
+        });
+        let c = client(Some(Duration::from_secs(120))).map_err(|e| e.to_string())?;
+        let resp = c.post(format!("{base}/api/generate"))
+            .json(&body)
+            .send()
+            .map_err(|e| if e.is_timeout() { "Moondream timed out after 2 minutes".to_string() } else { format!("Ollama unreachable: {e}") })?;
+        let gen: GenerateResponse = resp.json().map_err(|e| format!("Failed to parse Moondream JSON: {e}"))?;
+        let desc = gen.response.trim().to_string();
+        if desc.is_empty() {
+            Err("Vision encoder returned empty description".to_string())
+        } else {
+            Ok(desc)
+        }
+    };
+
+    let gemma_fn: Option<Box<crate::prompt_condenser::GemmaFn<'_>>> = if opts.use_llm_synthesis {
+        // Health check: GET /api/tags
+        let check_model = (|| -> Result<bool, String> {
+            let c = client(Some(Duration::from_secs(5))).map_err(|e| e.to_string())?;
+            let resp = c.get(format!("{base}/api/tags"))
+                .send()
+                .map_err(|e| format!("Failed to contact Ollama at {base}: {e}"))?;
+            let tags_json = resp.text().map_err(|e| e.to_string())?;
+            crate::prompt_condenser::ollama_model_pulled(&tags_json, text_model)
+        })();
+
+        match check_model {
+            Ok(true) => {
+                Some(Box::new(|req: &crate::prompt_condenser::GemmaRequest| -> Result<crate::prompt_condenser::GemmaReply, String> {
+                    let img_opt = if req.with_image { Some(b64_image.as_str()) } else { None };
+                    let req_body = crate::prompt_condenser::ollama_chat_request_body(
+                        text_model,
+                        req.text,
+                        req.temperature,
+                        crate::prompt_condenser::GEMMA_CONTEXT_WINDOW,
+                        req.max_tokens,
+                        img_opt,
+                        true, // json_mode
+                    )
+                    .replacen("\"stream\":false,", "\"stream\":false,\"think\":false,", 1);
+                    let c = client(Some(Duration::from_secs(300))).map_err(|e| e.to_string())?;
+                    let resp = c.post(format!("{base}/api/chat"))
+                        .header("Content-Type", "application/json")
+                        .body(req_body)
+                        .send()
+                        .map_err(|e| if e.is_timeout() { "Gemma synthesis timed out after 5 minutes".to_string() } else { format!("Gemma chat error: {e}") })?;
+                    let resp_text = resp.text().map_err(|e| e.to_string())?;
+                    crate::prompt_condenser::parse_ollama_chat_response(&resp_text)
+                }))
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    let vocab = crate::danbooru::get_prompt_condenser_vocab();
+    let cfg = crate::prompt_condenser::Config::default();
+    let gemma_ref = gemma_fn.as_ref().map(|f| f.as_ref());
+    let mut result = crate::prompt_condenser::run_dual_pass(
+        raw_wd14_tags,
+        &opts,
+        &cfg,
+        vocab,
+        &moondream_fn,
+        gemma_ref,
+    );
+
+    if opts.use_llm_synthesis && gemma_fn.is_none() {
+        let msg = crate::prompt_condenser::ollama_not_pulled_message(text_model);
+        if !result.warnings.iter().any(|w| w.contains(&msg)) {
+            result.warnings.push(msg);
+        }
+    }
+
+    result
 }
 
 /// Asks a vision model to write a prompt for the image. If a separate vision encoder is set
@@ -1251,24 +1494,60 @@ pub fn describe_image_with_desc(
     vision_desc: &str,
     encoder_name: &str,
 ) -> Result<ImageAiResult> {
-    let system = image_system_prompt(&req.config, &req.tag_hints);
-    let second_pass_note = if req.second_pass_vision {
-        "\n\n## 2nd Pass Visual Verification\nAn image is attached for direct visual verification. Cross-examine the visual description and tagger detections against the actual image to ensure exact hair, eyes, body build, bust size, clothing, and details are 100% accurate."
-    } else {
-        ""
-    };
-    let user_prompt = if req.tag_hints.trim().is_empty() {
+    let prose_tags = crate::danbooru::extract_tags_from_prose(vision_desc);
+    let mut enriched_hints = req.tag_hints.clone();
+    for pt in &prose_tags {
+        if !enriched_hints.to_lowercase().contains(&pt.to_lowercase()) {
+            if !enriched_hints.trim().is_empty() {
+                enriched_hints.push_str(", ");
+            }
+            enriched_hints.push_str(pt);
+        }
+    }
+    if !req.second_pass_vision {
+        let tag_filter = AntigravityTagFilter::new();
+        let tagged_prompt = tag_filter.process_tags(&enriched_hints);
+        let cleaned_prompt = tag_filter.resolve_and_strip_flags(&tagged_prompt);
+        return Ok(ImageAiResult {
+            description: vision_desc.to_string(),
+            prompt: cleaned_prompt,
+        });
+    }
+
+    let candidates = crate::danbooru::list()
+        .ok()
+        .map(|l| {
+            l.candidates(vision_desc, 4, 30)
+                .iter()
+                .map(|t| format!("{} ({})", t.name, t.count))
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .filter(|c| !c.is_empty())
+        .map(|c| format!("\n\n## Canonical Danbooru Candidates (from 50k post-count dictionary)\n{c}"))
+        .unwrap_or_default();
+
+    let system = image_system_prompt(&req.config, &enriched_hints);
+    let second_pass_note = "\n\n## 2nd Pass Visual Verification\nAn image is attached for direct visual verification. Cross-examine the visual description and tagger detections against the actual image to ensure exact hair, eyes, body build, bust size, clothing, and details are 100% accurate.";
+    let user_prompt = if enriched_hints.trim().is_empty() {
         format!(
-            "## Visual description from vision encoder ({encoder_name}):\n{vision_desc}{second_pass_note}\n\nWrite the prompt for this image."
+            "## Visual description from vision encoder ({encoder_name}):\n{vision_desc}{candidates}{second_pass_note}\n\nWrite the prompt for this image."
         )
     } else {
         format!(
-            "## Visual description from vision encoder ({encoder_name}):\n{vision_desc}{second_pass_note}\n\n\
+            "## Visual description from vision encoder ({encoder_name}):\n{vision_desc}{candidates}{second_pass_note}\n\n\
              ## Task\n\
              Synthesize the visual description and tagger detections into a complete, accurate, conflict-free Danbooru prompt according to the combination instructions."
         )
     };
-    describe_with_text_model(req, &system, &user_prompt)
+    let mut res = describe_with_text_model(req, &system, &user_prompt)?;
+    for pt in prose_tags {
+        if !res.prompt.to_lowercase().contains(&pt.to_lowercase()) {
+            res.prompt.push_str(", ");
+            res.prompt.push_str(pt);
+        }
+    }
+    Ok(res)
 }
 
 /// Encodes an in-memory DynamicImage to JPEG base64 string, scaling down if over 1024px.
@@ -1340,9 +1619,19 @@ pub fn extract_visual_description_from_path(
     let scene_desc = ask_vision_encoder(&base, mode, encoder, scene_b64, scene_ask)?;
 
     // Check for detected single character to run multi-zone anatomical inspection
-    let main_char = boxes.into_iter().max_by(|a, b| a.area().total_cmp(&b.area()));
+    // (fallback to full-frame box when anime detector finds no box on realistic/cosplay photos)
+    let main = boxes
+        .into_iter()
+        .max_by(|a, b| a.area().total_cmp(&b.area()))
+        .unwrap_or(crate::detector::PersonBox {
+            x0: 0.0,
+            y0: 0.0,
+            x1: img.width() as f32,
+            y1: img.height() as f32,
+            score: 1.0,
+        });
 
-    if let Some(main) = main_char {
+    {
         let h = (main.y1 - main.y0).max(1.0);
         let ih = (img.height() as f32).max(1.0);
 
@@ -1356,9 +1645,9 @@ pub fn extract_visual_description_from_path(
             let mid_b64 = encode_dynamic_image_b64(&mid_img)?;
             let low_b64 = encode_dynamic_image_b64(&low_img)?;
 
-            let up_ask = "Describe in detail the head, face, eyes, hair color and style, animal ears or horns, expressions, and collar accessories.";
-            let mid_ask = "Describe in detail the upper clothing, chest/breast size (e.g. flat chest, small, medium, large, or huge breasts), torso build, waist, sleeves, gloves, hands, holding items, belts, and any tail origin at the lower back.";
-            let low_ask = "Describe in detail the lower body: skirt or pants, legs, legwear, stockings, feet, shoes, boots, high heels, claws, paws, and tail.";
+            let up_ask = "Describe in detail the head, face, skin tone, eye shade, hair color, length, and texture, headwear or eyewear placement, animal ears or horns, expressions, and collar accessories.";
+            let mid_ask = "Describe in detail the upper clothing cut, color, patterns or logos, fabric fit and tension, chest proportions, torso build, waist, sleeves, gloves, hands and what they are touching or holding, and belts.";
+            let low_ask = "Describe in detail the lower body and leg pose: bottoms, skirt, shorts or swimwear, leg positions, legwear, stockings, socks, hand actions on legs or clothes, and feet, bare feet, or shoes.";
 
             let up_desc = ask_vision_encoder(&base, mode, encoder, up_b64, up_ask).unwrap_or_default();
             let mid_desc = ask_vision_encoder(&base, mode, encoder, mid_b64, mid_ask).unwrap_or_default();
@@ -1542,6 +1831,7 @@ fn describe_image_with(req: &ImageAiRequest, system: &str, ask: &str) -> Result<
 }
 
 fn clean_image_ai_prompt(out: &mut ImageAiResult, checkpoint: crate::profiles::CheckpointProfile) {
+    out.prompt = AntigravityTagFilter::new().resolve_and_strip_flags(&out.prompt);
     // small cleanups: the checkpoint's name and bare category words aren't image content
     let name = checkpoint.display_name().to_lowercase();
     let junk = ["hair", "eyes", "lighting", "light", "pose", "expression", "clothing", "background", "style", "setting"];
@@ -1550,7 +1840,7 @@ fn clean_image_ai_prompt(out: &mut ImageAiResult, checkpoint: crate::profiles::C
         .map(str::to_string)
         .filter(|t| {
             let l = t.to_lowercase();
-            !l.is_empty() && l != name && !junk.contains(&l.as_str())
+            !l.is_empty() && l != name && !junk.contains(&l.as_str()) && !l.ends_with("_flag") && !l.contains("_flag")
         })
         .collect();
     // "solo" and 1girl/1boy contradict a group
@@ -1592,6 +1882,9 @@ pub struct TwoImageRequest {
     pub hints: crate::twoimg::SplitPrompt,
     /// If true and the target text model has vision capability, directly attach image pixels for a 2nd pass visual check.
     pub second_pass_vision: bool,
+    /// If true, extract body shape/build from the scene reference for the character.
+    #[allow(dead_code)]
+    pub scene_body_shape: bool,
 }
 
 pub fn split_image(req: &TwoImageRequest) -> Result<(crate::twoimg::SplitPrompt, String)> {
@@ -1640,12 +1933,20 @@ fn split_image_pipelined(req: &TwoImageRequest, encoder: &str) -> Result<(crate:
     let vision_descriptions = vision_parts.join("\n\n");
 
     // 2. Format tagger hints
+    let tag_filter = AntigravityTagFilter::new();
     let hints = if req.split.chars.is_some() {
-        let mut h: Vec<String> = req.hints.chars.iter().enumerate().map(|(i, c)| format!("Character {}: {c}", i + 1)).collect();
+        let mut h: Vec<String> = req
+            .hints
+            .chars
+            .iter()
+            .enumerate()
+            .map(|(i, c)| format!("Character {}: {}", i + 1, tag_filter.process_tags(c)))
+            .collect();
         h.push(format!("Shared: {}", req.hints.scene));
         h.join("\n")
     } else {
-        format!("Not split: {}, {}", req.hints.chars.join(", "), req.hints.scene)
+        let combined = format!("{}, {}", req.hints.chars.join(", "), req.hints.scene);
+        format!("Not split: {}", tag_filter.process_tags(&combined))
     };
 
     let order_desc = if req.split.chars.is_some() {
@@ -1763,12 +2064,20 @@ fn split_image_direct(req: &TwoImageRequest) -> Result<(crate::twoimg::SplitProm
             words[n]
         ),
     };
+    let tag_filter = AntigravityTagFilter::new();
     let hints = if req.split.chars.is_some() {
-        let mut h: Vec<String> = req.hints.chars.iter().enumerate().map(|(i, c)| format!("Character {}: {c}", i + 1)).collect();
+        let mut h: Vec<String> = req
+            .hints
+            .chars
+            .iter()
+            .enumerate()
+            .map(|(i, c)| format!("Character {}: {}", i + 1, tag_filter.process_tags(c)))
+            .collect();
         h.push(format!("Shared: {}", req.hints.scene));
         h.join("\n")
     } else {
-        format!("Not split: {}, {}", req.hints.chars.join(", "), req.hints.scene)
+        let combined = format!("{}, {}", req.hints.chars.join(", "), req.hints.scene);
+        format!("Not split: {}", tag_filter.process_tags(&combined))
     };
     let order_desc = if req.split.chars.is_some() {
         let order = (0..n)
@@ -3067,6 +3376,7 @@ mod tests {
                 config,
                 tag_hints: hints.clone(),
                 second_pass_vision: false,
+                scene_body_shape: false,
             };
             let t = std::time::Instant::now();
             let r = describe_image(&req).unwrap();
@@ -3349,6 +3659,18 @@ mod tests {
         assert!(q.contains("STEPS") && !q.contains("dynamic_prompt") && !q.contains("```"));
         let (sm, _) = build_ai_system_and_user_prompt_for(p, &cfg, ModelFamily::Small);
         assert!(sm.len() < q.len() && sm.contains("up to 6 individual edits"));
+        assert!(g.contains("DIRECTIVE 1: CAMERA & SUBMERSION FRAMING") && g.contains("DIRECTIVE 7: VLM + TAGGER SYNTHESIS"));
+
+        // AntigravityTagFilter runs on raw prompt tags before the LLM handoff
+        let (_, user_msg) = build_ai_system_and_user_prompt_for(
+            "(1girl:1.2), bunny girl, maid, white shirt, thighhighs, standing",
+            &cfg,
+            ModelFamily::Gemma,
+        );
+        assert!(user_msg.contains("full body"));
+        assert!(!user_msg.contains("bunny girl"));
+        assert!(user_msg.contains("MISSING_BOTTOMS_FLAG"));
+        assert!(user_msg.contains("UNANCHORED_LIMBS_FLAG"));
     }
 }
 

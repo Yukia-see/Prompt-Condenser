@@ -11,6 +11,10 @@ mod sceneref;
 mod tagger;
 mod two;
 mod twoimg;
+#[allow(dead_code)]
+pub mod prompt_condenser;
+#[cfg(test)]
+mod prompt_condenser_parity;
 
 use ai_engine::{AiScanRequest, GpuInfo, OllamaModel};
 use analyzer::{ChangeAction, PromptChange, ScanConfig};
@@ -82,6 +86,7 @@ type State = Rc<RefCell<AppState>>;
 /// A Scene / Pose reference image: what it showed each character doing and the scene,
 /// who the user gave each tag to, and what went into which box (so it can come out).
 struct SceneRef {
+    raw_tags: String,
     actions: Vec<sceneref::Action>,
     boxes: Vec<BoxSnap>,
 }
@@ -322,7 +327,7 @@ fn char_prompts(ui: &AppWindow, config: &ScanConfig) -> Vec<String> {
 /// framing; `two::combine` moves the scene's tags to the shared part).
 fn with_scene(c1: &str, config: &ScanConfig) -> String {
     let scene = config.scene_prompt_raw.trim().trim_matches(',').trim();
-    if !config.two_char || scene.is_empty() {
+    if scene.is_empty() {
         return c1.to_string();
     }
     let c1 = c1.trim().trim_end_matches(',').trim();
@@ -980,6 +985,7 @@ fn run_two_image(ui: &AppWindow, state: &State) {
         state.borrow().vision_models.iter().any(|v| ai_engine::same_model(v, m))
     });
     let second_pass = ui.get_image_second_pass() && has_vision;
+    let scene_body_shape = ui.get_scene_body_shape();
     let n = tab_chars(ui);
     // a cached reading for another number of characters doesn't count
     let cached = state.borrow().two_tags.clone().filter(|t| t.wanted == n);
@@ -1030,6 +1036,7 @@ fn run_two_image(ui: &AppWindow, state: &State) {
                     hints: twoimg::rule_split(&tags, threshold),
                     split: tags.clone(),
                     second_pass_vision: second_pass,
+                    scene_body_shape,
                 })
                 .map(|(split, _)| twoimg::settle(split, &tags, threshold))
             });
@@ -1107,6 +1114,17 @@ struct ReadCtx {
     threshold: f32,
     config: ScanConfig,
     second_pass: bool,
+    scene_body_shape: bool,
+    enable_dual_pass: bool,
+    use_llm_synthesis: bool,
+}
+
+fn effective_scene_body_shape(ui: &AppWindow) -> bool {
+    if ui.get_enable_dual_pass() {
+        ui.get_dual_pass_mode_index() == 0
+    } else {
+        ui.get_scene_body_shape()
+    }
 }
 
 fn read_ctx(ui: &AppWindow, state: &State) -> ReadCtx {
@@ -1118,6 +1136,7 @@ fn read_ctx(ui: &AppWindow, state: &State) -> ReadCtx {
         state.borrow().vision_models.iter().any(|v| ai_engine::same_model(v, m))
     });
     let second_pass = ui.get_image_second_pass() && has_vision;
+    let scene_body_shape = effective_scene_body_shape(ui);
     ReadCtx {
         model: text_model,
         vision_encoder: ai_on.then(|| vision_model(ui, state)).flatten(),
@@ -1126,14 +1145,41 @@ fn read_ctx(ui: &AppWindow, state: &State) -> ReadCtx {
         threshold: ui.get_tag_threshold(),
         config,
         second_pass,
+        scene_body_shape,
+        enable_dual_pass: ui.get_enable_dual_pass(),
+        use_llm_synthesis: ui.get_use_llm_synthesis(),
     }
 }
 
 /// One character's reference image -> its tags (before Identity Only).
-fn read_char_blocking(path: &std::path::Path, ctx: &ReadCtx, progress: &(dyn Fn(String) + Sync)) -> anyhow::Result<(String, &'static str)> {
+fn read_char_blocking(path: &std::path::Path, ctx: &ReadCtx, progress: &(dyn Fn(String) + Sync)) -> anyhow::Result<(String, &'static str, Vec<String>)> {
+    if ctx.enable_dual_pass {
+        if let (Some(enc), Some(model)) = (&ctx.vision_encoder, &ctx.model) {
+            let tags = twoimg::tag_one_fast(path, progress)?;
+            let raw_wd14 = tagger::build_prompt(&tags, prompt_condenser::WD14_GENERAL_THRESHOLD).prompt;
+            let mode = if ctx.scene_body_shape {
+                prompt_condenser::Mode::SceneShape
+            } else {
+                prompt_condenser::Mode::ScenePose
+            };
+            let opts = prompt_condenser::PipelineOptions {
+                mode,
+                use_llm_synthesis: ctx.use_llm_synthesis,
+                gemma_vision_pass: ctx.second_pass,
+            };
+            let dual = ai_engine::run_dual_pass_pipeline(&ctx.host, ctx.mode, enc, model, path, &raw_wd14, opts);
+            let combined = match (dual.character_prompt.is_empty(), dual.scene_prompt.is_empty()) {
+                (false, false) => format!("{}, {}", dual.character_prompt, dual.scene_prompt),
+                (false, true) => dual.character_prompt,
+                (true, false) => dual.scene_prompt,
+                (true, true) => raw_wd14,
+            };
+            return Ok((combined, "Dual-Pass AI", dual.warnings));
+        }
+    }
     let tags = twoimg::tag_one_fast(path, progress)?;
     let hints = tagger::build_prompt(&tags, ctx.threshold).prompt;
-    let Some(model) = ctx.model.clone() else { return Ok((hints, "tagger")) };
+    let Some(model) = ctx.model.clone() else { return Ok((hints, "tagger", Vec::new())) };
     let req = ai_engine::ImageAiRequest {
         host: ctx.host.clone(),
         model,
@@ -1143,10 +1189,11 @@ fn read_char_blocking(path: &std::path::Path, ctx: &ReadCtx, progress: &(dyn Fn(
         config: ctx.config.clone(),
         tag_hints: hints.clone(),
         second_pass_vision: ctx.second_pass,
+        scene_body_shape: ctx.scene_body_shape,
     };
     Ok(match ai_engine::describe_image(&req) {
-        Ok(r) => (r.prompt, "AI"),
-        Err(_) => (hints, "tagger, the AI failed"),
+        Ok(r) => (r.prompt, "AI", Vec::new()),
+        Err(_) => (hints, "tagger, the AI failed", Vec::new()),
     })
 }
 
@@ -1158,14 +1205,48 @@ fn read_scene_blocking(
     ctx: &ReadCtx,
     n: usize,
     progress: &(dyn Fn(String) + Sync),
-) -> anyhow::Result<(Vec<sceneref::Action>, String)> {
+) -> anyhow::Result<(Vec<sceneref::Action>, String, String, Vec<String>)> {
     if n >= 2 {
-        return read_scene_split(path, ctx, n, progress);
+        let (actions, how, raw) = read_scene_split(path, ctx, n, progress)?;
+        return Ok((actions, how, raw, Vec::new()));
+    }
+    if ctx.enable_dual_pass {
+        if let (Some(enc), Some(model)) = (&ctx.vision_encoder, &ctx.model) {
+            let tags = tagger::tag_image(path)?;
+            let raw_wd14 = tagger::build_prompt(&tags, prompt_condenser::WD14_GENERAL_THRESHOLD).prompt;
+            let mode = if ctx.scene_body_shape {
+                prompt_condenser::Mode::SceneShape
+            } else {
+                prompt_condenser::Mode::ScenePose
+            };
+            let opts = prompt_condenser::PipelineOptions {
+                mode,
+                use_llm_synthesis: ctx.use_llm_synthesis,
+                gemma_vision_pass: ctx.second_pass,
+            };
+            let dual = ai_engine::run_dual_pass_pipeline(&ctx.host, ctx.mode, enc, model, path, &raw_wd14, opts);
+            let combined = match (dual.scene_prompt.is_empty(), dual.character_prompt.is_empty()) {
+                (false, false) => format!("{}, {}", dual.scene_prompt, dual.character_prompt),
+                (false, true) => dual.scene_prompt,
+                (true, false) => dual.character_prompt,
+                (true, true) => raw_wd14,
+            };
+            let actions = sceneref::from_single_with_shape(&combined, false, ctx.scene_body_shape);
+            return Ok((actions, "Dual-Pass AI".to_string(), combined, dual.warnings));
+        }
     }
     progress("Tagging scene and character pose…".into());
     let tags = tagger::tag_image(path)?;
-    let hints = scene::filter_scene_and_pose_only(&tagger::build_prompt(&tags, ctx.threshold).prompt, false);
-    let Some(model) = ctx.model.clone() else { return Ok((sceneref::from_single(&hints, false), "tagger".into())) };
+    let raw_prompt = tagger::build_prompt(&tags, ctx.threshold).prompt;
+    let hints = scene::filter_scene_and_pose_only_with_shape(&raw_prompt, false, ctx.scene_body_shape);
+    let Some(model) = ctx.model.clone() else {
+        return Ok((
+            sceneref::from_single_with_shape(&raw_prompt, false, ctx.scene_body_shape),
+            "tagger".into(),
+            raw_prompt,
+            Vec::new(),
+        ));
+    };
     let status_name = if let Some(ref enc) = ctx.vision_encoder {
         if ai_engine::same_model(enc, &model) {
             enc.clone()
@@ -1187,11 +1268,14 @@ fn read_scene_blocking(
         config: ctx.config.clone(),
         tag_hints: hints.clone(),
         second_pass_vision: ctx.second_pass,
+        scene_body_shape: ctx.scene_body_shape,
     };
-    Ok(match ai_engine::describe_scene_pose(&req) {
-        Ok(r) => (sceneref::from_single(&r.prompt, false), "AI".into()),
-        Err(_) => (sceneref::from_single(&hints, false), "tagger, the AI failed".into()),
-    })
+    let (prompt, how) = match ai_engine::describe_scene_pose(&req) {
+        Ok(r) => (r.prompt, "AI".to_string()),
+        Err(_) => (raw_prompt.clone(), "tagger, the AI failed".to_string()),
+    };
+    let actions = sceneref::from_single_with_shape(&prompt, false, ctx.scene_body_shape);
+    Ok((actions, how, prompt, Vec::new()))
 }
 
 fn read_scene_split(
@@ -1199,7 +1283,7 @@ fn read_scene_split(
     ctx: &ReadCtx,
     n: usize,
     progress: &(dyn Fn(String) + Sync),
-) -> anyhow::Result<(Vec<sceneref::Action>, String)> {
+) -> anyhow::Result<(Vec<sceneref::Action>, String, String)> {
     if !detector::is_installed() {
         let (tx, rx) = mpsc::channel::<String>();
         std::thread::scope(|s| {
@@ -1233,6 +1317,7 @@ fn read_scene_split(
                 hints: hints.clone(),
                 split: tags.clone(),
                 second_pass_vision: ctx.second_pass,
+                scene_body_shape: ctx.scene_body_shape,
             }) {
                 Ok((s, _)) => (twoimg::settle(s, &tags, ctx.threshold), "AI".to_string()),
                 Err(_) => (hints, "tagger, the AI failed".to_string()),
@@ -1243,7 +1328,8 @@ fn read_scene_split(
     if let Some(note) = twoimg::not_found_note(&tags) {
         how.push_str(&format!("; {note}, so character 1 got every pose"));
     }
-    Ok((sceneref::from_split(&split.chars, &split.scene, false), how))
+    let raw_tags = format!("{} || {}", split.chars.join(" | "), split.scene);
+    Ok((sceneref::from_split_with_shape(&split.chars, &split.scene, false, ctx.scene_body_shape), how, raw_tags))
 }
 
 /// Shows the Read button while reference images wait to be read.
@@ -1284,10 +1370,9 @@ fn run_scene_fast_scan(ui: &AppWindow, state: &State) {
             ui.set_tagger_busy(false);
             with_state(|state| {
                 match scene_result {
-                    Ok((actions, how)) => {
+                    Ok((actions, how, raw_tags, _)) => {
                         let found = actions.len();
-                        set_scene_reading(&ui, state, actions);
-                        ui.set_scene_panel_open(true);
+                        set_scene_reading(&ui, state, actions, raw_tags);
                         ui.set_scene_ref_status(format!("⚡ Auto Scene ({how} • {secs:.1}s): {found} tags detected & assigned.").into());
                         ui.set_image_status(format!("Scene fast-scanned in {secs:.1}s").into());
                     }
@@ -1312,7 +1397,7 @@ fn run_read_queue(ui: &AppWindow, state: &State) {
         let st = state.borrow();
         let scene = st.scene_ref_path.clone();
         let chars: Vec<(usize, std::path::PathBuf)> = (0..tab_chars(ui))
-            .filter_map(|k| st.char_paths[k].clone().filter(|_| st.char_images[k].is_none()).map(|p| (k, p)))
+            .filter_map(|k| st.char_paths[k].clone().map(|p| (k, p)))
             .collect();
         (scene, chars)
     };
@@ -1327,7 +1412,7 @@ fn run_read_queue(ui: &AppWindow, state: &State) {
             say("Reading the scene & pose reference…".into());
             read_scene_blocking(&p, &ctx, n, &say)
         });
-        let char_results: Vec<(usize, anyhow::Result<(String, &'static str)>)> = chars
+        let char_results: Vec<(usize, anyhow::Result<(String, &'static str, Vec<String>)>)> = chars
             .into_iter()
             .map(|(k, p)| {
                 say(format!("Reading character {}…", k + 1));
@@ -1339,12 +1424,13 @@ fn run_read_queue(ui: &AppWindow, state: &State) {
             ui.set_tagger_busy(false);
             with_state(|state| {
                 let mut done = Vec::new();
+                let mut all_warnings = Vec::new();
                 // the scene goes in first, so the characters are read against it
                 match scene_result {
-                    Some(Ok((actions, how))) => {
+                    Some(Ok((actions, how, raw_tags, warnings))) => {
+                        all_warnings.extend(warnings);
                         let found = actions.len();
-                        set_scene_reading(&ui, state, actions);
-                        ui.set_scene_panel_open(true);
+                        set_scene_reading(&ui, state, actions, raw_tags);
                         ui.set_scene_ref_status(format!("Auto Scene ({how}): {found} tags placed across characters & scene.").into());
                         done.push(format!("scene & pose ({how})"));
                     }
@@ -1357,7 +1443,8 @@ fn run_read_queue(ui: &AppWindow, state: &State) {
                 let mut chars_done = false;
                 for (k, r) in char_results {
                     match r {
-                        Ok((text, how)) => {
+                        Ok((text, how, warnings)) => {
+                            all_warnings.extend(warnings);
                             state.borrow_mut().char_images[k] = Some(text);
                             apply_char_image(&ui, state, k);
                             chars_done = true;
@@ -1365,6 +1452,11 @@ fn run_read_queue(ui: &AppWindow, state: &State) {
                         }
                         Err(e) => done.push(format!("character {} failed: {e:#}", k + 1)),
                     }
+                }
+                if !all_warnings.is_empty() {
+                    ui.set_pipeline_warnings(all_warnings.join(" | ").into());
+                } else {
+                    ui.set_pipeline_warnings("".into());
                 }
                 // a character image rewrote its box: put that character's scene actions back
                 if chars_done {
@@ -1382,11 +1474,8 @@ fn apply_char_image(ui: &AppWindow, state: &State, which: usize) {
     let Some(text) = state.borrow().char_images[which].clone() else { return };
     // one character: no quality tags, no "solo", no group counts
     // with a Scene / Pose reference, the character images only say who they are
-    let text = if state.borrow().scene_ref.is_some() && !ui.get_image_identity_only() {
-        scene::filter_identity_only(&text)
-    } else {
-        identity(ui, &text)
-    };
+    let drop_shape = state.borrow().scene_ref.is_some() && effective_scene_body_shape(ui);
+    let text = scene::filter_identity_only_with_shape(&text, drop_shape);
     let text = twoimg::clean_list(&text, false);
     remember_boxes(ui, state);
     set_char_box(ui, which, &text);
@@ -1407,7 +1496,7 @@ fn scene_overrides(ui: &AppWindow) -> sceneref::Overrides {
 }
 
 /// Stores a new reading and applies its plan across the boxes.
-fn set_scene_reading(ui: &AppWindow, state: &State, actions: Vec<sceneref::Action>) {
+fn set_scene_reading(ui: &AppWindow, state: &State, actions: Vec<sceneref::Action>, raw_tags: String) {
     let mut st = state.borrow_mut();
     // take out the old reading first, if any
     let old_boxes = st.scene_ref.take().map(|r| r.boxes).unwrap_or_default();
@@ -1419,9 +1508,10 @@ fn set_scene_reading(ui: &AppWindow, state: &State, actions: Vec<sceneref::Actio
     ui.set_scene_override_c2("".into());
     ui.set_scene_override_c3("".into());
     ui.set_scene_override_c4("".into());
+    ui.set_scene_prompt("".into());
 
     let mut st = state.borrow_mut();
-    st.scene_ref = Some(SceneRef { actions, boxes: Vec::new() });
+    st.scene_ref = Some(SceneRef { raw_tags, actions, boxes: Vec::new() });
     drop(st);
     apply_scene_ref(ui, state);
     sync_scene_panel(ui, state);
@@ -1440,16 +1530,7 @@ fn apply_scene_ref(ui: &AppWindow, state: &State) {
 
     // Box index: 0 = Before / Char 1, 1 = Char 2, 2 = Char 3, 3 = Char 4, 4 = Scene box
     // (box, tags, which predicate: 0 = actions, 1 = scene, 2 = both)
-    let targets: Vec<(usize, Vec<String>, u8)> = if n == 1 {
-        // 1 Character tab: both actions and scene tags go to Before
-        let mut all = plan.chars.first().cloned().unwrap_or_default();
-        for s in &plan.scene {
-            if !all.contains(s) { all.push(s.clone()); }
-        }
-        // Before holds the character's actions and the scene together, so the reference
-        // replaces both (otherwise your own "indoors" would sit next to its "beach")
-        vec![(0, all, 2)]
-    } else {
+    let targets: Vec<(usize, Vec<String>, u8)> = {
         let mut list = Vec::new();
         for i in 0..n {
             let tags = plan.chars.get(i).cloned().unwrap_or_default();
@@ -1471,8 +1552,9 @@ fn apply_scene_ref(ui: &AppWindow, state: &State) {
             // When doing references or scene: clear shared prompt; if text already exists that is different from character prompts, add to it
             sceneref::update_shared_scene_prompt(&original, &refs, &other_prompts)
         } else {
+            let body_shape_on = effective_scene_body_shape(ui);
             sceneref::inject(&original, &refs, &|t| match kind {
-                0 => sceneref::is_action(t),
+                0 => sceneref::is_action(t) || (body_shape_on && crate::scene::is_body_shape_tag(&t.normalized)),
                 1 => scene::is_scene_or_pose(t),
                 _ => sceneref::is_pose_or_scene(t),
             })
@@ -1776,10 +1858,30 @@ fn run_ai_image(ui: &AppWindow, state: &State) {
         config: scan_config(ui),
         tag_hints: String::new(),
         second_pass_vision: second_pass,
+        scene_body_shape: ui.get_scene_body_shape(),
     };
     let threshold = ui.get_tag_threshold();
+    let enable_dual_pass = ui.get_enable_dual_pass();
+    let dual_pass_opts = if enable_dual_pass {
+        let mode = if ui.get_dual_pass_mode_index() == 0 {
+            prompt_condenser::Mode::SceneShape
+        } else {
+            prompt_condenser::Mode::ScenePose
+        };
+        Some(prompt_condenser::PipelineOptions {
+            mode,
+            use_llm_synthesis: ui.get_use_llm_synthesis(),
+            gemma_vision_pass: ui.get_image_second_pass() && ui.get_use_llm_synthesis(),
+        })
+    } else {
+        None
+    };
     ui.set_tagger_busy(true);
-    let status_name = if ai_engine::same_model(&encoder, &text_model) {
+    let status_name = if enable_dual_pass {
+        let mode_name = if ui.get_dual_pass_mode_index() == 0 { "Shape" } else { "Pose" };
+        let synth = if ui.get_use_llm_synthesis() { " + Gemma" } else { " (No LLM)" };
+        format!("Dual-Pass [{mode_name}]: {encoder}{synth}")
+    } else if ai_engine::same_model(&encoder, &text_model) {
         encoder.clone()
     } else if second_pass {
         format!("{encoder} + {text_model} (2nd Pass Vision)")
@@ -1790,6 +1892,69 @@ fn run_ai_image(ui: &AppWindow, state: &State) {
     let weak = ui.as_weak();
     std::thread::spawn(move || {
         let started = std::time::Instant::now();
+        if let Some(opts) = dual_pass_opts {
+            let tags = if cached_tags.is_some() {
+                cached_tags
+            } else if tagger::is_installed() {
+                twoimg::tag_one_fast(&path, &status_sender(&weak)).ok()
+            } else {
+                None
+            };
+            let wd14_tags = if let Some(ref t) = tags {
+                tagger::build_prompt(t, prompt_condenser::WD14_GENERAL_THRESHOLD).prompt
+            } else {
+                String::new()
+            };
+            let dual_result = ai_engine::run_dual_pass_pipeline(
+                &req.host,
+                req.mode,
+                &encoder,
+                &req.model,
+                &path,
+                &wd14_tags,
+                opts,
+            );
+            let secs = started.elapsed().as_secs_f32();
+            let _ = weak.upgrade_in_event_loop(move |ui| {
+                ui.set_tagger_busy(false);
+                with_state(|state| {
+                    if tags.is_some() {
+                        state.borrow_mut().last_tags = tags;
+                    }
+                    if !dual_result.warnings.is_empty() {
+                        ui.set_pipeline_warnings(dual_result.warnings.join(" | ").into());
+                    } else {
+                        ui.set_pipeline_warnings("".into());
+                    }
+                    let raw_combined = match (dual_result.character_prompt.is_empty(), dual_result.scene_prompt.is_empty()) {
+                        (false, false) => format!("{}, {}", dual_result.character_prompt, dual_result.scene_prompt),
+                        (false, true) => dual_result.character_prompt.clone(),
+                        (true, false) => dual_result.scene_prompt.clone(),
+                        (true, true) => wd14_tags.clone(),
+                    };
+                    let deduped_prompt = parser::AntigravityTagFilter::new().resolve_and_strip_flags(&raw_combined);
+                    let mode_str = match opts.mode {
+                        prompt_condenser::Mode::SceneShape => "Shape",
+                        prompt_condenser::Mode::ScenePose => "Pose",
+                    };
+                    let res = ai_engine::ImageAiResult {
+                        description: format!("Dual-Pass [{mode_str}]: Scene + Character merged."),
+                        prompt: deduped_prompt,
+                    };
+                    state.borrow_mut().image_ai = Some(res.clone());
+                    if ui.get_image_use_ai() {
+                        set_prompt_from_image(&ui, state, &identity(&ui, &res.prompt));
+                        let timing = format!(" • {secs:.1} s");
+                        ui.set_image_status(format!("Dual-Pass [{mode_str}]{timing}: Scene + Character merged.").into());
+                    }
+                    if std::mem::take(&mut state.borrow_mut().scan_after_image) {
+                        ui.invoke_run_ai_scan_requested();
+                    }
+                });
+            });
+            return;
+        }
+
         // In Combined mode: run tagger and vision encoder in parallel for maximum speed
         let (tags, vision_desc_res) = if cached_tags.is_none() && tagger::is_installed() && !ai_engine::same_model(&encoder, &text_model) {
             std::thread::scope(|s| {
@@ -1862,7 +2027,11 @@ fn status_sender(weak: &slint::Weak<AppWindow>) -> impl Fn(String) + Sync {
 
 /// "Identity Only": an image only supplies who the character is and what they wear.
 fn identity(ui: &AppWindow, prompt: &str) -> String {
-    if ui.get_image_identity_only() { scene::filter_identity_only(prompt) } else { prompt.to_string() }
+    if ui.get_image_identity_only() {
+        scene::filter_identity_only(prompt)
+    } else {
+        parser::AntigravityTagFilter::new().resolve_and_strip_flags(prompt)
+    }
 }
 
 fn apply_ai_image(ui: &AppWindow, state: &State, res: &ai_engine::ImageAiResult, secs: Option<f32>) {
@@ -1973,6 +2142,10 @@ struct Settings {
     scene_prompt: String,
     image_identity_only: bool,
     image_second_pass: bool,
+    scene_body_shape: bool,
+    enable_dual_pass: bool,
+    dual_pass_mode_index: i32,
+    use_llm_synthesis: bool,
     /// THEME dropdown: 0 OLED Pitch Black, 1 M3 Deep Violet, 2 OLED Cyber Emerald,
     /// 3 M3 Ocean Blue, 4 M3 Crimson Ember, 5 M3 Mocha Gold.
     theme_index: i32,
@@ -2014,7 +2187,11 @@ impl Default for Settings {
             char_break: true,
             scene_prompt: String::new(),
             image_identity_only: false,
-            image_second_pass: true,
+            image_second_pass: false,
+            scene_body_shape: false,
+            enable_dual_pass: true,
+            dual_pass_mode_index: 0,
+            use_llm_synthesis: true,
             theme_index: 1,
             lora_split_ratios: [0.7; 4],
             options_expanded: true,
@@ -2064,6 +2241,10 @@ fn load_settings(ui: &AppWindow) {
     ui.set_scene_prompt(st.scene_prompt.into());
     ui.set_image_identity_only(st.image_identity_only);
     ui.set_image_second_pass(st.image_second_pass);
+    ui.set_scene_body_shape(st.scene_body_shape);
+    ui.set_enable_dual_pass(st.enable_dual_pass);
+    ui.set_dual_pass_mode_index(st.dual_pass_mode_index.clamp(0, 1));
+    ui.set_use_llm_synthesis(st.use_llm_synthesis);
     ui.set_theme_index(st.theme_index.clamp(0, 5));
     ui.set_options_expanded(st.options_expanded);
     ui.set_after_view(st.after_view.clamp(0, 4));
@@ -2107,6 +2288,10 @@ fn save_settings(ui: &AppWindow) {
         scene_prompt: ui.get_scene_prompt().to_string(),
         image_identity_only: ui.get_image_identity_only(),
         image_second_pass: ui.get_image_second_pass(),
+        scene_body_shape: ui.get_scene_body_shape(),
+        enable_dual_pass: ui.get_enable_dual_pass(),
+        dual_pass_mode_index: ui.get_dual_pass_mode_index(),
+        use_llm_synthesis: ui.get_use_llm_synthesis(),
         theme_index: ui.get_theme_index(),
         options_expanded: ui.get_options_expanded(),
         after_view: ui.get_after_view(),
@@ -2515,11 +2700,11 @@ fn main() -> Result<(), slint::PlatformError> {
                 st.scene_ref.take().map(|r| r.boxes).unwrap_or_default()
             };
             restore_boxes(&ui, &old_boxes);
+            ui.set_scene_prompt("".into());
             analyze(&ui, &state);
             ui.set_scene_ref_status("Scene image loaded. Click '⚡ Auto Scene (Fast)' or '🧠 Read (AI)'.".into());
             update_pending(&ui, &state);
             sync_scene_panel(&ui, &state);
-            ui.set_scene_panel_open(true);
         });
     }
     {
@@ -2848,6 +3033,138 @@ fn main() -> Result<(), slint::PlatformError> {
                 state.borrow_mut().image_ai = None;
                 state.borrow_mut().two_ai = None;
             });
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_scene_body_shape_changed(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            save_settings(&ui);
+            let on = effective_scene_body_shape(&ui);
+            let msg = if on {
+                "Scene Body Shape enabled: Scene supplies body proportions & shape; Character keeps outfit, stature & face."
+            } else {
+                "Scene Body Shape disabled: Character supplies body proportions & shape."
+            };
+            ui.set_scene_ref_status(msg.into());
+            {
+                let mut st = state.borrow_mut();
+                if let Some(ref mut sr) = st.scene_ref {
+                    if !sr.raw_tags.is_empty() {
+                        if sr.raw_tags.contains(" || ") {
+                            let parts: Vec<&str> = sr.raw_tags.split(" || ").collect();
+                            let char_slices: Vec<String> = parts[0].split(" | ").map(|s| s.to_string()).collect();
+                            sr.actions = sceneref::from_split_with_shape(&char_slices, parts.get(1).unwrap_or(&""), false, on);
+                        } else {
+                            sr.actions = sceneref::from_single_with_shape(&sr.raw_tags, false, on);
+                        }
+                    }
+                }
+            }
+            for which in 0..tab_chars(&ui) {
+                if state.borrow().char_images[which].is_some() {
+                    apply_char_image(&ui, &state, which);
+                }
+            }
+            apply_scene_ref(&ui, &state);
+            analyze(&ui, &state);
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_dual_pass_changed(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            save_settings(&ui);
+            let on = ui.get_enable_dual_pass();
+            let msg = if on {
+                "Dual-Pass Vision enabled (Moondream 2-pass + WD14 reconciliation)."
+            } else {
+                "Dual-Pass Vision disabled (single-pass reading)."
+            };
+            ui.set_image_status(msg.into());
+            let shape_on = effective_scene_body_shape(&ui);
+            {
+                let mut st = state.borrow_mut();
+                st.image_ai = None;
+                st.two_ai = None;
+                if let Some(ref mut sr) = st.scene_ref {
+                    if !sr.raw_tags.is_empty() {
+                        if sr.raw_tags.contains(" || ") {
+                            let parts: Vec<&str> = sr.raw_tags.split(" || ").collect();
+                            let char_slices: Vec<String> = parts[0].split(" | ").map(|s| s.to_string()).collect();
+                            sr.actions = sceneref::from_split_with_shape(&char_slices, parts.get(1).unwrap_or(&""), false, shape_on);
+                        } else {
+                            sr.actions = sceneref::from_single_with_shape(&sr.raw_tags, false, shape_on);
+                        }
+                    }
+                }
+            }
+            for which in 0..tab_chars(&ui) {
+                if state.borrow().char_images[which].is_some() {
+                    apply_char_image(&ui, &state, which);
+                }
+            }
+            apply_scene_ref(&ui, &state);
+            analyze(&ui, &state);
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_dual_pass_mode_changed(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            save_settings(&ui);
+            let mode_idx = ui.get_dual_pass_mode_index();
+            let msg = if mode_idx == 0 {
+                "Dual-Pass Mode: Scene + Body Shape (Mode A)"
+            } else {
+                "Dual-Pass Mode: Scene + Skeletal Pose (Mode B)"
+            };
+            ui.set_image_status(msg.into());
+            let shape_on = effective_scene_body_shape(&ui);
+            {
+                let mut st = state.borrow_mut();
+                st.image_ai = None;
+                st.two_ai = None;
+                if let Some(ref mut sr) = st.scene_ref {
+                    if !sr.raw_tags.is_empty() {
+                        if sr.raw_tags.contains(" || ") {
+                            let parts: Vec<&str> = sr.raw_tags.split(" || ").collect();
+                            let char_slices: Vec<String> = parts[0].split(" | ").map(|s| s.to_string()).collect();
+                            sr.actions = sceneref::from_split_with_shape(&char_slices, parts.get(1).unwrap_or(&""), false, shape_on);
+                        } else {
+                            sr.actions = sceneref::from_single_with_shape(&sr.raw_tags, false, shape_on);
+                        }
+                    }
+                }
+            }
+            for which in 0..tab_chars(&ui) {
+                if state.borrow().char_images[which].is_some() {
+                    apply_char_image(&ui, &state, which);
+                }
+            }
+            apply_scene_ref(&ui, &state);
+            analyze(&ui, &state);
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_llm_synthesis_changed(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            save_settings(&ui);
+            let on = ui.get_use_llm_synthesis();
+            let msg = if on {
+                "LLM Tag Synthesis enabled (Gemma 4 12B in Ollama)."
+            } else {
+                "LLM Tag Synthesis disabled (direct mechanical tag merge)."
+            };
+            ui.set_image_status(msg.into());
+            let mut st = state.borrow_mut();
+            st.image_ai = None;
+            st.two_ai = None;
         });
     }
     {

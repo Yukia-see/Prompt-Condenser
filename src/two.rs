@@ -566,15 +566,44 @@ pub fn combine_section_blocks(texts: &[String], config: &ScanConfig, strip_confl
     if n == 0 {
         return String::new();
     }
+    // If a single input text already contains `[Scene...]:` and `[Character...]:` blocks, unpack them cleanly
+    let mut unpacked_scene = String::new();
+    let effective_texts: Vec<String> = if n == 1 {
+        if let Some((parsed_chars, parsed_scene)) = parse_section_blocks(&texts[0]) {
+            unpacked_scene = parsed_scene;
+            if parsed_chars.is_empty() {
+                texts.to_vec()
+            } else {
+                vec![parsed_chars.join(", ")]
+            }
+        } else {
+            texts.to_vec()
+        }
+    } else {
+        texts.to_vec()
+    };
+
     let tokens = |text: &str, lora: &str| -> Vec<PromptToken> {
         crate::analyzer::fix_body_type(strip_lora_tokens(parse_prompt(text), lora, strip_conflicts))
             .into_iter()
             .filter(|t| t.normalized != "break")
-            .filter(|t| !(strip_conflicts && t.normalized == "solo"))
+            // "solo" only conflicts when there are multiple characters (n > 1)
+            .filter(|t| !(strip_conflicts && n > 1 && t.normalized == "solo"))
             .collect()
     };
-    let chars: Vec<Vec<PromptToken>> = texts.iter().enumerate().map(|(i, t)| tokens(t, config.lora_of(i))).collect();
-    let scene_box: Vec<String> = parse_prompt(&config.scene_prompt_raw).into_iter().map(|t| t.normalized).collect();
+    let chars: Vec<Vec<PromptToken>> = effective_texts
+        .iter()
+        .enumerate()
+        .map(|(i, t)| tokens(t, config.lora_of(i)))
+        .collect();
+    let combined_scene_raw = if unpacked_scene.is_empty() {
+        config.scene_prompt_raw.clone()
+    } else if config.scene_prompt_raw.trim().is_empty() {
+        unpacked_scene
+    } else {
+        format!("{}, {}", config.scene_prompt_raw.trim(), unpacked_scene)
+    };
+    let scene_box: Vec<String> = parse_prompt(&combined_scene_raw).into_iter().map(|t| t.normalized).collect();
 
     let mut quality: Vec<PromptToken> = Vec::new();
     let mut group_counts: Vec<PromptToken> = Vec::new();
@@ -591,8 +620,16 @@ pub fn combine_section_blocks(texts: &[String], config: &ScanConfig, strip_confl
     for (i, toks) in chars.iter().enumerate() {
         let mut kind = None;
         for t in toks {
-            let n = t.normalized.as_str();
-            if let Some((num, k)) = count_tag(n) {
+            let norm = t.normalized.as_str();
+            if norm == "solo"
+                || norm.ends_with(" flag")
+                || norm.ends_with("_flag")
+                || norm.contains("flag")
+                || t.raw.to_lowercase().contains("flag")
+            {
+                continue;
+            }
+            if let Some((num, k)) = count_tag(norm) {
                 if num >= 2 {
                     push_unique(&mut group_counts, t);
                 } else {
@@ -600,11 +637,16 @@ pub fn combine_section_blocks(texts: &[String], config: &ScanConfig, strip_confl
                 }
                 continue;
             }
-            if is_interaction(n) {
+            if is_interaction(norm) {
                 push_unique(&mut interaction, t);
                 continue;
             }
-            if scene_box.iter().any(|x| x == n) {
+            // Surface-anchored postures like "sitting on bed" ground both the Scene header and Character pose
+            if norm == "sitting on bed" {
+                blocks[i].push(t.clone());
+                continue;
+            }
+            if scene_box.iter().any(|x| x == norm) {
                 if slot(t) == Slot::Quality {
                     push_unique(&mut quality, t);
                 } else {
@@ -616,7 +658,7 @@ pub fn combine_section_blocks(texts: &[String], config: &ScanConfig, strip_confl
                 Slot::Quality => push_unique(&mut quality, t),
                 Slot::Camera | Slot::Setting | Slot::Light | Slot::Style | Slot::Clause => push_unique(&mut footer, t),
                 _ => {
-                    if !is_spatial_position(n) {
+                    if !is_spatial_position(norm) {
                         blocks[i].push(t.clone());
                     }
                 }
@@ -626,7 +668,11 @@ pub fn combine_section_blocks(texts: &[String], config: &ScanConfig, strip_confl
         kind_of[i] = kind;
     }
 
-    for t in parse_prompt(&config.scene_prompt_raw) {
+    for t in parse_prompt(&combined_scene_raw) {
+        let norm = t.normalized.as_str();
+        if count_tag(norm).is_some() || norm == "solo" {
+            continue;
+        }
         if slot(&t) == Slot::Quality {
             push_unique(&mut quality, &t);
         } else {
@@ -646,12 +692,30 @@ pub fn combine_section_blocks(texts: &[String], config: &ScanConfig, strip_confl
                 c => parts.push(format!("{c}{k}s")),
             }
         }
+        if n == 1 && parts.len() == 1 {
+            parts.push("solo".to_string());
+        }
         parts.join(", ")
     };
     let count_tokens = parse_prompt(&count_text);
 
     if config.cleanup_enabled || config.arranged {
-        footer.sort_by_key(footer_slot);
+        footer.sort_by_key(|t| match footer_slot(t) {
+            Slot::Setting => 0,
+            Slot::Camera => 1,
+            Slot::Light => 2,
+            Slot::Style => 3,
+            _ => 4,
+        });
+    }
+
+    // Ensure canonical quality tags on Anima / SDXL when building a complete Scene + Character section block
+    if quality.is_empty() && !combined_scene_raw.trim().is_empty() {
+        for q in config.checkpoint.canonical_quality_tags() {
+            for qt in parse_prompt(q) {
+                push_unique(&mut quality, &qt);
+            }
+        }
     }
 
     let raw = |v: &[PromptToken]| v.iter().map(|t| t.raw.trim().to_string()).collect::<Vec<String>>();
@@ -673,16 +737,32 @@ pub fn combine_section_blocks(texts: &[String], config: &ScanConfig, strip_confl
 
     // Section 1: Scene / Environment & Shared Framing
     let mut header_items = [raw(&quality), raw(&count_tokens), raw(&interaction), raw(&footer)].concat();
-    if let Some(sen) = sentence.map(str::trim).filter(|s| !s.is_empty()) {
-        header_items.push(sen.to_string());
+    let has_clause = footer.iter().any(|t| slot(t) == Slot::Clause);
+    let auto_prose = if sentence.map(str::trim).filter(|s| !s.is_empty()).is_none()
+        && !has_clause
+        && (config.natural || !combined_scene_raw.trim().is_empty())
+        && config.checkpoint.supports_natural_language()
+        && !blocks.is_empty()
+    {
+        let mut combined_tokens = footer.clone();
+        combined_tokens.extend(blocks[0].clone());
+        let p = crate::scene::synthesize_natural_prose(&combined_tokens);
+        if p.is_empty() { None } else { Some(p) }
+    } else {
+        None
+    };
+    let effective_sentence = sentence
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or(auto_prose.as_deref());
+    if let Some(sen) = effective_sentence {
+        if !header_items.iter().any(|h| h == sen) {
+            header_items.push(sen.to_string());
+        }
     }
     let header_text = header_items.into_iter().filter(|s| !s.trim().is_empty()).collect::<Vec<_>>().join(", ");
     if !header_text.is_empty() {
-        let title = if n > 1 {
-            "[Scene / Environment & Shared Framing]:"
-        } else {
-            "[Scene / Environment & Framing]:"
-        };
+        let title = "[Scene / Environment & Shared Framing]:";
         sections.push(format!("{title}\n{header_text}"));
     }
 
@@ -728,16 +808,16 @@ pub fn combine_section_blocks(texts: &[String], config: &ScanConfig, strip_confl
             let mut remaining = Vec::new();
             for tok in parse_prompt(&b) {
                 let norm = tok.normalized.as_str();
-                if count_tag(norm).is_some() {
+                if count_tag(norm).is_some() || norm == "solo" {
                     continue;
                 }
                 remaining.push(tok.raw);
             }
             let b_clean = remaining.join(", ");
             if b_clean.is_empty() {
-                format!("1{}", noun(i))
+                format!("1{}, solo", noun(i))
             } else {
-                format!("1{}, {b_clean}", noun(i))
+                format!("1{}, solo, {b_clean}", noun(i))
             }
         };
         if !char_content.trim().is_empty() {

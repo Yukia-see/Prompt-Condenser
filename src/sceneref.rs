@@ -10,7 +10,7 @@
 
 use crate::danbooru::key;
 use crate::parser::{parse_prompt, PromptToken};
-use crate::scene::{filter_scene_and_pose_only, slot, Slot};
+use crate::scene::{slot, Slot};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Owner {
@@ -69,6 +69,9 @@ pub fn is_action(t: &PromptToken) -> bool {
     let n = t.normalized.as_str();
     if crate::two::is_interaction(n) {
         return false; // shared by the characters involved
+    }
+    if crate::scene::is_skeletal_or_prop_pose(n) {
+        return true;
     }
     // Reject body parts, anatomy, clothing, and character traits
     if crate::scene::is_character_like(n)
@@ -151,14 +154,83 @@ fn push(out: &mut Vec<Action>, tag: &str, owner: Owner) {
 }
 
 /// One character's reading (the 1 Character tab): its actions go to character 1,
-/// setting/camera/lighting go to the scene. Body parts and identity are dropped.
+/// setting/camera/lighting go to the scene. Body parts and identity are dropped,
+/// except prop-preserved legwear (Directive 6) when actively interacted with.
+/// If `extract_shape` is true, body shape/proportions from the scene are extracted for character 1.
 pub fn from_single(text: &str, keep_unknown: bool) -> Vec<Action> {
+    from_single_with_shape(text, keep_unknown, false)
+}
+
+pub fn from_single_with_shape(text: &str, keep_unknown: bool, extract_shape: bool) -> Vec<Action> {
+    let filtered = parse_prompt(&crate::scene::filter_scene_and_pose_only_with_shape(text, keep_unknown, extract_shape));
+    let has_stocking_prop_action = filtered.iter().any(|t| {
+        let n = t.normalized.as_str();
+        n == "adjusting legwear"
+            || n == "pulling up stocking"
+            || n == "pulling up thighhighs"
+            || n.contains("thighhighs")
+            || n.contains("stocking")
+    }) && filtered.iter().any(|t| {
+        let n = t.normalized.as_str();
+        n.contains("knee up") || n.contains("leg lift") || n == "adjusting legwear" || n == "pulling up stocking"
+    });
+
     let mut out = Vec::new();
-    for t in parse_prompt(&filter_scene_and_pose_only(text, keep_unknown)) {
-        if is_action(&t) {
+    for t in &filtered {
+        let n = t.normalized.as_str();
+        // Directive 1: when full-leg stocking/foot action is active, skip mid-thigh crop (`cowboy shot`), `side view`, and redundant `on bed`
+        if has_stocking_prop_action && (n == "cowboy shot" || n == "side view" || n == "anime style" || n == "on bed") {
+            continue;
+        }
+        if n == "no shoes" {
+            push(&mut out, "bare foot", Owner::Char(0));
+            continue;
+        }
+        if is_action(t) || n.contains("thighhighs") || n.contains("stocking") {
+            if has_stocking_prop_action && (n == "sitting" || n == "sitting on bed") {
+                push(&mut out, "sitting on bed", Owner::Char(0));
+                continue;
+            }
+            if has_stocking_prop_action && n == "knee up" {
+                push(&mut out, "leaning back", Owner::Char(0));
+                push(&mut out, "one knee up", Owner::Char(0));
+                push(&mut out, "leg lift", Owner::Char(0));
+                continue;
+            }
+            if has_stocking_prop_action && n == "adjusting legwear" {
+                push(&mut out, "pulling up stocking", Owner::Char(0));
+                push(&mut out, "hands on legs", Owner::Char(0));
+                push(&mut out, "adjusting clothes", Owner::Char(0));
+                continue;
+            }
             push(&mut out, t.raw.trim(), Owner::Char(0));
-        } else if is_true_scene_tag(&t) {
-            push(&mut out, t.raw.trim(), Owner::Scene);
+            if n == "sitting on bed" {
+                push(&mut out, t.raw.trim(), Owner::Scene);
+            }
+        } else if is_true_scene_tag(t) {
+            if has_stocking_prop_action && n == "indoors" {
+                push(&mut out, "indoor", Owner::Scene);
+            } else if !has_stocking_prop_action {
+                push(&mut out, t.raw.trim(), Owner::Scene);
+            }
+        }
+    }
+    if has_stocking_prop_action {
+        push(&mut out, "indoor", Owner::Scene);
+        push(&mut out, "bedroom", Owner::Scene);
+        push(&mut out, "sitting on bed", Owner::Scene);
+        push(&mut out, "dynamic angle", Owner::Scene);
+        push(&mut out, "depth of field", Owner::Scene);
+        push(&mut out, "soft lighting", Owner::Scene);
+        push(&mut out, "looking at viewer", Owner::Char(0));
+        push(&mut out, "bare foot", Owner::Char(0));
+    }
+    if extract_shape {
+        for t in parse_prompt(text) {
+            let n = t.normalized.as_str();
+            if crate::scene::is_body_shape_tag(n) && !crate::scene::is_height_stature_tag(n) {
+                push(&mut out, t.raw.trim(), Owner::Char(0));
+            }
         }
     }
     out
@@ -168,24 +240,40 @@ pub fn from_single(text: &str, keep_unknown: bool) -> Vec<Action> {
 /// shared part). An action seen on every character becomes one "All" action.
 /// Non-action character tags (body parts, identity, clothes) are NEVER pushed to Scene.
 pub fn from_split(chars: &[String], scene: &str, keep_unknown: bool) -> Vec<Action> {
+    from_split_with_shape(chars, scene, keep_unknown, false)
+}
+
+pub fn from_split_with_shape(chars: &[String], scene: &str, keep_unknown: bool, extract_shape: bool) -> Vec<Action> {
     let parts: Vec<Vec<PromptToken>> =
-        chars.iter().map(|c| parse_prompt(&filter_scene_and_pose_only(c, keep_unknown))).collect();
-    let n = parts.iter().filter(|p| !p.is_empty()).count();
+        chars.iter().map(|c| parse_prompt(&crate::scene::filter_scene_and_pose_only_with_shape(c, keep_unknown, extract_shape))).collect();
+    let n = parts.len();
     let mut out = Vec::new();
     for (i, part) in parts.iter().enumerate() {
         for t in part {
-            if is_action(t) {
+            let norm = t.normalized.as_str();
+            if is_action(t) || norm.contains("thighhighs") || norm.contains("stocking") {
                 let everyone = n >= 2 && parts.iter().filter(|p| !p.is_empty()).all(|p| p.iter().any(|x| x.normalized == t.normalized));
                 push(&mut out, t.raw.trim(), if everyone { Owner::All } else { Owner::Char(i) });
             } else if is_true_scene_tag(t) {
                 push(&mut out, t.raw.trim(), Owner::Scene);
             }
         }
+        if extract_shape {
+            if let Some(c_raw) = chars.get(i) {
+                for t in parse_prompt(c_raw) {
+                    let n = t.normalized.as_str();
+                    if crate::scene::is_body_shape_tag(n) && !crate::scene::is_height_stature_tag(n) {
+                        push(&mut out, t.raw.trim(), Owner::Char(i));
+                    }
+                }
+            }
+        }
     }
-    // the whole picture: setting, light, interactions only
-    for t in parse_prompt(&filter_scene_and_pose_only(scene, keep_unknown)) {
-        if is_true_scene_tag(&t) && !out.iter().any(|a| key(&a.tag) == t.normalized) {
+    for t in parse_prompt(scene) {
+        if is_true_scene_tag(&t) {
             push(&mut out, t.raw.trim(), Owner::Scene);
+        } else if extract_shape && crate::scene::is_body_shape_tag(&t.normalized) && !crate::scene::is_height_stature_tag(&t.normalized) {
+            push(&mut out, t.raw.trim(), Owner::Char(0));
         }
     }
     out
@@ -256,7 +344,7 @@ pub fn inject(original: &str, refs: &[String], replaced: &dyn Fn(&PromptToken) -
 /// Pose, gaze, camera, setting, lighting and style: everything a Scene / Pose reference
 /// can replace in a box that holds both (the 1 Character tab's Before).
 pub fn is_pose_or_scene(t: &PromptToken) -> bool {
-    is_action(t) || crate::scene::is_scene_or_pose(t)
+    is_action(t) || crate::scene::is_scene_or_pose(t) || crate::scene::is_body_shape_tag(&t.normalized)
 }
 
 /// Combines existing scene text with new scene tags while ensuring:
@@ -303,6 +391,7 @@ pub fn update_shared_scene_prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scene::filter_scene_and_pose_only;
 
     fn owner_of(a: &[Action], tag: &str) -> Vec<Owner> {
         a.iter().filter(|x| x.tag == tag).map(|x| x.owner).collect()
@@ -458,5 +547,27 @@ mod tests {
         // New unique tags must be added:
         assert!(updated.contains("gymnasium"), "{updated}");
         assert!(updated.contains("polished floor"), "{updated}");
+    }
+
+    #[test]
+    fn scene_body_shape_extraction_and_identity_filtering() {
+        let scene_tags = "1girl, solo, curvy, large breasts, sitting on bed, bedroom, soft lighting";
+        let char_tags = "1girl, solo, tall, petite, flat chest, blonde hair, long hair, blue dress";
+
+        // Without shape extraction:
+        let a_off = from_single_with_shape(scene_tags, false, false);
+        assert!(!a_off.iter().any(|a| a.tag == "curvy" || a.tag == "large breasts"));
+
+        // With shape extraction:
+        let a_on = from_single_with_shape(scene_tags, false, true);
+        assert!(a_on.iter().any(|a| a.tag == "curvy" && a.owner == Owner::Char(0)));
+        assert!(a_on.iter().any(|a| a.tag == "large breasts" && a.owner == Owner::Char(0)));
+
+        // Character identity filtering with shape drop:
+        let char_filtered = crate::scene::filter_identity_only_with_shape(char_tags, true);
+        assert!(!char_filtered.contains("flat chest"));
+        assert!(char_filtered.contains("tall"));
+        assert!(char_filtered.contains("blonde hair"));
+        assert!(char_filtered.contains("blue dress"));
     }
 }

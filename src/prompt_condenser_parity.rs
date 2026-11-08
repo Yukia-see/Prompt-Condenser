@@ -1,0 +1,165 @@
+//! Python-vs-Rust parity: tests/parity.json is generated from the Python reference
+//! (tools/gen_parity.py). Every case must produce identical output in Rust.
+//!
+//! Test-only module. In your app add to main.rs / lib.rs:
+//!     mod prompt_condenser;
+//!     #[cfg(test)] mod prompt_condenser_parity;
+//! and keep tests/parity.json next to your Cargo.toml.
+
+use crate::prompt_condenser::json::{self, Value};
+use crate::prompt_condenser::*;
+use std::collections::HashSet;
+
+fn s(v: &Value, key: &str) -> String {
+    match v.get(key) {
+        Some(Value::Str(x)) => x.clone(),
+        other => panic!("missing string {}: {:?}", key, other),
+    }
+}
+
+fn list(v: &Value, key: &str) -> Vec<String> {
+    match v.get(key) {
+        Some(Value::Arr(items)) => items
+            .iter()
+            .map(|i| match i {
+                Value::Str(x) => x.clone(),
+                other => panic!("non-string in {}: {:?}", key, other),
+            })
+            .collect(),
+        other => panic!("missing list {}: {:?}", key, other),
+    }
+}
+
+fn set(v: &Value, key: &str) -> HashSet<String> {
+    list(v, key).into_iter().collect()
+}
+
+fn mode(v: &Value) -> Mode {
+    Mode::parse(&s(v, "mode")).unwrap()
+}
+
+fn cases<'a>(root: &'a Value, name: &str) -> &'a Vec<Value> {
+    match root.get(name) {
+        Some(Value::Arr(a)) => a,
+        other => panic!("missing cases {}: {:?}", name, other),
+    }
+}
+
+#[test]
+fn rust_matches_python_reference() {
+    let root = json::parse(include_str!("../tests/parity.json")).expect("parity.json");
+    let mut failures: Vec<String> = Vec::new();
+    let mut total = 0usize;
+    let mut check = |group: &str, input: String, got: String, want: String| {
+        total += 1;
+        if got != want {
+            failures.push(format!("[{}] input: {}\n  rust:   {}\n  python: {}", group, input, got, want));
+        }
+    };
+
+    for c in cases(&root, "router") {
+        let (p1, p2) = sort_tag_lists(&s(c, "wd"), mode(c));
+        let want = c.get("expect").unwrap();
+        check(
+            "router",
+            format!("{:?} {:?}", s(c, "wd"), s(c, "mode")),
+            format!("{} | {}", p1.join(", "), p2.join(", ")),
+            format!("{} | {}", s(want, "pass1_tags"), s(want, "pass2_tags")),
+        );
+    }
+
+    for c in cases(&root, "analyze") {
+        let v = set(c, "vocab");
+        let a = analyze_prose_with_vocab(&s(c, "text"), &v);
+        let want = c.get("expect").unwrap();
+        let fmt = |tags: &[String], strong: Vec<String>, weak: Vec<String>, neg: &[String]| {
+            format!("{:?} {:?} {:?} {:?}", tags, strong, weak, neg)
+        };
+        check(
+            "analyze",
+            s(c, "text"),
+            fmt(&a.tags, a.strong.iter().cloned().collect(), a.weak.iter().cloned().collect(), &a.negated),
+            fmt(&list(want, "tags"), list(want, "strong"), list(want, "weak"), &list(want, "negated")),
+        );
+    }
+
+    for c in cases(&root, "merge") {
+        let v = set(c, "vocab");
+        let m = merge_tags(&s(c, "wd"), &s(c, "md1"), &s(c, "md2"), mode(c), Some(&v));
+        let want = c.get("expect").unwrap();
+        let fmt = |a: &[String], b: &[String], sub: &[String], dm: &[String], dw: &[String], dh: &[String], n: &[String], u: &[String]| {
+            format!("{:?}\n{:?}\n{:?}\n{:?}\n{:?}\n{:?}\n{:?}\n{:?}", a, b, sub, dm, dw, dh, n, u)
+        };
+        check(
+            "merge",
+            format!("wd={:?} md1={:?} md2={:?} mode={:?} vocab={:?}", s(c, "wd"), s(c, "md1"), s(c, "md2"), s(c, "mode"), list(c, "vocab")),
+            fmt(&m.pass1_tags, &m.pass2_tags, &m.subject_tags, &m.dropped_moondream, &m.dropped_wd14, &m.dropped_hedged, &m.negated_moondream, &m.unrouted_wd14),
+            fmt(
+                &list(want, "pass1_tags"),
+                &list(want, "pass2_tags"),
+                &list(want, "subject_tags"),
+                &list(want, "dropped_moondream"),
+                &list(want, "dropped_wd14"),
+                &list(want, "dropped_hedged"),
+                &list(want, "negated_moondream"),
+                &list(want, "unrouted_wd14"),
+            ),
+        );
+    }
+
+    for c in cases(&root, "nollm") {
+        let v = set(c, "vocab");
+        let keep = matches!(c.get("keep"), Some(Value::Bool(true)));
+        let cfg = Config { keep_unmatched_prose: keep, ..Config::default() };
+        let out = process_direct(&s(c, "wd"), &s(c, "md1"), &s(c, "md2"), mode(c), Some(&v), &cfg);
+        let want = c.get("expect").unwrap();
+        check(
+            "nollm",
+            format!("wd={:?} md1={:?} md2={:?} mode={:?} keep={}", s(c, "wd"), s(c, "md1"), s(c, "md2"), s(c, "mode"), keep),
+            format!("{}\n{}", out.scene_prompt, out.character_prompt),
+            format!("{}\n{}", s(want, "scene_prompt"), s(want, "character_prompt")),
+        );
+    }
+
+    for c in cases(&root, "parse") {
+        let out = parse_gemma_json_response(&s(c, "raw"), &Config::default());
+        let want = c.get("expect").unwrap();
+        check(
+            "parse",
+            format!("{:?}", s(c, "raw")),
+            format!("{:?} | {:?}", out.scene_prompt, out.character_prompt),
+            format!("{:?} | {:?}", s(want, "scene_prompt"), s(want, "character_prompt")),
+        );
+    }
+
+    for c in cases(&root, "flatten") {
+        check("flatten", format!("{:?}", s(c, "text")), flatten_zones(&s(c, "text")), s(c, "expect"));
+    }
+
+    for c in cases(&root, "style") {
+        check("style", format!("{:?}", s(c, "text")), style_tags(&s(c, "text"), true), s(c, "expect"));
+    }
+
+    for c in cases(&root, "payload") {
+        let v = set(c, "vocab");
+        let vision = matches!(c.get("vision"), Some(Value::Bool(true)));
+        let p = build_payload(&s(c, "wd"), &s(c, "md1"), &s(c, "md2"), mode(c), Some(&v), vision);
+        check(
+            "payload",
+            format!("wd={:?} md1={:?} md2={:?} mode={:?} vision={}", s(c, "wd"), s(c, "md1"), s(c, "md2"), s(c, "mode"), vision),
+            payload_to_text(&p),
+            s(c, "expect"),
+        );
+    }
+
+    let shown: Vec<&String> = failures.iter().take(5).collect();
+    assert!(
+        failures.is_empty(),
+        "{} of {} parity cases differ from the Python reference. First {}:\n\n{}",
+        failures.len(),
+        total,
+        shown.len(),
+        shown.iter().map(|f| f.as_str()).collect::<Vec<_>>().join("\n\n")
+    );
+    println!("parity: all {} cases match the Python reference", total);
+}

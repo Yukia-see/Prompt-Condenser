@@ -110,9 +110,16 @@ pub fn tag_one_fast(path: &Path, progress: &(dyn Fn(String) + Sync)) -> Result<V
         return tag_one(path, progress);
     }
     let image = image::open(path).with_context(|| format!("Couldn't open {}", path.display()))?;
-    let boxes = detector::detect(&image).unwrap_or_default();
+    let mut boxes = detector::detect(&image).unwrap_or_default();
     if boxes.is_empty() {
-        return tagger::tag_dynamic(&image);
+        // Fallback to full-frame bounding box when anime person detector finds no box (e.g. realistic/cosplay photos)
+        boxes.push(PersonBox {
+            x0: 0.0,
+            y0: 0.0,
+            x1: image.width() as f32,
+            y1: image.height() as f32,
+            score: 1.0,
+        });
     }
     let full = tagger::tag_dynamic(&image)?;
     if boxes.len() == 1 {
@@ -120,10 +127,18 @@ pub fn tag_one_fast(path: &Path, progress: &(dyn Fn(String) + Sync)) -> Result<V
         let up = detector::upper_crop(&image, main);
         let is_tall = (main.y1 - main.y0) / (image.height() as f32).max(1.0) >= 0.35;
         if is_tall {
+            let mid = detector::middle_crop(&image, main);
             let low = detector::lower_crop(&image, main);
-            let mut tags = [&up, &low].iter().map(|v| tagger::tag_dynamic(v)).collect::<Result<Vec<_>>>()?.into_iter();
-            let (up_detail, low_detail) = (tags.next().unwrap_or_default(), tags.next().unwrap_or_default());
+            let mut tags = [&up, &mid, &low]
+                .iter()
+                .map(|v| tagger::tag_dynamic(v))
+                .collect::<Result<Vec<_>>>()?
+                .into_iter();
+            let up_detail = tags.next().unwrap_or_default();
+            let mid_detail = tags.next().unwrap_or_default();
+            let low_detail = tags.next().unwrap_or_default();
             let merged = tagger::merge_detail_crop(&full, &up_detail);
+            let merged = tagger::merge_detail_crop(&merged, &mid_detail);
             return Ok(tagger::merge_detail_crop(&merged, &low_detail));
         } else {
             let detail = tagger::tag_dynamic(&up)?;
@@ -385,6 +400,10 @@ pub fn clean_list(text: &str, is_scene_list: bool) -> String {
         .join(", ");
     parse_prompt(&text)
         .into_iter()
+        .filter(|t| {
+            let l = t.raw.to_lowercase();
+            !t.normalized.ends_with(" flag") && !t.normalized.ends_with("_flag") && !t.normalized.contains("flag") && !l.contains("flag")
+        })
         .filter(|t| t.category != crate::parser::TokenCategory::QualityMeta && t.normalized != "solo")
         .filter(|t| match count_tag(&t.normalized) {
             Some((1, _)) => !is_scene_list,
@@ -522,6 +541,7 @@ mod tests {
                 vision_encoder: Some("moondream:1.8b".into()),
                 mode: crate::profiles::AiMode::Gpu, split: ts.clone(), hints: rules,
                 second_pass_vision: false,
+                scene_body_shape: false,
             }).unwrap();
             let ai = settle(ai, &ts2, 0.35);
             println!("AI ({:.0}s) who: {who}", t.elapsed().as_secs_f32());

@@ -60,9 +60,10 @@ impl CheckpointProfile {
     pub fn system_prompt_rules(&self) -> &'static str {
         match self {
             Self::Anima => {
-                "Anima uses 'masterpiece, best quality' at the start, followed by clean comma-separated Danbooru tags \
-                 and concise descriptive tag phrases for subject, traits, pose, emphasized body features, clothing, and \
-                 scene (no Pony score_9 tags). Use (feature:weight) up to 1.35 for emphasized parts."
+                "Anima uses 'masterpiece, best quality' at the start, followed by clean comma-separated canonical Danbooru tags \
+                 (always spaces instead of underscores, and no inline (tag:weight) syntax unless explicitly pinned) and 1-2 \
+                 concise natural-language sentences in the Scene block locking subject, primary verb/posture, environment, and \
+                 clothing layers (no Pony score_9 tags)."
             }
             Self::PonyV6 => {
                 "Pony V6 XL requires 'score_9, score_8_up, score_7_up' at the very start. \
@@ -212,7 +213,7 @@ impl TargetView {
             Self::Turnaround360 => "close-up, cropped, out of frame, blurry background, depth of field, dutch angle",
             Self::UpperBody => "full body, lower body, feet, shoes",
             Self::CloseUpPortrait => "full body, lower body, wide shot, distant",
-            Self::FrontView => "from behind, back view",
+            Self::FrontView => "from behind, back view, rear view, over the shoulder, looking back",
             Self::FromBehind => "front view",
             Self::SideProfile => "front view, from behind",
             Self::FullBody => "close-up, portrait, cropped, out of frame, head out of frame, feet out of frame",

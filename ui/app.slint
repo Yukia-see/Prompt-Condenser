@@ -1306,10 +1306,20 @@ export component AppWindow inherits Window {
     callback load_image_requested();
     callback remove_image_requested();
     callback image_mode_changed();
+    in-out property <bool> enable_dual_pass: true;       // Dual-pass Moondream + WD14
+    callback dual_pass_changed();
+    in-out property <int> dual_pass_mode_index: 0;      // 0: Scene + Body Shape (Mode A), 1: Scene + Skeletal Pose (Mode B)
+    in-out property <[string]> dual_pass_mode_labels: ["Scene + Body Shape (Mode A)", "Scene + Skeletal Pose (Mode B)"];
+    callback dual_pass_mode_changed();
+    in-out property <bool> use_llm_synthesis: true;     // LLM Tag Synthesis (Gemma 4 12B)
+    callback llm_synthesis_changed();
+    in-out property <string> pipeline_warnings: "";     // Pipeline fallback warnings (e.g. Ollama unreachable)
     in-out property <bool> image_identity_only: false;   // images supply only who + outfit
     callback identity_changed();
-    in-out property <bool> image_second_pass: true;     // 2nd pass visual check with vision-capable model
+    in-out property <bool> image_second_pass: false;    // 2nd pass visual check with vision-capable model
     callback second_pass_changed();
+    in-out property <bool> scene_body_shape: false;     // swap body shape from scene reference, keep outfit/height/face
+    callback scene_body_shape_changed();
     callback read_image_requested();
     callback redo_image_requested();
     in-out property <bool> images_pending: false;   // reference images picked, not read yet
@@ -1631,8 +1641,8 @@ export component AppWindow inherits Window {
                     }
                 }
 
-                // ---- FULL-WIDTH SHARED PROMPT ROW (Matches BOOST length above it)
-                if root.app_tab >= 1 : HorizontalLayout {
+                // ---- FULL-WIDTH SHARED PROMPT ROW (Matches BOOST length above it, available on 1-4 Characters)
+                HorizontalLayout {
                     spacing: 8px;
                     SectionLabel {
                         width: 118px;
@@ -1900,6 +1910,25 @@ export component AppWindow inherits Window {
                                 clicked => { root.image_use_ai = true; root.image_mode_changed(); }
                             }
                             FilterChip {
+                                text: "Dual-Pass Vision";
+                                checked <=> root.enable_dual_pass;
+                                enabled: !root.tagger_busy;
+                                toggled => { root.dual_pass_changed(); }
+                            }
+                            if root.enable_dual_pass : ComboBox {
+                                width: 175px;
+                                model: root.dual_pass_mode_labels;
+                                current-index <=> root.dual_pass_mode_index;
+                                enabled: !root.tagger_busy;
+                                selected => { root.dual_pass_mode_changed(); }
+                            }
+                            if root.enable_dual_pass : FilterChip {
+                                text: "LLM Synthesis";
+                                checked <=> root.use_llm_synthesis;
+                                enabled: !root.tagger_busy;
+                                toggled => { root.llm_synthesis_changed(); }
+                            }
+                            FilterChip {
                                 text: "Identity Only";
                                 checked <=> root.image_identity_only;
                                 enabled: !root.tagger_busy;
@@ -1908,8 +1937,52 @@ export component AppWindow inherits Window {
                             FilterChip {
                                 text: "2nd Pass Visual Check";
                                 checked <=> root.image_second_pass;
-                                enabled: !root.tagger_busy;
+                                enabled: !root.tagger_busy && (!root.enable_dual_pass || root.use_llm_synthesis);
                                 toggled => { root.second_pass_changed(); }
+                            }
+                            if !root.enable_dual_pass : FilterChip {
+                                text: "Scene Body Shape";
+                                checked <=> root.scene_body_shape;
+                                enabled: !root.tagger_busy;
+                                toggled => { root.scene_body_shape_changed(); }
+                            }
+                        }
+                    }
+
+                    // Dual-pass / pipeline warnings notice area
+                    if root.pipeline_warnings != "" : Rectangle {
+                        background: #ffb4a924;
+                        border-radius: 6px;
+                        border-width: 1px;
+                        border-color: M3.error;
+                        HorizontalLayout {
+                            padding-left: 10px;
+                            padding-right: 10px;
+                            padding-top: 6px;
+                            padding-bottom: 6px;
+                            spacing: 8px;
+                            alignment: start;
+                            Text {
+                                text: "⚠ Pipeline Notice: " + root.pipeline_warnings;
+                                font-size: 11px;
+                                color: M3.error;
+                                overflow: elide;
+                                vertical-alignment: center;
+                            }
+                            Rectangle { horizontal-stretch: 1; }
+                            TouchArea {
+                                width: 20px;
+                                height: 20px;
+                                mouse-cursor: MouseCursor.pointer;
+                                clicked => { root.pipeline_warnings = ""; }
+                                Text {
+                                    text: "✕";
+                                    font-size: 12px;
+                                    font-weight: 700;
+                                    color: M3.error;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
                             }
                         }
                     }

@@ -449,6 +449,229 @@ pub fn estimate_clip_tokens(prompt: &str) -> (usize, usize) {
     (estimated_tokens, chunks)
 }
 
+/// Sanitizes scanner/raw tags and injects structural audit flags before the LLM pass.
+#[derive(Debug, Clone)]
+pub struct AntigravityTagFilter {
+    pub wide_shots: Vec<&'static str>,
+    pub close_shots: Vec<&'static str>,
+    pub tops: Vec<&'static str>,
+    pub bottoms: Vec<&'static str>,
+    pub static_poses: Vec<&'static str>,
+    pub limb_anchors: Vec<&'static str>,
+    pub archetype_overrides: Vec<&'static str>,
+    pub uniforms: Vec<&'static str>,
+}
+
+impl Default for AntigravityTagFilter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AntigravityTagFilter {
+    pub fn new() -> Self {
+        Self {
+            wide_shots: vec!["full body", "cowboy shot", "wide shot"],
+            close_shots: vec!["close-up", "portrait", "upper body", "face focus"],
+            tops: vec![
+                "bra_top",
+                "bra top",
+                "shirt",
+                "jacket",
+                "tank top",
+                "camisole",
+                "bikini top",
+                "blue bikini",
+                "wearing a blue bikini",
+                "spaghetti strap",
+                "clothes writing",
+                "text on clothes",
+                "print shirt",
+                "tube top",
+                "crop top",
+                "halterneck",
+                "bandeau",
+                "sweater",
+                "hoodie",
+            ],
+            bottoms: vec![
+                "pants",
+                "skirt",
+                "shorts",
+                "bikini bottoms",
+                "panties",
+                "underwear",
+                "dress",
+                "jeans",
+                "leggings",
+            ],
+            static_poses: vec!["standing", "sitting", "kneeling"],
+            limb_anchors: vec![
+                "hand",
+                "hands",
+                "arm",
+                "arms",
+                "holding",
+                "reaching",
+                "pulling",
+                "adjusting",
+                "crossed",
+                "lap",
+                "hips",
+            ],
+            archetype_overrides: vec!["bunny girl", "cat girl", "fox girl"],
+            uniforms: vec![
+                "maid",
+                "maid outfit",
+                "plaid dress",
+                "school uniform",
+                "serafuku",
+                "suit",
+            ],
+        }
+    }
+
+    /// Sanitizes scanner tags and injects structural audit flags for the LLM pass.
+    pub fn process_tags(&self, raw_tag_string: &str) -> String {
+        if raw_tag_string.trim().is_empty() {
+            return String::new();
+        }
+        // 1. Normalize and strip inline weights/parentheses
+        let raw_list: Vec<String> = raw_tag_string
+            .split(',')
+            .map(|t| t.trim().to_lowercase())
+            .filter(|t| !t.is_empty())
+            .collect();
+        let mut tags: Vec<String> = Vec::new();
+        for tag in raw_list {
+            let clean = if tag.starts_with('<') && tag.ends_with('>') {
+                tag
+            } else {
+                tag.replace('(', "")
+                    .replace(')', "")
+                    .split(':')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_string()
+            };
+            if !clean.is_empty() && !tags.contains(&clean) {
+                tags.push(clean);
+            }
+        }
+
+        // 2. Implicit Full-Body Inference (Footwear/Legwear Trigger)
+        let footwear_triggers = [
+            "thighhighs",
+            "stocking",
+            "stockings",
+            "kneehighs",
+            "mary janes",
+            "boots",
+            "heels",
+            "barefoot",
+            "bare foot",
+            "sandals",
+        ];
+        if tags
+            .iter()
+            .any(|t| footwear_triggers.iter().any(|fw| t.contains(fw)))
+        {
+            let has_framing = tags.iter().any(|t| {
+                self.wide_shots.contains(&t.as_str()) || self.close_shots.contains(&t.as_str())
+            });
+            if !has_framing {
+                tags.insert(0, "full body".to_string());
+            }
+        }
+
+        // 3. Camera Paradox Resolution (Wide overrides Close)
+        let has_wide = tags.iter().any(|t| self.wide_shots.contains(&t.as_str()));
+        if has_wide {
+            tags.retain(|t| !self.close_shots.contains(&t.as_str()));
+        }
+        let has_close = tags.iter().any(|t| self.close_shots.contains(&t.as_str()));
+
+        // 4. Archetype vs. Uniform Collision Purge
+        if tags
+            .iter()
+            .any(|t| self.uniforms.iter().any(|u| t.contains(u)))
+        {
+            tags.retain(|t| !self.archetype_overrides.contains(&t.as_str()));
+        }
+
+        // 5. Bottomless Hazard Flagging
+        let has_static = tags
+            .iter()
+            .any(|t| self.static_poses.contains(&t.as_str()) || t.starts_with("sitting "));
+        let has_top = tags
+            .iter()
+            .any(|t| self.tops.iter().any(|top| t.contains(top)));
+        let has_bottom = tags
+            .iter()
+            .any(|t| self.bottoms.iter().any(|bot| t.contains(bot)));
+        if (has_wide || (has_static && !has_close)) && has_top && !has_bottom {
+            tags.push("MISSING_BOTTOMS_FLAG".to_string());
+        }
+
+        // 6. Unrouted Limb Flagging
+        let has_limb_anchor = tags
+            .iter()
+            .any(|t| self.limb_anchors.iter().any(|limb| t.contains(limb)));
+        if has_static && !has_limb_anchor {
+            tags.push("UNANCHORED_LIMBS_FLAG".to_string());
+        }
+
+        tags.join(", ")
+    }
+
+    /// Resolves internal flags according to Directive 3 and strips all internal `*_FLAG` tokens.
+    pub fn resolve_and_strip_flags(&self, prompt: &str) -> String {
+        let mut tokens: Vec<String> = prompt
+            .split(',')
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .collect();
+        let has_missing_bottoms = tokens.iter().any(|t| t == "MISSING_BOTTOMS_FLAG");
+
+        tokens.retain(|t| {
+            let l = t.to_lowercase();
+            !l.ends_with("_flag") && !l.ends_with(" flag") && !l.contains("flag")
+        });
+
+        if has_missing_bottoms {
+            let has_bot = tokens.iter().any(|t| {
+                let l = t.to_lowercase();
+                self.bottoms.iter().any(|b| l.contains(b))
+            });
+            if !has_bot {
+                let is_blue = tokens.iter().any(|t| {
+                    let l = t.to_lowercase();
+                    l.contains("blue") || l.contains("tube top")
+                });
+                if is_blue {
+                    tokens.push("light blue bikini bottoms".to_string());
+                } else {
+                    tokens.push("denim shorts".to_string());
+                }
+            }
+            let has_feet = tokens.iter().any(|t| {
+                let l = t.to_lowercase();
+                l.contains("barefoot")
+                    || l.contains("bare foot")
+                    || l.contains("shoes")
+                    || l.contains("sandals")
+                    || l.contains("boots")
+            });
+            if !has_feet {
+                tokens.push("bare foot".to_string());
+            }
+        }
+
+        tokens.join(", ")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -509,5 +732,20 @@ mod tests {
         assert_eq!(estimate_clip_tokens(""), (0, 0));
         let long = vec!["tag"; 100].join(", ");
         assert_eq!(estimate_clip_tokens(&long).1, 2);
+    }
+
+    #[test]
+    fn antigravity_tag_filter_rules() {
+        let filter = AntigravityTagFilter::new();
+        // Footwear triggers full body, wide overrides close, uniform purges bunny girl,
+        // wide + top without bottom flags MISSING_BOTTOMS_FLAG, static without limb flags UNANCHORED_LIMBS_FLAG
+        let out = filter.process_tags("(1girl:1.2), bunny girl, maid, white shirt, thighhighs, standing");
+        assert_eq!(
+            out,
+            "full body, 1girl, maid, white shirt, thighhighs, standing, MISSING_BOTTOMS_FLAG, UNANCHORED_LIMBS_FLAG"
+        );
+        // Wide overrides close
+        let out2 = filter.process_tags("full body, upper body, portrait, 1girl, shirt, skirt, sitting, hands in lap");
+        assert_eq!(out2, "full body, 1girl, shirt, skirt, sitting, hands in lap");
     }
 }

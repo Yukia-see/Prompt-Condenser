@@ -493,8 +493,13 @@ pub fn recommended_negative(config: &ScanConfig, positive: &str) -> String {
     if config.checkpoint.default_negative().is_empty() {
         return String::new();
     }
-    let view_negs = config.target_view.negative_tags();
     let pos_tokens = parse_prompt(positive);
+    let view_negs = if config.target_view != crate::profiles::TargetView::None {
+        config.target_view.negative_tags()
+    } else {
+        let eff = crate::analyzer::detect_effective_view(&pos_tokens, crate::profiles::TargetView::None);
+        eff.negative_tags()
+    };
     let prop_tiers = crate::analyzer::detect_all_proportion_tiers(&pos_tokens);
     let mut auto_negs: Vec<String> = Vec::new();
 
@@ -618,4 +623,42 @@ pub fn marked_tags(markdown: &str, kind: Highlight) -> Vec<String> {
         rest = &rest[end..];
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn front_view_negative_detection_and_rear_suppression() {
+        use crate::analyzer::ScanConfig;
+        use crate::profiles::{CheckpointProfile, TargetView};
+        let cfg = ScanConfig {
+            checkpoint: CheckpointProfile::Anima,
+            target_view: TargetView::None,
+            pinned_emphasis_raw: String::new(),
+            emphasis_weight: 1.25,
+            cleanup_enabled: true,
+            resolve_conflicts_enabled: true,
+            clamp_weights_enabled: true,
+            camera_angle: 0,
+            pose: 0,
+            proportion: 0,
+            dynamic: false,
+            lora_tags_raw: String::new(),
+            arranged: false,
+            natural: false,
+            two_char: false,
+            char2_prompt_raw: String::new(),
+            char2_lora_tags_raw: String::new(),
+            char_break: true,
+            scene_prompt_raw: String::new(),
+            more_chars: Vec::new(),
+            detail: crate::profiles::DetailLevel::Balanced,
+        };
+        let prompt = "masterpiece, 1girl, solo, front view, sitting on bed";
+        let neg = recommended_negative(&cfg, prompt);
+        assert!(neg.contains("from behind") || neg.contains("back view") || neg.contains("rear view"), "{neg}");
+        assert!(neg.contains("over the shoulder"), "{neg}");
+    }
 }

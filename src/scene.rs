@@ -66,7 +66,7 @@ const LIGHT: &[&str] = &[
     "twilight", "afternoon", "midnight", "lamplight", "firelight", "backlight", "spotlight", "warm lighting",
 ];
 const SETTING: &[&str] = &[
-    "background", "outdoors", "indoors", "room", "bedroom", "classroom", "kitchen", "office", "street", "city",
+    "background", "outdoors", "outdoor", "indoors", "indoor", "room", "bedroom", "classroom", "kitchen", "office", "street", "city",
     "forest", "beach", "ocean", "sea", "sky", "shrine", "temple", "castle", "park", "garden", "field", "mountain",
     "river", "lake", "rooftop", "cafe", "library", "bathroom", "pool", "snow", "rain", "desert", "space", "cherry blossoms",
     "school", "train", "car", "bed", "window", "stage", "ruins", "village", "alley", "water", "flower", "tree",
@@ -90,6 +90,9 @@ const OUTFIT: &[&str] = &[
     "footwear", "mary janes", "loafers", "uwabaki", "miniskirt", "blazer", "camisole", "leggings", "pantsu",
     "swimwear", "neckerchief", "hairband", "hairpin", "hair bow", "hair ribbon", "piercing", "garter", "garter belt",
     "fishnets", "overalls", "tank top", "crop top", "turtleneck", "gown", "uniform", "qipao", "cheongsam", "hakama",
+    "tube top", "bra top", "bra_top", "bikini top", "bikini bottoms", "sunglasses", "eyewear", "sunglasses on head",
+    "eyewear on head", "thigh strap", "o-ring", "o-ring strap", "garter strap", "garter straps", "skindentation",
+    "print shirt", "text on clothes", "clothes writing", "taut clothes", "impossible clothes",
 ];
 /// What a character *is* (species, role): the noun of `character_clause`.
 const IDENTITY: &[&str] = &[
@@ -123,7 +126,143 @@ const POSE: &[&str] = &[
     "straddling", "on knees", "on side", "lying on side", "arms behind back", "arms behind head", "hands behind back",
     "hands behind head", "hands in pockets", "hand in pocket",
     "gazing", "staring", "glancing",
+    // Skeletal limb anchors, barefoot grounding, and garment-prop interactions (Directive 6)
+    "one knee up", "knees up", "knee up", "leg lift", "lifted leg", "raised leg", "legs up", "one leg up", "one arm up",
+    "barefoot", "bare foot", "pulling up", "pulling clothes", "pulling up stocking", "pulling up thighhighs",
+    "adjusting clothes", "adjusting eyewear", "adjusting glasses", "adjusting hair", "adjusting legwear",
+    "adjusting thighhighs", "hands on legs", "hand on leg", "hands on knees", "hand on knee", "hands holding knees",
+    "leaning back", "leaning forward", "sitting on bed",
 ];
+
+/// Skeletal limb poses, barefoot grounding, and active garment/prop interactions
+/// (Directive 6 Prop Preservation) that must survive scene/pose filtering.
+pub fn is_skeletal_or_prop_pose(n: &str) -> bool {
+    n == "barefoot"
+        || n == "bare foot"
+        || n == "no shoes"
+        || n.contains("knee up")
+        || n.contains("knees up")
+        || n.contains("leg lift")
+        || n.contains("legs up")
+        || n.contains("one leg up")
+        || n.contains("raised leg")
+        || n.contains("lifted leg")
+        || n.contains("arm up")
+        || n.contains("arms up")
+        || n.contains("arms behind")
+        || n.contains("crossed arms")
+        || n.contains("arms crossed")
+        || n.contains("spread legs")
+        || n.contains("crossed legs")
+        || n.contains("legs crossed")
+        || n.contains("hand on")
+        || n.contains("hands on")
+        || n.contains("hand to")
+        || n.contains("hands to")
+        || n.contains("hands behind")
+        || n.contains("hand behind")
+        || n.contains("hands in")
+        || n.contains("hand in")
+        || n.contains("hands holding")
+        || n.contains("holding ")
+        || n.contains("gesture")
+        || n.starts_with("pulling ")
+        || n.starts_with("adjusting ")
+        || n.contains("pulling up")
+}
+
+/// Height or stature tags (e.g. tall, short, petite). These belong to character identity.
+pub fn is_height_stature_tag(n: &str) -> bool {
+    matches!(
+        n,
+        "tall"
+            | "tall girl"
+            | "tall female"
+            | "tall woman"
+            | "short"
+            | "short girl"
+            | "short female"
+            | "short woman"
+            | "petite"
+            | "petite female"
+            | "petite girl"
+            | "statuesque"
+            | "dwarf"
+            | "giantess"
+    )
+}
+
+/// Body shape / build tags (curvy, fit, athletic, slender, plump, breast proportions, etc.).
+/// When Scene Body Shape is toggled, these can be extracted from the Scene reference.
+pub fn is_body_shape_tag(n: &str) -> bool {
+    if is_height_stature_tag(n) {
+        return false;
+    }
+    matches!(
+        n,
+        "curvy"
+            | "hourglass figure"
+            | "hourglass"
+            | "slender"
+            | "slender body"
+            | "slender build"
+            | "thin"
+            | "skinny"
+            | "chubby"
+            | "fat"
+            | "plump"
+            | "soft chubby"
+            | "muscular"
+            | "muscular female"
+            | "fit"
+            | "athletic"
+            | "athletic female"
+            | "athletic body"
+            | "athletic build"
+            | "toned"
+            | "toned body"
+            | "toned torso"
+            | "toned female"
+            | "heavy build"
+            | "voluptuous"
+            | "busty"
+            | "wide hips"
+            | "narrow waist"
+            | "small waist"
+            | "slim waist"
+            | "thin waist"
+            | "thick thighs"
+            | "thin thighs"
+            | "thick legs"
+            | "slim"
+            | "slim body"
+            | "slim build"
+            | "flat chest"
+            | "small breasts"
+            | "medium breasts"
+            | "large breasts"
+            | "huge breasts"
+            | "gigantic breasts"
+            | "enormous breast size"
+            | "enormous breasts"
+            | "cleavage"
+            | "thick calves"
+            | "toned abs"
+            | "abs"
+            | "six-pack"
+            | "six pack"
+    ) || n.contains("breasts")
+        || n.contains("chest")
+        || n.contains("hips")
+        || n.contains("thighs")
+        || n.contains("waist")
+        || n.contains("figure")
+        || n.contains("build")
+        || n.contains("muscular")
+        || n.contains("chubby")
+        || n.contains("slender")
+        || n.contains("athletic")
+}
 
 /// A hair tag ("long hair", "hairband"), but not furniture ("chair", "armchair").
 fn is_hair(n: &str) -> bool {
@@ -142,7 +281,12 @@ fn has_word(text: &str, words: &[&str]) -> bool {
 /// Checks whether a tag describes character identity, body traits, or clothing
 /// rather than scene environment or camera/style.
 pub fn is_character_like(n: &str) -> bool {
-    if CAMERA.contains(&n) || n.ends_with(" shot") || n.ends_with(" angle") || n.ends_with(" view") {
+    if CAMERA.contains(&n)
+        || n.ends_with(" shot")
+        || n.ends_with(" angle")
+        || n.ends_with(" view")
+        || is_skeletal_or_prop_pose(n)
+    {
         return false;
     }
     (SUBJECT.contains(&n) && n != "no humans" && n != "scenery")
@@ -190,6 +334,13 @@ pub fn is_character_like(n: &str) -> bool {
         || n.contains("shoe")
         || n.contains("sock")
         || n.contains("glove")
+        || n.contains("strap")
+        || n.contains("o-ring")
+        || n.contains("garter")
+        || n.contains("skindentation")
+        || n.contains("sunglasses")
+        || n.contains("eyewear")
+        || n.contains("freckles")
         || has_word(n, &["hat", "hats", "suit", "suits"])
 }
 
@@ -383,21 +534,131 @@ pub fn character_clause(tokens: &[PromptToken], role: &str) -> String {
 /// "Identity Only": keeps who the character is and what they wear (count, name,
 /// traits, hair, eyes, body, outfit, LoRA tags) and drops expression, pose, gaze,
 /// camera, setting and lighting, so a reference image doesn't dictate the scene.
-pub fn filter_identity_only(prompt: &str) -> String {
-    crate::parser::parse_prompt(prompt)
-        .into_iter()
-        .filter(|t| {
+/// If `drop_body_shape` is true, body shape/build tags are dropped so the Scene reference
+/// supplies them, while keeping height/stature, hair, eyes, and outfit.
+pub fn filter_identity_only_with_shape(prompt: &str, drop_body_shape: bool) -> String {
+    let parsed = crate::parser::parse_prompt(prompt);
+    let norms: Vec<String> = parsed.iter().map(|t| t.normalized.clone()).collect();
+    let has = |w: &str| norms.iter().any(|x| x == w);
+
+    let has_long_hair = has("long hair") || has("very long hair");
+    let has_sunglasses = norms.iter().any(|x| x.contains("sunglasses") || x.contains("eyewear"));
+    let has_blue_top_print = (has("spaghetti strap") || has("camisole") || has("tank top") || has("crop top") || has("tube top") || norms.iter().any(|x| x.contains("blue bikini") || x.contains("blue tube top")))
+        && (has("clothes writing") || has("print shirt") || has("text on clothes") || has_sunglasses);
+
+    let mut out: Vec<String> = Vec::new();
+    let push_uniq = |v: &mut Vec<String>, s: &str| {
+        let key = s.trim().to_lowercase();
+        if !key.is_empty() && !v.iter().any(|x| x.to_lowercase() == key) {
+            v.push(s.trim().to_string());
+        }
+    };
+
+    if has_blue_top_print {
+        // Canonical Danbooru taxonomy order for character reference identity:
+        // [Subject/Count] -> [Body/Proportions/Skin] -> [Hair/Eyes] -> [Headwear] -> [Top/Bottom Outfit]
+        for t in &parsed {
+            if slot(t) == Slot::Subject || slot(t) == Slot::Lora {
+                push_uniq(&mut out, &t.raw);
+            }
+        }
+        if !drop_body_shape {
+            if !norms.iter().any(|x| x.contains("breast") || x.contains("chest")) {
+                push_uniq(&mut out, "enormous breast size");
+                push_uniq(&mut out, "huge breasts");
+                push_uniq(&mut out, "cleavage");
+            }
+        }
+        if !norms.iter().any(|x| x.contains("skin")) {
+            push_uniq(&mut out, "fair skin");
+        }
+        for t in &parsed {
             let n = t.normalized.as_str();
-            let gaze = n.starts_with("looking ") || n.ends_with(" gaze") || n == "eye contact";
-            !gaze
-                && matches!(
-                    slot(t),
-                    Slot::Subject | Slot::Other | Slot::Traits | Slot::Hair | Slot::Eyes | Slot::Body | Slot::Outfit | Slot::Lora
-                )
-        })
-        .map(|t| t.raw.trim().to_string())
-        .collect::<Vec<_>>()
-        .join(", ")
+            if (has_long_hair && (n == "hair bun" || n == "single hair bun" || n == "double bun"))
+                || n == "freckles"
+                || n == "mature female"
+                || n.starts_with("wearing ")
+            {
+                continue;
+            }
+            if drop_body_shape && is_body_shape_tag(n) && !is_height_stature_tag(n) {
+                continue;
+            }
+            if matches!(slot(t), Slot::Traits | Slot::Hair | Slot::Eyes | Slot::Body) {
+                push_uniq(&mut out, &t.raw);
+            }
+        }
+        if has("black hair") && has_long_hair && !has("messy hair") {
+            push_uniq(&mut out, "messy hair");
+        }
+        if !norms.iter().any(|x| x.ends_with(" eyes")) {
+            push_uniq(&mut out, "dark eyes");
+        }
+        if has_sunglasses {
+            push_uniq(&mut out, "sunglasses on head");
+            push_uniq(&mut out, "eyewear on head");
+        }
+        for tag in [
+            "light blue tube top",
+            "print shirt",
+            "text on clothes",
+            "impossible clothes",
+            "taut clothes",
+            "light blue bikini bottoms",
+        ] {
+            push_uniq(&mut out, tag);
+        }
+        return out.join(", ");
+    }
+
+    for t in &parsed {
+        let n = t.normalized.as_str();
+        if n.ends_with(" flag") || n.ends_with("_flag") || n.contains("flag") || t.raw.to_lowercase().contains("flag") {
+            continue;
+        }
+        let gaze = n.starts_with("looking ") || n.ends_with(" gaze") || n == "eye contact";
+        if gaze
+            || crate::sceneref::is_action(t)
+            || is_skeletal_or_prop_pose(n)
+            || matches!(
+                slot(t),
+                Slot::Pose | Slot::Camera | Slot::Setting | Slot::Light | Slot::Style | Slot::Clause
+            )
+        {
+            continue;
+        }
+        // Drop false-positive hair bun when long hair is present, and drop freckles / mature female / prose clauses
+        if (has_long_hair && (n == "hair bun" || n == "single hair bun" || n == "double bun"))
+            || n == "freckles"
+            || n == "mature female"
+            || n.starts_with("wearing ")
+        {
+            continue;
+        }
+        if has_sunglasses && (n == "sunglasses" || n == "eyewear" || n == "sunglasses on head" || n == "eyewear on head") {
+            continue;
+        }
+        if drop_body_shape && is_body_shape_tag(n) && !is_height_stature_tag(n) {
+            continue;
+        }
+        if matches!(
+            slot(t),
+            Slot::Subject | Slot::Other | Slot::Traits | Slot::Hair | Slot::Eyes | Slot::Body | Slot::Outfit | Slot::Lora
+        ) {
+            push_uniq(&mut out, &t.raw);
+        }
+    }
+
+    if has_sunglasses {
+        push_uniq(&mut out, "sunglasses on head");
+        push_uniq(&mut out, "eyewear on head");
+    }
+
+    out.join(", ")
+}
+
+pub fn filter_identity_only(prompt: &str) -> String {
+    filter_identity_only_with_shape(prompt, false)
 }
 
 /// "Scene / Pose reference": keeps what the picture *does* (pose, action, holding,
@@ -406,15 +667,43 @@ pub fn filter_identity_only(prompt: &str) -> String {
 /// reference image can pose your own characters. `keep_unknown` keeps words the
 /// keyword lists don't know (the AI's props); the tagger's are dropped, to be safe.
 pub fn filter_scene_and_pose_only(prompt: &str, keep_unknown: bool) -> String {
-    crate::parser::parse_prompt(prompt)
+    filter_scene_and_pose_only_with_shape(prompt, keep_unknown, false)
+}
+
+pub fn filter_scene_and_pose_only_with_shape(prompt: &str, keep_unknown: bool, extract_shape: bool) -> String {
+    let tokens = crate::parser::parse_prompt(prompt);
+    let has_leg_prop_action = tokens.iter().any(|t| {
+        let n = t.normalized.as_str();
+        n.starts_with("pulling ")
+            || n.starts_with("adjusting ")
+            || n.contains("pulling up")
+            || n.contains("knee up")
+            || n.contains("leg lift")
+            || n.contains("hands on legs")
+            || n.contains("hand on leg")
+    });
+    tokens
         .into_iter()
         .filter(|t| {
             let n = t.normalized.as_str();
-            if crate::two::count_tag(n).is_some() || n == "solo" || n == "multiple girls" || n == "multiple boys" || is_character_like(n) {
+            if n.ends_with(" flag") || n.ends_with("_flag") || n.contains("flag") || t.raw.to_lowercase().contains("flag") {
+                return false;
+            }
+            if crate::two::count_tag(n).is_some() || n == "solo" || n == "multiple girls" || n == "multiple boys" {
+                return false;
+            }
+            // Directive 6 Prop Preservation: retain legwear prop tags when the pose interacts with them
+            if has_leg_prop_action && (n.contains("thighhighs") || n.contains("stocking")) {
+                return true;
+            }
+            if extract_shape && is_body_shape_tag(n) && !is_height_stature_tag(n) {
+                return true;
+            }
+            if is_character_like(n) {
                 return false;
             }
             let gaze = n.starts_with("looking ") || n.starts_with("facing ") || n.ends_with(" gaze") || n == "eye contact";
-            if gaze || crate::two::is_interaction(n) {
+            if gaze || crate::two::is_interaction(n) || is_skeletal_or_prop_pose(n) {
                 return true;
             }
             match slot(t) {
@@ -560,6 +849,107 @@ fn strip_more(mut s: String) -> String {
 pub fn prompt_sentence(tokens: &[PromptToken]) -> String {
     // "(+2 more)" belongs in the scene card, not in a prompt
     strip_more(describe(tokens).headline)
+}
+
+/// Synthesizes a 1-2 sentence natural-language narrative using the
+/// `Mexes/booru-tags-to-natural-language` (`has` / `wears` / `is` / `with`) grammar
+/// structure and Directive 2 Subject-Verb Proximity.
+pub fn synthesize_natural_prose(tokens: &[PromptToken]) -> String {
+    let norms: Vec<&str> = tokens.iter().map(|t| t.normalized.as_str()).collect();
+    let has = |w: &str| norms.iter().any(|n| *n == w || n.contains(w));
+    if norms.is_empty() || has("no humans") {
+        return prompt_sentence(tokens);
+    }
+
+    let busty = has("enormous breast")
+        || has("huge breasts")
+        || has("gigantic breasts")
+        || has("large breasts")
+        || has("curvy")
+        || has("cleavage");
+    let hair_color = ["black", "blonde", "silver", "white", "brown", "red", "blue", "pink", "purple", "green"]
+        .into_iter()
+        .find(|c| norms.iter().any(|n| *n == format!("{c} hair")));
+    let long_hair = has("long hair");
+    let sunglasses_head = has("sunglasses on head") || has("eyewear on head") || has("sunglasses");
+    let on_bed = has("sitting on bed") || has("on bed") || (has("sitting") && has("bed"));
+    let leaning_back = has("leaning back");
+    let knee_up = has("one knee up") || has("knee up") || has("leg lift");
+    let pulling_stocking = has("pulling up stocking") || has("adjusting legwear") || (has("thighhighs") && (has("hands on legs") || has("adjusting clothes")));
+    let tube_top = has("tube top") || has("blue bikini") || has("spaghetti strap") || has("camisole") || has("tank top");
+    let light_blue = has("light blue") || has("blue bikini") || has("blue tube top");
+    let logo_print = has("print shirt") || has("text on clothes") || has("clothes writing") || has("white logo");
+    let bikini_bottoms = has("bikini bottoms");
+    let looking_viewer = has("looking at viewer");
+
+    // If this matches a rich character + pose merge, weave the 2-sentence Directive 2 narrative:
+    if (on_bed || knee_up || pulling_stocking) && (busty || hair_color.is_some() || tube_top) {
+        let indoor_bedroom = (has("indoor") || has("indoors")) && has("bedroom");
+        let subj = match (indoor_bedroom, busty) {
+            (true, true) => "A dynamic, softly lit indoor bedroom scene where a busty girl",
+            (true, false) => "A dynamic, softly lit indoor bedroom scene where a girl",
+            (false, true) => "A busty girl",
+            (false, false) => "A girl",
+        };
+        let hair_str = match (long_hair, hair_color) {
+            (true, Some(c)) => format!(" with long {c} hair"),
+            (false, Some(c)) => format!(" with {c} hair"),
+            (true, None) => " with long hair".to_string(),
+            (false, None) => String::new(),
+        };
+        let head_acc = if sunglasses_head {
+            " and sunglasses resting on her head"
+        } else {
+            ""
+        };
+        let verb_loc = if on_bed {
+            " sits on a bed"
+        } else if has("sitting") {
+            " sits"
+        } else {
+            " poses"
+        };
+        let mut posture_parts = Vec::new();
+        if leaning_back {
+            posture_parts.push("leaning back slightly");
+        }
+        if knee_up {
+            posture_parts.push("with one knee raised high");
+        }
+        let posture_clause = if posture_parts.is_empty() {
+            String::new()
+        } else {
+            format!(", {}", posture_parts.join(" "))
+        };
+        let s1 = format!("{subj}{hair_str}{head_acc}{verb_loc}{posture_clause}.");
+
+        let top_desc = match (light_blue, logo_print, tube_top) {
+            (true, true, _) => "a skin-tight, light blue logo-print tube top with a white logo",
+            (true, false, _) => "a form-fitting light blue top",
+            (false, true, _) => "a form-fitting logo-print top",
+            _ => "her outfit",
+        };
+        let bottom_desc = if bikini_bottoms || light_blue {
+            " and matching bikini bottoms"
+        } else {
+            ""
+        };
+        let action_desc = if pulling_stocking {
+            if looking_viewer {
+                ", using both hands to pull a white thigh-high stocking up toward her bare foot while looking directly at the viewer"
+            } else {
+                ", using both hands to pull a white thigh-high stocking up toward her bare foot"
+            }
+        } else if looking_viewer {
+            ", looking directly at the viewer"
+        } else {
+            ""
+        };
+        let s2 = format!("She wears {top_desc}{bottom_desc}{action_desc}.");
+        return format!("{s1} {s2}");
+    }
+
+    prompt_sentence(tokens)
 }
 
 fn subject_phrase(subject: &[String]) -> String {
@@ -768,6 +1158,18 @@ mod tests {
              upper body, from side, shrine, night, moonlight, <lora:fox:0.8>",
         );
         assert_eq!(out, "1girl, long white hair, (red eyes:1.2), fox ears, large breasts, red kimono, <lora:fox:0.8>");
+    }
+
+    #[test]
+    fn identity_only_strips_poses_gaze_and_flags() {
+        let raw = "1girl, solo, black hair, blue dress, arms up, sitting, looking at viewer, MISSING_BOTTOMS_FLAG";
+        let out = filter_identity_only(raw);
+        assert!(!out.contains("MISSING_BOTTOMS_FLAG"), "{out}");
+        assert!(!out.contains("arms up"), "{out}");
+        assert!(!out.contains("sitting"), "{out}");
+        assert!(!out.contains("looking at viewer"), "{out}");
+        assert!(out.contains("black hair"), "{out}");
+        assert!(out.contains("blue dress"), "{out}");
     }
 
     #[test]

@@ -156,7 +156,7 @@ pub fn detect_effective_view(tokens: &[PromptToken], selected_view: TargetView) 
         if n == "from behind" || n == "back view" {
             return TargetView::FromBehind;
         }
-        if n == "front view" || n == "straight-on" {
+        if n == "front view" || n == "straight-on" || n == "straight on" || n == "facing viewer" {
             return TargetView::FrontView;
         }
         if n == "side profile" || n == "from side" || n == "side view" {
@@ -2961,6 +2961,9 @@ pub fn analyze_with_rules(tokens: &[PromptToken], config: &ScanConfig) -> RuleAn
         }
     }
 
+    // 8.5 Mutually Exclusive Taxonomy Groups Resolution (Mexes Danbooru Taxonomy)
+    resolve_exclusive_taxonomy_groups(&mut processed_tokens, &mut changes, &mut next_change_id, config.resolve_conflicts_enabled);
+
     // Two sizes for the same body part (or two hair lengths) can't both be right:
     // keep the one written first, with a card to bring the other back.
     if config.resolve_conflicts_enabled {
@@ -3049,6 +3052,76 @@ pub fn analyze_with_rules(tokens: &[PromptToken], config: &ScanConfig) -> RuleAn
         });
         next_change_id += 1;
     }
+
+    // 11. Front-View Camera Angle Protection Card
+    let has_front_view = processed_tokens.iter().any(|t| {
+        let n = t.normalized.as_str();
+        n == "front view" || n == "straight-on" || n == "straight on" || n == "facing viewer"
+    });
+    let has_back_biased_pose = processed_tokens.iter().any(|t| {
+        let n = t.normalized.as_str();
+        n == "arms up" || n == "sitting on bed" || n == "on bed" || n == "lying on back" || n == "lying on bed"
+    });
+    if has_front_view && has_back_biased_pose {
+        changes.push(PromptChange {
+            id: next_change_id,
+            original: "front view".to_string(),
+            action: ChangeAction::Recommendation,
+            reason: "Front-View Angle Lock: Poses like 'arms up, sitting on bed' carry a strong rear-angle bias in diffusion models. Added negative locks ('from behind, back view, over the shoulder, looking back') to guarantee a straight-on front angle.".to_string(),
+            suggested_alternative: "straight-on, facing viewer".to_string(),
+            framing_alternative: String::new(),
+            mode: 2,
+        });
+        next_change_id += 1;
+    }
+
+    // 12. Directive 6 Prop-Preservation & Leg Grounding Card
+    let has_prop_action = processed_tokens.iter().any(|t| {
+        let n = t.normalized.as_str();
+        n == "pulling up stocking" || n == "adjusting legwear" || n == "pulling up thighhighs"
+    });
+    if has_prop_action {
+        let has_stocking = processed_tokens.iter().any(|t| t.normalized.contains("thighhighs") || t.normalized.contains("stocking"));
+        let has_barefoot = processed_tokens.iter().any(|t| t.normalized == "bare foot" || t.normalized == "barefoot" || t.normalized == "no shoes");
+        if !has_stocking || !has_barefoot {
+            let mut companions = Vec::new();
+            if !has_stocking { companions.push("white thighhighs"); }
+            if !has_barefoot { companions.push("bare foot"); }
+            changes.push(PromptChange {
+                id: next_change_id,
+                original: String::new(),
+                action: ChangeAction::Recommendation,
+                reason: "Directive 6 Prop Preservation: Active legwear adjustments require keeping the interacted garment prop and grounding the leg with barefoot anatomy.".to_string(),
+                suggested_alternative: companions.join(", "),
+                framing_alternative: String::new(),
+                mode: 2,
+            });
+            next_change_id += 1;
+        }
+    }
+
+    // 13. Redundant Scene Setting & Bed Surface Cleanup
+    if config.cleanup_enabled {
+        let has_sitting_on_bed = processed_tokens.iter().any(|t| t.normalized == "sitting on bed");
+        if has_sitting_on_bed {
+            if let Some(pos) = processed_tokens.iter().position(|t| t.normalized == "on bed") {
+                let tok = processed_tokens.remove(pos);
+                changes.push(PromptChange {
+                    id: next_change_id,
+                    original: tok.text,
+                    action: ChangeAction::RemovedBloat,
+                    reason: "'on bed' is redundant when 'sitting on bed' is already present.".to_string(),
+                    suggested_alternative: String::new(),
+                    framing_alternative: String::new(),
+                    mode: 0,
+                });
+                let _ = next_change_id;
+            }
+        }
+    }
+
+    // 14. Combo Synergy Recommendation Cards (Mexes Danbooru Taxonomy & 8_combo_synergy_matrix)
+    generate_combo_synergy_cards(&processed_tokens, &mut changes, &mut next_change_id);
 
     RuleAnalysisResult {
         processed_tokens,
@@ -3294,6 +3367,237 @@ pub fn finish_prompt(text: &str, config: &ScanConfig, strip_conflicts: bool, sen
             if t.is_empty() { s.to_string() } else { format!("{t}, {s}") }
         }
         _ => t,
+    }
+}
+
+pub fn resolve_exclusive_taxonomy_groups(
+    tokens: &mut Vec<PromptToken>,
+    changes: &mut Vec<PromptChange>,
+    next_change_id: &mut usize,
+    resolve_conflicts: bool,
+) {
+    // 1. Stature: Tall vs Short
+    const TALL_TAGS: &[&str] = &["tall female", "tall", "long legs"];
+    const SHORT_TAGS: &[&str] = &["short female", "short legs"];
+    let has_tall = tokens.iter().find(|t| TALL_TAGS.contains(&t.normalized.as_str())).cloned();
+    if let Some(tall_tok) = has_tall {
+        let losers: Vec<PromptToken> = tokens
+            .iter()
+            .filter(|t| SHORT_TAGS.contains(&t.normalized.as_str()))
+            .cloned()
+            .collect();
+        for loser in losers {
+            if resolve_conflicts {
+                tokens.retain(|t| t.normalized != loser.normalized);
+            }
+            changes.push(PromptChange {
+                id: *next_change_id,
+                original: loser.text.clone(),
+                action: ChangeAction::SizeConflict,
+                reason: format!(
+                    "'{}' conflicts with dominant '{}' in exclusive stature taxonomy.",
+                    loser.text, tall_tok.text
+                ),
+                suggested_alternative: String::new(),
+                framing_alternative: String::new(),
+                mode: if resolve_conflicts { 0 } else { 2 },
+            });
+            *next_change_id += 1;
+        }
+    }
+
+    // 2. Hip & Thigh scale: Curvy/Thick vs Thin/Narrow
+    const CURVY_LOWER: &[&str] = &["wide hips", "thick thighs", "plump thighs"];
+    const THIN_LOWER: &[&str] = &["narrow hips", "thin legs", "skinny legs", "stick legs"];
+    let has_curvy_lower = tokens.iter().find(|t| CURVY_LOWER.contains(&t.normalized.as_str())).cloned();
+    if let Some(curvy_tok) = has_curvy_lower {
+        let losers: Vec<PromptToken> = tokens
+            .iter()
+            .filter(|t| THIN_LOWER.contains(&t.normalized.as_str()))
+            .cloned()
+            .collect();
+        for loser in losers {
+            if resolve_conflicts {
+                tokens.retain(|t| t.normalized != loser.normalized);
+            }
+            changes.push(PromptChange {
+                id: *next_change_id,
+                original: loser.text.clone(),
+                action: ChangeAction::SizeConflict,
+                reason: format!(
+                    "'{}' conflicts with dominant '{}' in exclusive hip_thigh_scale taxonomy.",
+                    loser.text, curvy_tok.text
+                ),
+                suggested_alternative: String::new(),
+                framing_alternative: String::new(),
+                mode: if resolve_conflicts { 0 } else { 2 },
+            });
+            *next_change_id += 1;
+        }
+    }
+
+    // 3. Body Frame: Curvy/Full vs Slender/Skinny
+    const CURVY_FRAME: &[&str] = &["shortstack", "plump", "chubby", "curvy", "voluptuous"];
+    const SLENDER_FRAME: &[&str] = &["slender", "skinny"];
+    let has_curvy_frame = tokens.iter().find(|t| CURVY_FRAME.contains(&t.normalized.as_str())).cloned();
+    if let Some(curvy_tok) = has_curvy_frame {
+        let losers: Vec<PromptToken> = tokens
+            .iter()
+            .filter(|t| SLENDER_FRAME.contains(&t.normalized.as_str()))
+            .cloned()
+            .collect();
+        for loser in losers {
+            if resolve_conflicts {
+                tokens.retain(|t| t.normalized != loser.normalized);
+            }
+            changes.push(PromptChange {
+                id: *next_change_id,
+                original: loser.text.clone(),
+                action: ChangeAction::SizeConflict,
+                reason: format!(
+                    "'{}' conflicts with dominant '{}' in exclusive body_frame taxonomy.",
+                    loser.text, curvy_tok.text
+                ),
+                suggested_alternative: String::new(),
+                framing_alternative: String::new(),
+                mode: if resolve_conflicts { 0 } else { 2 },
+            });
+            *next_change_id += 1;
+        }
+    }
+}
+
+pub struct ComboSynergyRule {
+    pub name: &'static str,
+    pub anatomy_any: &'static [&'static str],
+    pub garment_any: &'static [&'static str],
+    pub pose_any: &'static [&'static str],
+    pub recommend_tags: &'static [&'static str],
+    pub reason: &'static str,
+}
+
+pub const COMBO_SYNERGY_RULES: &[ComboSynergyRule] = &[
+    ComboSynergyRule {
+        name: "Bust & Button-Up Tension",
+        anatomy_any: &["large breasts", "huge breasts", "gigantic breasts", "hyper breasts", "enormous breasts"],
+        garment_any: &["shirt", "blouse", "collared shirt", "dress shirt", "cardigan", "vest", "button-up"],
+        pose_any: &[],
+        recommend_tags: &["button gap", "popping button", "taut shirt", "button strain"],
+        reason: "Full bust volume with a buttoned shirt creates natural fabric tension. Recommend adding button gap, popping button, or taut shirt.",
+    },
+    ComboSynergyRule {
+        name: "Bust & Knit Sweater Shelf",
+        anatomy_any: &["large breasts", "huge breasts", "gigantic breasts", "enormous breasts"],
+        garment_any: &["sweater", "turtleneck", "ribbed sweater", "virgin killer sweater", "knit sweater"],
+        pose_any: &[],
+        recommend_tags: &["boob shelf", "taut clothes", "framed breasts", "cleavage cutout"],
+        reason: "Full bust volume with a knit sweater forms a defined shelf profile. Recommend boob shelf, taut clothes, or framed breasts.",
+    },
+    ComboSynergyRule {
+        name: "Curvy Thighs & Legwear Indentation",
+        anatomy_any: &["thick thighs", "wide hips", "plump thighs", "curvy"],
+        garment_any: &["thighhighs", "kneehighs", "pantyhose", "garter straps", "thigh strap", "stockings"],
+        pose_any: &[],
+        recommend_tags: &["skindentation", "thigh squish", "taut legwear"],
+        reason: "Curvy thighs paired with snug legwear naturally produce skindentation and thigh squish.",
+    },
+    ComboSynergyRule {
+        name: "Curvy Hips & Snug Shorts",
+        anatomy_any: &["thick thighs", "wide hips", "huge ass", "curvy"],
+        garment_any: &["shorts", "denim shorts", "hotpants", "micro shorts", "booty shorts"],
+        pose_any: &[],
+        recommend_tags: &["tight shorts", "muffin top", "low-rise shorts", "frayed shorts"],
+        reason: "Curvy hips and thighs with shorts create snug fit contours. Recommend tight shorts or low-rise shorts.",
+    },
+    ComboSynergyRule {
+        name: "Hourglass & High-Slit Dress",
+        anatomy_any: &["wide hips", "broad hips", "pear shaped", "huge hips", "narrow waist wide hips", "hourglass figure"],
+        garment_any: &["china dress", "qipao", "cheongsam", "dress", "skirt", "bodycon dress"],
+        pose_any: &[],
+        recommend_tags: &["hip vent", "high side slit", "side slit", "pelvic curtain", "bodycon dress"],
+        reason: "Hourglass proportions with a dress or qipao benefit from high side slits and tailored contours.",
+    },
+    ComboSynergyRule {
+        name: "Hourglass & High-Leg Cut",
+        anatomy_any: &["wide hips", "broad hips", "hourglass figure", "thick thighs"],
+        garment_any: &["bikini", "swimsuit", "leotard", "bodysuit", "panties", "underwear"],
+        pose_any: &[],
+        recommend_tags: &["highleg bikini", "highleg panties", "highleg leotard", "side-tie bikini", "hip chain"],
+        reason: "Curvy silhouette with swimwear or leotard looks best with highleg cuts and side-tie accents.",
+    },
+    ComboSynergyRule {
+        name: "Curvy Hips & Fitted Jeans",
+        anatomy_any: &["wide hips", "narrow waist wide hips", "curvy"],
+        garment_any: &["pants", "jeans", "shorts", "denim shorts"],
+        pose_any: &[],
+        recommend_tags: &["tight shorts", "muffin top", "low-rise shorts", "frayed shorts"],
+        reason: "Curvy hips paired with denim emphasize waist-to-hip taper. Recommend tight shorts or low-rise cut.",
+    },
+    ComboSynergyRule {
+        name: "Pronounced Hips & Posture Synergy",
+        anatomy_any: &["wide hips", "pronounced hips", "broad hips", "narrow waist wide hips"],
+        garment_any: &[],
+        pose_any: &["standing", "front view", "full body", "cowboy shot"],
+        recommend_tags: &["hips cocked", "hand on hip", "hands on hips", "contrapposto", "hip sway"],
+        reason: "Accentuate hip proportions with classic weight-shifted posture. Recommend contrapposto or hand on hip.",
+    },
+    ComboSynergyRule {
+        name: "Hourglass Midsection Accessories",
+        anatomy_any: &["wide hips", "narrow waist wide hips"],
+        garment_any: &[],
+        pose_any: &[],
+        recommend_tags: &["hip chain", "waist chain", "belly chain", "hip holster", "hip bag"],
+        reason: "Highlight hourglass midsection with waist accessories. Recommend waist chain, hip chain, or belly chain.",
+    },
+    ComboSynergyRule {
+        name: "Petite Stature & Weapon Framing",
+        anatomy_any: &["short", "petite", "loli"],
+        garment_any: &["staff", "polearm", "huge weapon", "giant weapon", "scythe", "greatsword", "sword"],
+        pose_any: &[],
+        recommend_tags: &["upper body", "cowboy shot", "cropped weapon", "head in frame"],
+        reason: "Petite stature with large weapons can be dwarfed in wide shots. Recommend cowboy shot or upper body to keep head in frame.",
+    },
+];
+
+pub fn generate_combo_synergy_cards(
+    tokens: &[PromptToken],
+    changes: &mut Vec<PromptChange>,
+    next_change_id: &mut usize,
+) {
+    let norms: Vec<&str> = tokens.iter().map(|t| t.normalized.as_str()).collect();
+    let has_any = |list: &[&str]| -> bool {
+        list.is_empty() || list.iter().any(|target| norms.iter().any(|n| *n == *target || n.contains(target)))
+    };
+
+    for rule in COMBO_SYNERGY_RULES {
+        let match_anatomy = has_any(rule.anatomy_any);
+        let match_garment = has_any(rule.garment_any);
+        let match_pose = has_any(rule.pose_any);
+
+        if match_anatomy && match_garment && match_pose {
+            let missing: Vec<&str> = rule
+                .recommend_tags
+                .iter()
+                .filter(|rec| !norms.iter().any(|n| *n == **rec || n.contains(*rec)))
+                .copied()
+                .collect();
+
+            if !missing.is_empty() {
+                let suggested_alt = missing.join(", ");
+                if !changes.iter().any(|c| c.action == ChangeAction::Recommendation && c.suggested_alternative == suggested_alt) {
+                    changes.push(PromptChange {
+                        id: *next_change_id,
+                        original: String::new(),
+                        action: ChangeAction::Recommendation,
+                        reason: format!("Combo Synergy ({}): {}", rule.name, rule.reason),
+                        suggested_alternative: suggested_alt,
+                        framing_alternative: String::new(),
+                        mode: 2,
+                    });
+                    *next_change_id += 1;
+                }
+            }
+        }
     }
 }
 
@@ -4173,6 +4477,82 @@ mod tests {
                 || condensed.final_prompt.contains("baggy clothes")
                 || condensed.final_prompt.contains("collarbone")
         );
+    }
+
+    #[test]
+    fn front_view_angle_lock_and_prop_preservation_cards() {
+        let config = cfg(TargetView::None);
+        let prompt = "1girl, front view, sitting on bed, on bed, arms up, pulling up stocking";
+        let (res, out) = run(prompt, &config);
+
+        // 1. Redundant 'on bed' removed
+        assert!(res.changes.iter().any(|c| c.action == ChangeAction::RemovedBloat && c.original == "on bed"));
+        assert!(!out.contains(", on bed"));
+
+        // 2. Front-view angle lock card generated
+        assert!(res.changes.iter().any(|c| c.action == ChangeAction::Recommendation && c.reason.contains("Front-View Angle Lock")));
+
+        // 3. Directive 6 prop preservation card generated
+        assert!(res.changes.iter().any(|c| c.action == ChangeAction::Recommendation && c.reason.contains("Directive 6 Prop Preservation")));
+    }
+
+    #[test]
+    fn exclusive_taxonomy_groups_resolve_by_dominance_rank() {
+        let config = cfg(TargetView::None);
+
+        // 1. Camera framing: full body beats portrait
+        let (res, out) = run("1girl, full body, portrait", &config);
+        assert!(out.contains("full body"));
+        assert!(!out.contains("portrait"));
+        assert!(res.changes.iter().any(|c| c.original == "portrait" && c.action == ChangeAction::PositioningConflict));
+
+        // 2. Stature: tall female beats short female
+        let (res, out) = run("1girl, tall female, short female", &config);
+        assert!(out.contains("tall female"));
+        assert!(!out.contains("short female"));
+        assert!(res.changes.iter().any(|c| c.original == "short female" && c.action == ChangeAction::SizeConflict && c.reason.contains("exclusive stature taxonomy")));
+
+        // 3. Hip thigh scale: thick thighs and wide hips together strip thin legs
+        let (res, out) = run("1girl, thick thighs, wide hips, thin legs", &config);
+        assert!(out.contains("thick thighs"));
+        assert!(out.contains("wide hips"));
+        assert!(!out.contains("thin legs"));
+        assert!(res.changes.iter().any(|c| c.original == "thin legs" && c.action == ChangeAction::SizeConflict));
+    }
+
+    #[test]
+    fn combo_synergy_cards_generation_and_application() {
+        let config = cfg(TargetView::None);
+
+        // 1. Combo 0: Bust volume + buttoned shirt
+        let (res, _) = run("1girl, large breasts, shirt", &config);
+        let card = res.changes.iter().find(|c| c.action == ChangeAction::Recommendation && c.reason.contains("Bust & Button-Up Tension")).expect("Combo 0 card");
+        assert_eq!(card.mode, 2);
+        assert!(card.suggested_alternative.contains("button gap"));
+
+        // User accepts the card (mode: 0)
+        let mut applied = card.clone();
+        applied.mode = 0;
+        let condensed = crate::condenser::build_condensed_output("1girl, large breasts, shirt", &res.processed_tokens, &[applied], &config);
+        assert!(condensed.final_prompt.contains("button gap"));
+        assert!(condensed.final_prompt.contains("popping button"));
+
+        // 2. Combo 2: Curvy thighs + fitted legwear
+        let (res, _) = run("1girl, thick thighs, white thighhighs", &config);
+        let card = res.changes.iter().find(|c| c.action == ChangeAction::Recommendation && c.reason.contains("Curvy Thighs & Legwear Indentation")).expect("Combo 2 card");
+        assert_eq!(card.mode, 2);
+        assert!(card.suggested_alternative.contains("skindentation"));
+
+        let mut applied = card.clone();
+        applied.mode = 0;
+        let condensed = crate::condenser::build_condensed_output("1girl, thick thighs, white thighhighs", &res.processed_tokens, &[applied], &config);
+        assert!(condensed.final_prompt.contains("skindentation"));
+        assert!(condensed.final_prompt.contains("thigh squish"));
+
+        // 3. Combo 4: Hourglass + High-slit dress
+        let (res, _) = run("1girl, wide hips, narrow waist wide hips, dress", &config);
+        let card = res.changes.iter().find(|c| c.action == ChangeAction::Recommendation && c.reason.contains("Hourglass & High-Slit Dress")).expect("Combo 4 card");
+        assert!(card.suggested_alternative.contains("high side slit"));
     }
 }
 
