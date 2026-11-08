@@ -346,6 +346,93 @@ pub fn quadrant_crops(img: &image::DynamicImage) -> [(&'static str, image::Dynam
     ]
 }
 
+/// Returns a bounding box centered on a wrist position with a proportional margin
+/// (e.g. 18% of figure height, min 32px) clamped to image boundaries.
+pub fn wrist_hand_box(
+    wrist_x: f32,
+    wrist_y: f32,
+    figure_height: f32,
+    img_w: f32,
+    img_h: f32,
+) -> PersonBox {
+    let radius = (figure_height * 0.18).max(32.0);
+    PersonBox {
+        x0: (wrist_x - radius).max(0.0),
+        y0: (wrist_y - radius).max(0.0),
+        x1: (wrist_x + radius).min(img_w),
+        y1: (wrist_y + radius).min(img_h),
+        score: 1.0,
+    }
+}
+
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct OpenPosePerson {
+    pub person_id: Vec<i32>,
+    pub pose_keypoints_2d: Vec<f32>,
+    pub face_keypoints_2d: Vec<f32>,
+    pub hand_left_keypoints_2d: Vec<f32>,
+    pub hand_right_keypoints_2d: Vec<f32>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct OpenPoseExport {
+    pub version: f32,
+    pub people: Vec<OpenPosePerson>,
+    pub canvas_width: u32,
+    pub canvas_height: u32,
+}
+
+pub fn export_openpose_json(
+    people: &[OpenPosePerson],
+    canvas_width: u32,
+    canvas_height: u32,
+) -> String {
+    let export = OpenPoseExport {
+        version: 1.3,
+        people: people.to_vec(),
+        canvas_width,
+        canvas_height,
+    };
+    serde_json::to_string_pretty(&export).unwrap_or_else(|_| "{}".to_string())
+}
+
+/// Synthesizes estimated 18-point OpenPose keypoints from a detected PersonBox
+/// using standard anime anatomical ratios when full skeleton detector is offline.
+pub fn person_box_to_estimated_keypoints(b: &PersonBox) -> Vec<f32> {
+    let w = b.x1 - b.x0;
+    let h = b.y1 - b.y0;
+    let cx = b.x0 + w * 0.5;
+
+    let pts = [
+        (cx, b.y0 + h * 0.12),           // 0: Nose
+        (cx, b.y0 + h * 0.20),           // 1: Neck
+        (cx - w * 0.22, b.y0 + h * 0.22), // 2: RShoulder
+        (cx - w * 0.28, b.y0 + h * 0.38), // 3: RElbow
+        (cx - w * 0.25, b.y0 + h * 0.52), // 4: RWrist
+        (cx + w * 0.22, b.y0 + h * 0.22), // 5: LShoulder
+        (cx + w * 0.28, b.y0 + h * 0.38), // 6: LElbow
+        (cx + w * 0.25, b.y0 + h * 0.52), // 7: LWrist
+        (cx, b.y0 + h * 0.55),           // 8: MidHip
+        (cx - w * 0.16, b.y0 + h * 0.56), // 9: RHip
+        (cx - w * 0.18, b.y0 + h * 0.76), // 10: RKnee
+        (cx - w * 0.20, b.y0 + h * 0.96), // 11: RAnkle
+        (cx + w * 0.16, b.y0 + h * 0.56), // 12: LHip
+        (cx + w * 0.18, b.y0 + h * 0.76), // 13: LKnee
+        (cx + w * 0.20, b.y0 + h * 0.96), // 14: LAnkle
+        (cx - w * 0.08, b.y0 + h * 0.09), // 15: REye
+        (cx + w * 0.08, b.y0 + h * 0.09), // 16: LEye
+        (cx - w * 0.18, b.y0 + h * 0.12), // 17: REar
+    ];
+
+    let mut out = Vec::with_capacity(pts.len() * 3);
+    for (x, y) in pts {
+        out.push(x);
+        out.push(y);
+        out.push(b.score);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -394,6 +481,32 @@ mod tests {
         let (_crop_ext, warn_ext) = crop_with_overlap_mask(&img, &b1, &[b1, b3]);
         assert!(warn_ext.is_some());
         assert!(warn_ext.unwrap().contains("Extreme figure overlap"));
+    }
+
+    #[test]
+    fn wrist_hand_box_and_openpose_export() {
+        let b = PersonBox { x0: 100.0, y0: 100.0, x1: 500.0, y1: 900.0, score: 0.95 };
+        let hand = wrist_hand_box(200.0, 500.0, 800.0, 1000.0, 1000.0);
+        // Radius = 800 * 0.18 = 144
+        assert!((hand.x0 - 56.0).abs() < 1e-3);
+        assert!((hand.x1 - 344.0).abs() < 1e-3);
+        assert!((hand.y0 - 356.0).abs() < 1e-3);
+        assert!((hand.y1 - 644.0).abs() < 1e-3);
+
+        let kpts = person_box_to_estimated_keypoints(&b);
+        assert_eq!(kpts.len(), 18 * 3);
+
+        let person = OpenPosePerson {
+            person_id: vec![-1],
+            pose_keypoints_2d: kpts,
+            face_keypoints_2d: vec![],
+            hand_left_keypoints_2d: vec![],
+            hand_right_keypoints_2d: vec![],
+        };
+        let json_str = export_openpose_json(&[person], 1000, 1000);
+        assert!(json_str.contains("\"version\": 1.3"));
+        assert!(json_str.contains("\"canvas_width\": 1000"));
+        assert!(json_str.contains("\"pose_keypoints_2d\""));
     }
 
     /// `DETECT_TEST=a.png cargo test live_detect -- --ignored --nocapture`

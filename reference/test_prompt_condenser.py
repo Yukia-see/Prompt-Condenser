@@ -4,6 +4,7 @@ Run with pytest:           python -m pytest test_prompt_condenser.py
 Or with no dependencies:   python3 test_prompt_condenser.py
 """
 import contextlib
+import json
 
 try:
     import pytest
@@ -508,6 +509,30 @@ def test_layer_conflict_coexist_and_suppression():
     assert "boots" in all_tn
     assert "thighhighs" in all_tn
     assert ("cleavage", "turtleneck") in m_tn["dropped_layer_conflicts"]
+
+
+def test_wrist_hand_box_and_openpose_export():
+    hand = p.wrist_hand_box(200.0, 500.0, 800.0, 1000.0, 1000.0)
+    # Radius = 800 * 0.18 = 144
+    assert abs(hand["x0"] - 56.0) < 1e-3
+    assert abs(hand["x1"] - 344.0) < 1e-3
+    assert abs(hand["y0"] - 356.0) < 1e-3
+    assert abs(hand["y1"] - 644.0) < 1e-3
+
+    people = [
+        {
+            "person_id": [-1],
+            "pose_keypoints_2d": [100.0, 200.0, 0.9] * 18,
+            "face_keypoints_2d": [],
+            "hand_left_keypoints_2d": [],
+            "hand_right_keypoints_2d": [],
+        }
+    ]
+    json_str = p.export_openpose_json(people, 1024, 1024)
+    data = json.loads(json_str)
+    assert data["version"] == 1.3
+    assert data["canvas_width"] == 1024
+    assert len(data["people"]) == 1
 
 
 if __name__ == "__main__":  # zero-dependency runner

@@ -636,6 +636,38 @@ def compute_zone_boxes(
 
     return zones
 
+
+def wrist_hand_box(
+    wrist_x: float,
+    wrist_y: float,
+    figure_height: float,
+    img_w: float,
+    img_h: float,
+) -> dict:
+    """Returns a bounding box centered on a wrist position with a proportional margin."""
+    radius = max(figure_height * 0.18, 32.0)
+    return {
+        "x0": max(wrist_x - radius, 0.0),
+        "y0": max(wrist_y - radius, 0.0),
+        "x1": min(wrist_x + radius, img_w),
+        "y1": min(wrist_y + radius, img_h),
+    }
+
+
+def export_openpose_json(
+    people: list[dict],
+    canvas_width: int,
+    canvas_height: int,
+) -> str:
+    """Exports an OpenPose / ControlNet compatible JSON string."""
+    payload = {
+        "version": 1.3,
+        "people": people,
+        "canvas_width": canvas_width,
+        "canvas_height": canvas_height,
+    }
+    return json.dumps(payload, indent=2)
+
 _SINGLE_STOP = {
     "light", "hand", "left", "right", "front", "back", "side", "top", "one", "two",
     "air", "dark", "small", "large", "long", "short", "open", "close", "line",
