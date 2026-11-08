@@ -211,21 +211,51 @@ fn with_model<T>(f: impl FnOnce(&mut Loaded) -> Result<T>) -> Result<T> {
     f(guard.as_mut().expect("just loaded"))
 }
 
-/// Adds what a zoomed-in crop (`detector::upper_crop`) sees better: only confident
-/// (>= 0.55) appearance tags (hair, eyes, traits, body, outfit, expression). Framing,
-/// count and setting tags from the crop are ignored, since zooming in changes those.
+/// Checks whether a normalized tag represents a concrete environmental object or prop
+/// (plants, foliage, furniture, fixtures, handheld props) rather than generic framing or abstract setting words.
+pub fn is_concrete_scene_object(norm: &str) -> bool {
+    let n = norm.replace('_', " ");
+    const OBJECTS: &[&str] = &[
+        "plant", "potted plant", "houseplant", "flower", "flowers", "bouquet", "petal", "rose",
+        "sunflower", "lily", "tulip", "cherry blossoms", "tree", "leaf", "leaves", "foliage",
+        "fern", "vines", "ivy", "grass", "bush", "hedge", "cactus", "succulent", "vase",
+        "flowerpot", "flower pot", "window", "curtain", "curtains", "drapes", "chair", "armchair",
+        "couch", "sofa", "table", "desk", "bookshelf", "bookcase", "shelf", "lamp", "lantern",
+        "chandelier", "street lamp", "mirror", "clock", "poster", "painting", "picture frame",
+        "signboard", "pillow", "cushion", "carpet", "rug", "mat", "bed", "television", "monitor",
+        "laptop", "computer", "cup", "mug", "teacup", "bottle", "wine glass", "book", "umbrella",
+        "parasol", "weapon", "sword", "gun", "staff", "wand", "fan", "food", "drink", "phone",
+        "cellphone", "smartphone", "camera", "plushie", "doll", "instrument", "guitar", "violin",
+    ];
+    OBJECTS.iter().any(|&obj| n == obj || n.contains(obj))
+}
+
+/// Adds what a zoomed-in crop (`detector::upper_crop`, `middle_crop`, `lower_crop`) sees better:
+/// confident (>= 0.55) appearance tags (hair, eyes, traits, body, outfit, expression, held props, micro-poses,
+/// and concrete scene objects like plants or furniture). Framing, count, size tags and generic backgrounds
+/// from the crop are ignored, since zooming in changes those.
 pub fn merge_detail_crop(base: &[ScoredTag], detail: &[ScoredTag]) -> Vec<ScoredTag> {
     use crate::scene::Slot;
     let mut out = base.to_vec();
     for d in detail.iter().filter(|d| d.kind == TagKind::General && d.score >= 0.55) {
         let prompt = to_prompt_tag(&d.name);
         let Some(t) = crate::parser::parse_prompt(&prompt).into_iter().next() else { continue };
+        let is_concrete_scene = is_concrete_scene_object(&t.normalized);
+        let is_micro_pose = crate::scene::slot(&t) == Slot::Pose && (
+            t.normalized.starts_with("holding")
+            || t.normalized.starts_with("adjusting")
+            || t.normalized.starts_with("pulling")
+            || t.normalized.contains("knee")
+            || t.normalized.contains("hand")
+            || t.normalized.contains("leg")
+            || t.normalized == "v"
+            || t.normalized == "v sign"
+            || t.normalized == "peace sign"
+        );
         let detail_slot = matches!(
             crate::scene::slot(&t),
-            // Other = details the keyword lists don't know (accessories, markings);
-            // framing, setting and light have their own slots and stay out
             Slot::Hair | Slot::Eyes | Slot::Traits | Slot::Body | Slot::Outfit | Slot::Expression | Slot::Other
-        );
+        ) || is_micro_pose || (crate::scene::slot(&t) == Slot::Setting && is_concrete_scene);
         // zooming in makes the body look bigger, so sizes and proportions come from the
         // full view only
         if !detail_slot
@@ -241,6 +271,85 @@ pub fn merge_detail_crop(base: &[ScoredTag], detail: &[ScoredTag]) -> Vec<Scored
         }
     }
     out
+}
+
+/// Merges tags discovered in a scene quadrant crop (TL, TR, BL, BR), specifically keeping
+/// confident (>= 0.40) concrete scene objects (plants, flowers, lamps, furniture, props)
+/// and character micro-details (>= 0.55), while discarding false zoom-framing tags.
+pub fn merge_quadrant_scene_crop(base: &[ScoredTag], quad: &[ScoredTag]) -> Vec<ScoredTag> {
+    use crate::scene::Slot;
+    let mut out = base.to_vec();
+    for q in quad.iter().filter(|q| q.kind == TagKind::General) {
+        let norm = crate::danbooru::key(&q.name);
+        // Exclude framing, camera, and generic background tags
+        if crate::two::count_tag(&norm).is_some()
+            || norm == "solo"
+            || crate::analyzer::is_size_tag(&norm)
+            || norm == "simple background"
+            || norm == "white background"
+            || norm == "grey background"
+            || norm == "monochrome"
+            || (norm.ends_with("background") && !is_concrete_scene_object(&norm))
+            || norm.ends_with("shot")
+            || norm.ends_with("view")
+            || norm.ends_with("angle")
+            || norm == "close-up"
+            || norm == "portrait"
+            || norm == "upper body"
+            || norm == "lower body"
+            || norm == "full body"
+            || norm == "cowboy shot"
+        {
+            continue;
+        }
+
+        let is_concrete = is_concrete_scene_object(&norm);
+        let min_thresh = if is_concrete { 0.40 } else { 0.55 };
+        if q.score < min_thresh {
+            continue;
+        }
+
+        let prompt = to_prompt_tag(&q.name);
+        let Some(t) = crate::parser::parse_prompt(&prompt).into_iter().next() else { continue };
+        let s = crate::scene::slot(&t);
+        let is_valid = is_concrete
+            || matches!(s, Slot::Hair | Slot::Eyes | Slot::Traits | Slot::Outfit | Slot::Expression | Slot::Other)
+            || (s == Slot::Pose && (norm.starts_with("holding") || norm.contains("knee") || norm.contains("leg") || norm.contains("hand") || norm.contains("adjusting")));
+
+        if !is_valid {
+            continue;
+        }
+
+        match out.iter_mut().find(|b| b.name == q.name) {
+            Some(b) => b.score = b.score.max(q.score),
+            None => out.push(q.clone()),
+        }
+    }
+    out
+}
+
+/// Extracts the top confident WD14 detections from a specific crop (Upper, Middle, Lower, or Quadrant)
+/// to pass as explicit visual anchors to Qwen 2.5-VL so it pinpoints the exact object sub-type.
+pub fn extract_zone_triggers(scores: &[ScoredTag], threshold: f32) -> Vec<String> {
+    let mut picks: Vec<String> = scores
+        .iter()
+        .filter(|t| t.kind == TagKind::General && t.score >= threshold)
+        .map(|t| to_prompt_tag(&t.name))
+        .filter(|t| {
+            let l = t.to_lowercase();
+            !l.contains("background")
+                && !l.ends_with("shot")
+                && !l.ends_with("view")
+                && !l.ends_with("angle")
+                && l != "solo"
+                && l != "1girl"
+                && l != "2girls"
+                && l != "3girls"
+                && l != "4girls"
+        })
+        .collect();
+    picks.truncate(15);
+    picks
 }
 
 /// Emoticon tags keep their underscores (`^_^`, `>_<`...).
@@ -322,6 +431,26 @@ mod tests {
         // one size per body part in the prompt: the most confident
         let p = build_prompt(&[t("medium_breasts", 0.5), t("large_breasts", 0.7), t("long_hair", 0.9), t("very_long_hair", 0.6)], 0.35);
         assert_eq!(p.prompt, "long hair, large breasts, very long hair");
+    }
+
+    #[test]
+    fn quadrant_crop_merges_concrete_scene_objects_and_held_props() {
+        let t = |name: &str, score| ScoredTag { name: name.into(), kind: TagKind::General, score };
+        let base = vec![t("1girl", 0.9), t("full_body", 0.8), t("simple_background", 0.8)];
+        let quad = vec![
+            t("potted_plant", 0.65),
+            t("flower", 0.70),
+            t("holding_sword", 0.60),
+            t("white_background", 0.75),
+            t("upper_body", 0.80),
+        ];
+        let m = merge_quadrant_scene_crop(&base, &quad);
+        let score = |n: &str| m.iter().find(|x| x.name == n).map(|x| x.score);
+        assert_eq!(score("potted_plant"), Some(0.65));
+        assert_eq!(score("flower"), Some(0.70));
+        assert_eq!(score("holding_sword"), Some(0.60));
+        assert_eq!(score("white_background"), None);
+        assert_eq!(score("upper_body"), None);
     }
 
     #[test]

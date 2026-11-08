@@ -1,11 +1,11 @@
 """
-Prompt-Condenser: dual-pass Moondream + WD14 pipeline with a selectable split mode.
+Prompt-Condenser: dual-pass VLM (Qwen-VL / Moondream) + WD14 pipeline with a selectable split mode.
 
 Flow:
-  1. WD14 tags the image; Moondream describes it in two passes (prose).
-  2. Moondream prose is converted into WD-style (Danbooru) tags.
-  3. WD14 tags adjust the Moondream tags (reconcile): WD14 wins on attributes
-     (colors on clothing/hair/eyes), Moondream wins on pose and camera angle.
+  1. WD14 tags the image; VLM describes it in two passes (prose).
+  2. VLM prose is converted into WD-style (Danbooru) tags.
+  3. WD14 tags adjust the VLM tags (reconcile): WD14 wins on attributes
+     (colors on clothing/hair/eyes), VLM wins on pose and camera angle.
   4. Result is one WD-style prompt split into scene_prompt / character_prompt.
   5. Optionally, Gemma polishes the merged tags (use_llm_synthesis).
 
@@ -40,14 +40,17 @@ log = logging.getLogger("prompt_condenser")
 # WD14 thresholds are consumed by the upstream WD14 tagger node
 # (pass them to it when you call it; this file only receives the tag string).
 # ---------------------------------------------------------------------------
-MOONDREAM_TEMPERATURE = 0.1
+VLM_TEMPERATURE = 0.1
+MOONDREAM_TEMPERATURE = VLM_TEMPERATURE
 GEMMA_TEMPERATURE = 0.35
 GEMMA_OLLAMA_MODEL = "huihui_ai/gemma-4-abliterated:12b"
 GEMMA_CONTEXT_WINDOW = 131072   # 128K: the context the model page lists for the 12b tag
 GEMMA_MAX_TOKENS = 768          # normal output cap
 GEMMA_MAX_TOKENS_RETRY = 1024   # one retry with this cap if the first reply was cut off
-MOONDREAM_RETRIES = 1           # re-ask once if a pass comes back empty or looks like a refusal
-MOONDREAM_RETRY_TEMP_BUMP = 0.2 # retry slightly warmer so it does not repeat the same failure
+VLM_RETRIES = 1                 # re-ask once if a pass comes back empty or looks like a refusal
+MOONDREAM_RETRIES = VLM_RETRIES
+VLM_RETRY_TEMP_BUMP = 0.2       # retry slightly warmer so it does not repeat the same failure
+MOONDREAM_RETRY_TEMP_BUMP = VLM_RETRY_TEMP_BUMP
 TAG_ESCAPE_PARENTHESES = False  # True: write "(" as "\(" (A1111/ComfyUI prompt syntax)
 WD14_GENERAL_THRESHOLD = 0.22
 WD14_CHARACTER_THRESHOLD = 0.85
@@ -60,35 +63,41 @@ ZONE_FORMAT_HINT = (
 )
 
 # ---------------------------------------------------------------------------
-# PHASE 1: MOONDREAM PROMPTS + PER-MODE CONFIG
+# PHASE 1: VLM PROMPTS + PER-MODE CONFIG
 # ---------------------------------------------------------------------------
-MOONDREAM_MODE_A_PASS_1 = (
+VLM_MODE_A_PASS_1 = (
     "Analyze physical space and body proportions and silhouette as visible. "
     "Ignore clothing and face. 6 zones: 1. Scene & Lighting 2. Camera & Depth "
     "3. Core Pose 4. Upper Body Shape 5. Lower Body Shape 6. Physical Anchors"
     + ZONE_FORMAT_HINT
 )
-MOONDREAM_MODE_A_PASS_2 = (
+MOONDREAM_MODE_A_PASS_1 = VLM_MODE_A_PASS_1
+
+VLM_MODE_A_PASS_2 = (
     "Analyze facial identity and wardrobe. Ignore body weight and environment. "
     "6 zones: 1. Head & Hair 2. Face & Eyes 3. Torso Clothing 4. Leg Clothing "
     "5. Footwear 6. Accessories & Props"
     + ZONE_FORMAT_HINT
 )
+MOONDREAM_MODE_A_PASS_2 = VLM_MODE_A_PASS_2
 
-MOONDREAM_MODE_B_PASS_1 = (
+VLM_MODE_B_PASS_1 = (
     "Analyze physical space and skeletal pose. Ignore clothing, face, and body "
     "thickness. 6 zones: 1. Scene & Lighting 2. Camera & Depth 3. Center of "
     "Gravity & Stance 4. Torso & Head Alignment 5. Limb Positioning "
     "6. Environmental Anchors"
     + ZONE_FORMAT_HINT
 )
-MOONDREAM_MODE_B_PASS_2 = (
+MOONDREAM_MODE_B_PASS_1 = VLM_MODE_B_PASS_1
+
+VLM_MODE_B_PASS_2 = (
     "Analyze physical body proportions, facial identity, and wardrobe. Ignore "
     "environment and underlying pose mechanics. 6 zones: 1. Head & Face "
     "2. Upper Body Proportions & Clothing 3. Lower Body Proportions & Clothing "
     "4. Legwear & Footwear 5. Skin & Fabric Physics 6. Accessories & Props"
     + ZONE_FORMAT_HINT
 )
+MOONDREAM_MODE_B_PASS_2 = VLM_MODE_B_PASS_2
 
 # Scene keywords route WD14 tags to Pass 1 (scene_prompt). Matching is whole-word,
 # so "background" catches "simple background" / "white background", and "sky"
@@ -489,15 +498,17 @@ def merge_tags(raw_wd14_tags: str, pass1_txt: str, pass2_txt: str, mode: str,
         log.debug("WD14 tags that defaulted to Pass 2 (grow SCENE_KEYWORDS from these): %s", wd2)
 
     return {
-        # Moondream is the base; WD14 tags are added/adjusted on top.
+        # VLM is the base; WD14 tags are added/adjusted on top.
         "pass1_tags": md1 + wd1,
         "pass2_tags": md2 + wd2,
         "subject_tags": subject,
-        "dropped_moondream": sorted(drop_md),
+        "dropped_vlm": sorted(drop_md),
         "dropped_wd14": sorted(drop_wd),
         "dropped_hedged": sorted(hedged_unconfirmed),
-        "negated_moondream": negated,
+        "negated_vlm": negated,
         "unrouted_wd14": list(wd2),
+        "dropped_moondream": sorted(drop_md),
+        "negated_moondream": negated,
     }
 
 
@@ -667,38 +678,44 @@ def make_ollama_gemma_fn(model: str = GEMMA_OLLAMA_MODEL,
 _REFUSAL_RE = re.compile(r"\b(sorry|cannot|can't|unable to)\b", re.IGNORECASE)
 
 
-def _valid_moondream(text: str) -> bool:
+def _valid_vlm(text: str) -> bool:
     t = (text or "").strip()
     return len(t) >= 20 and not _REFUSAL_RE.search(t[:80])
 
 
-def _run_moondream(moondream_fn: Callable, image, prompt: str,
-                   label: str = "pass", warnings: Optional[list] = None) -> str:
-    """One Moondream pass; retry if it fails, is empty, or looks like a refusal.
+_valid_moondream = _valid_vlm
+
+
+def _run_vlm(vlm_fn: Callable, image, prompt: str,
+             label: str = "pass", warnings: Optional[list] = None) -> str:
+    """One VLM pass; retry if it fails, is empty, or looks like a refusal.
 
     Gives up with '' (that pass then contributes only its WD14 tags) and records a
     warning. A TypeError is re-raised: it means the wrapper is wired up wrong.
     """
     last_error = None
-    for attempt in range(MOONDREAM_RETRIES + 1):
-        temp = MOONDREAM_TEMPERATURE + (MOONDREAM_RETRY_TEMP_BUMP if attempt else 0.0)
+    for attempt in range(VLM_RETRIES + 1):
+        temp = VLM_TEMPERATURE + (VLM_RETRY_TEMP_BUMP if attempt else 0.0)
         try:
-            out = moondream_fn(image, prompt, temp)
+            out = vlm_fn(image, prompt, temp)
         except TypeError:
             raise
         except Exception as e:
             last_error = e
-            log.warning("Moondream %s attempt %d/%d failed: %s", label, attempt + 1,
-                        MOONDREAM_RETRIES + 1, e)
+            log.warning("VLM %s attempt %d/%d failed: %s", label, attempt + 1,
+                        VLM_RETRIES + 1, e)
             continue
-        if _valid_moondream(out):
+        if _valid_vlm(out):
             return out
-        log.warning("Moondream %s attempt %d/%d empty or refusal-like", label,
-                    attempt + 1, MOONDREAM_RETRIES + 1)
+        log.warning("VLM %s attempt %d/%d empty or refusal-like", label,
+                    attempt + 1, VLM_RETRIES + 1)
     if warnings is not None:
         reason = f"{type(last_error).__name__}: {last_error}" if last_error else "empty or refusal-like output"
-        warnings.append(f"Moondream {label} unavailable ({reason}); used WD14 tags only for it")
+        warnings.append(f"VLM {label} unavailable ({reason}); used WD14 tags only for it")
     return ""
+
+
+_run_moondream = _run_vlm
 
 
 _TRUNCATION_REASONS = {"length", "max_tokens", "max_length", "max_new_tokens"}
@@ -728,7 +745,7 @@ def _call_gemma(gemma_fn: Callable, text: str, image, max_tokens: int) -> tuple:
 
 # ---------------------------------------------------------------------------
 # PHASE 4: INTEGRATION
-# moondream_fn(image, prompt, temperature) -> str
+# vlm_fn(image, prompt, temperature) -> str
 # gemma_fn(text, temperature, max_tokens=..., image=...) -> str | (str, finish_reason)
 #   (image is only passed on the vision pass; finish_reason "length" or
 #    "max_tokens" means the reply was cut off and triggers one retry)
@@ -741,13 +758,19 @@ def run_pipeline(
     enable_dual_pass: bool,
     dual_pass_mode: str,
     use_llm_synthesis: bool,
-    moondream_fn: Callable,
+    vlm_fn: Optional[Callable] = None,
     gemma_fn: Optional[Callable] = None,
     single_pass_fn: Optional[Callable] = None,
     vocab_path: Optional[str] = None,
     keep_unmatched_prose: bool = False,
     gemma_vision_pass: bool = False,
+    moondream_fn: Optional[Callable] = None,
 ) -> dict:
+    if vlm_fn is None:
+        vlm_fn = moondream_fn
+    if vlm_fn is None and enable_dual_pass:
+        raise TypeError("run_pipeline() missing required argument: 'vlm_fn'")
+
     if not enable_dual_pass:
         # dual_pass_mode and use_llm_synthesis are ignored on this path.
         if single_pass_fn is None:
@@ -758,8 +781,8 @@ def run_pipeline(
     vocab = load_vocab(vocab_path) if vocab_path else None
     warnings: list = []
 
-    pass1_txt = _run_moondream(moondream_fn, image, cfg["pass1_prompt"], "pass 1", warnings)
-    pass2_txt = _run_moondream(moondream_fn, image, cfg["pass2_prompt"], "pass 2", warnings)
+    pass1_txt = _run_vlm(vlm_fn, image, cfg["pass1_prompt"], "pass 1", warnings)
+    pass2_txt = _run_vlm(vlm_fn, image, cfg["pass2_prompt"], "pass 2", warnings)
 
     def mechanical(reason: Optional[str] = None) -> dict:
         if reason:

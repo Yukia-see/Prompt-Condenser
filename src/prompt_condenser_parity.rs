@@ -93,15 +93,15 @@ fn rust_matches_python_reference() {
         check(
             "merge",
             format!("wd={:?} md1={:?} md2={:?} mode={:?} vocab={:?}", s(c, "wd"), s(c, "md1"), s(c, "md2"), s(c, "mode"), list(c, "vocab")),
-            fmt(&m.pass1_tags, &m.pass2_tags, &m.subject_tags, &m.dropped_moondream, &m.dropped_wd14, &m.dropped_hedged, &m.negated_moondream, &m.unrouted_wd14),
+            fmt(&m.pass1_tags, &m.pass2_tags, &m.subject_tags, &m.dropped_vlm, &m.dropped_wd14, &m.dropped_hedged, &m.negated_vlm, &m.unrouted_wd14),
             fmt(
                 &list(want, "pass1_tags"),
                 &list(want, "pass2_tags"),
                 &list(want, "subject_tags"),
-                &list(want, "dropped_moondream"),
+                &list(want, "dropped_vlm"),
                 &list(want, "dropped_wd14"),
                 &list(want, "dropped_hedged"),
-                &list(want, "negated_moondream"),
+                &list(want, "negated_vlm"),
                 &list(want, "unrouted_wd14"),
             ),
         );

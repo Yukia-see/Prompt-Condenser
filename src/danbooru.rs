@@ -350,6 +350,19 @@ pub fn extract_tags_from_prose(prose: &str) -> Vec<&'static str> {
     }
 
     // Body shape, build, and proportions
+    let has_closed_top = lower.contains("tube top")
+        || lower.contains("turtleneck")
+        || lower.contains("high collar")
+        || lower.contains("closed neckline")
+        || lower.contains("covered chest")
+        || lower.contains("no cleavage");
+    let has_confirmed_cleavage = (lower.contains("cleavage")
+        || lower.contains("plunging neckline")
+        || lower.contains("deep neckline")
+        || lower.contains("open neckline")
+        || lower.contains("exposed cleavage"))
+        && !has_closed_top;
+
     if lower.contains("curvy") || lower.contains("hourglass") || lower.contains("voluptuous") {
         push("curvy");
         push("hourglass figure");
@@ -385,13 +398,33 @@ pub fn extract_tags_from_prose(prose: &str) -> Vec<&'static str> {
     } else if lower.contains("enormous") || lower.contains("gigantic") || lower.contains("massive") {
         push("enormous breast size");
         push("huge breasts");
-        push("cleavage");
+        if has_confirmed_cleavage {
+            push("cleavage");
+        }
     } else if lower.contains("huge breast") || lower.contains("large breast") || lower.contains("big breast") || lower.contains("busty") {
         push("large breasts");
+        if has_confirmed_cleavage {
+            push("cleavage");
+        }
+    }
+    if has_confirmed_cleavage {
         push("cleavage");
     }
+    if lower.contains("sideboob") {
+        push("sideboob");
+    }
+    if lower.contains("underboob") {
+        push("underboob");
+    }
+    if lower.contains("keyhole") {
+        push("keyhole");
+    }
+    if lower.contains("off shoulder") || lower.contains("bare shoulders") {
+        push("off shoulder");
+        push("bare shoulders");
+    }
 
-    // Character hair, skin, headwear, and wardrobe
+    // Character hair, skin, headwear, hairpins, and wardrobe
     if lower.contains("fair skin") || lower.contains("pale skin") || lower.contains("light skin") {
         push("fair skin");
     }
@@ -411,6 +444,160 @@ pub fn extract_tags_from_prose(prose: &str) -> Vec<&'static str> {
         push("sunglasses on head");
         push("eyewear on head");
     }
+
+    // Specific hairpins, ornaments, and accessories
+    if lower.contains("flower hairpin") || lower.contains("flower hair ornament") || lower.contains("hair flower") {
+        push("flower hair ornament");
+    } else if lower.contains("butterfly hair ornament") || lower.contains("butterfly hairpin") {
+        push("butterfly hair ornament");
+    } else if lower.contains("star hair ornament") {
+        push("star hair ornament");
+    } else if lower.contains("heart hair ornament") {
+        push("heart hair ornament");
+    } else if lower.contains("x hair ornament") {
+        push("x hair ornament");
+    } else if lower.contains("hairclip") || lower.contains("hair clip") {
+        push("hairclip");
+    } else if lower.contains("hair ribbon") || lower.contains("hair bow") {
+        push("hair ribbon");
+        push("hair bow");
+    } else if lower.contains("hairpin") {
+        push("hairpin");
+    } else if lower.contains("hairband") || lower.contains("headband") {
+        push("hairband");
+    } else if lower.contains("scrunchie") {
+        push("scrunchie");
+    } else if lower.contains("tiara") {
+        push("tiara");
+    } else if lower.contains("crown") {
+        push("crown");
+    } else if lower.contains("maid headdress") || lower.contains("headdress") {
+        push("maid headdress");
+    }
+    if lower.contains("earring") || lower.contains("earrings") {
+        push("earrings");
+    }
+    if lower.contains("choker") {
+        push("choker");
+    }
+    if lower.contains("necklace") {
+        push("necklace");
+    }
+
+    // Held items and hand actions
+    if lower.contains("holding phone") || lower.contains("holding cellphone") || lower.contains("holding smartphone") || lower.contains("holding mobile") {
+        push("holding phone");
+    } else if lower.contains("holding cup") || lower.contains("holding mug") || lower.contains("holding teacup") {
+        push("holding cup");
+    } else if lower.contains("holding drink") || lower.contains("holding glass") || lower.contains("holding bottle") {
+        push("holding drink");
+    } else if lower.contains("holding book") {
+        push("holding book");
+    } else if lower.contains("holding umbrella") || lower.contains("holding parasol") {
+        push("holding umbrella");
+    } else if lower.contains("holding bag") || lower.contains("holding handbag") {
+        push("holding bag");
+    } else if lower.contains("holding sword") || lower.contains("holding blade") || lower.contains("holding katana") {
+        push("holding sword");
+    } else if lower.contains("holding weapon") || lower.contains("holding gun") {
+        push("holding weapon");
+    } else if lower.contains("holding staff") || lower.contains("holding wand") {
+        push("holding staff");
+    } else if lower.contains("holding fan") {
+        push("holding fan");
+    } else if lower.contains("holding flower") || lower.contains("holding bouquet") {
+        push("holding flower");
+    } else if lower.contains("holding food") {
+        push("holding food");
+    } else if lower.contains("holding plushie") || lower.contains("holding doll") {
+        push("holding plushie");
+    } else if lower.contains("holding camera") {
+        push("holding camera");
+    } else if lower.contains("holding microphone") {
+        push("holding microphone");
+    }
+
+    // Hand gestures and pose anchors
+    if lower.contains("hand on hip") || lower.contains("hands on hips") {
+        push("hand on hip");
+    }
+    if lower.contains("hands on knees") || lower.contains("hand on knee") || lower.contains("hands on legs") {
+        push("hands on knees");
+    }
+    if lower.contains("arms up") {
+        push("arms up");
+    }
+    if lower.contains("crossed arms") || lower.contains("arms crossed") {
+        push("crossed arms");
+    }
+    if lower.contains("peace sign") || lower.contains("v sign") {
+        push("peace sign");
+        push("v");
+    }
+
+    // Footwear, legwear, and straps
+    if lower.contains("o-ring") && (lower.contains("strap") || lower.contains("thigh")) {
+        push("o-ring thigh strap");
+    } else if lower.contains("thigh strap") {
+        push("thigh strap");
+    }
+    if lower.contains("garter strap") || lower.contains("garter belt") {
+        push("garter straps");
+    }
+    if lower.contains("white shoe") || lower.contains("white sneakers") {
+        push("white shoes");
+    } else if lower.contains("shoe") || lower.contains("sneaker") {
+        push("shoes");
+    } else if lower.contains("boot") || lower.contains("boots") {
+        push("boots");
+    } else if lower.contains("heel") || lower.contains("high heels") {
+        push("high heels");
+    } else if lower.contains("sandal") || lower.contains("sandals") {
+        push("sandals");
+    }
+    if lower.contains("white sock") || lower.contains("white socks") {
+        push("white socks");
+    }
+
+    // Environmental plants and concrete objects
+    if lower.contains("potted plant") || lower.contains("houseplant") {
+        push("potted plant");
+    } else if lower.contains("plant") && !lower.contains("plantation") {
+        push("plant");
+    }
+    if lower.contains("flower") && !lower.contains("flower hair") && !lower.contains("holding flower") {
+        push("flower");
+    }
+    if lower.contains("vase") {
+        push("vase");
+    }
+    if lower.contains("window") {
+        push("window");
+    }
+    if lower.contains("curtain") || lower.contains("curtains") {
+        push("curtains");
+    }
+    if lower.contains("lamp") || lower.contains("lantern") {
+        push("lamp");
+    }
+    if lower.contains("chair") || lower.contains("armchair") {
+        push("chair");
+    }
+    if lower.contains("couch") || lower.contains("sofa") {
+        push("couch");
+    }
+    if lower.contains("table") || lower.contains("desk") {
+        push("table");
+    }
+    if lower.contains("bookshelf") || lower.contains("bookcase") {
+        push("bookshelf");
+    }
+    if lower.contains("mirror") {
+        push("mirror");
+    }
+    if lower.contains("clock") {
+        push("clock");
+    }
     if (lower.contains("tube top") || lower.contains("crop top") || lower.contains("camisole") || lower.contains("tank top") || lower.contains("bikini top"))
         && (lower.contains("light blue") || lower.contains("pale blue") || lower.contains("baby blue") || lower.contains("blue"))
     {
@@ -429,6 +616,169 @@ pub fn extract_tags_from_prose(prose: &str) -> Vec<&'static str> {
     }
 
     out
+}
+
+/// Sanitizes scanner tags, resolves camera framing paradoxes, purges archetype vs. uniform collisions,
+/// and infers implicit full-body framing when footwear/legwear is detected.
+pub fn antigravity_tag_filter(raw_tag_string: &str) -> String {
+    const WIDE_SHOTS: &[&str] = &["full body", "cowboy shot", "wide shot"];
+    const CLOSE_SHOTS: &[&str] = &["close-up", "portrait", "upper body", "face focus"];
+    const TOPS: &[&str] = &[
+        "bra_top", "shirt", "jacket", "tank top", "camisole", "bikini top", "tube top", "crop top", "sweater", "hoodie",
+    ];
+    const BOTTOMS: &[&str] = &[
+        "pants", "skirt", "shorts", "bikini bottoms", "panties", "underwear", "dress", "jeans", "leggings",
+    ];
+    const STATIC_POSES: &[&str] = &["standing", "sitting", "kneeling"];
+    const LIMB_ANCHORS: &[&str] = &[
+        "hand", "hands", "arm", "arms", "holding", "reaching", "pulling", "adjusting", "crossed", "lap", "hips",
+    ];
+    const ARCHETYPE_OVERRIDES: &[&str] = &["bunny girl", "cat girl", "fox girl"];
+    const UNIFORMS: &[&str] = &["maid", "maid outfit", "plaid dress", "school uniform", "serafuku", "suit"];
+
+    let mut tags: Vec<String> = Vec::new();
+    for raw in raw_tag_string.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let clean = raw
+            .replace('(', "")
+            .replace(')', "")
+            .split(':')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_lowercase();
+        if !clean.is_empty() && !tags.contains(&clean) {
+            tags.push(clean);
+        }
+    }
+
+    // 2. Implicit Full-Body Inference (Footwear/Legwear Trigger)
+    let has_footwear = tags.iter().any(|t| {
+        ["thighhighs", "mary janes", "boots", "heels", "barefoot", "sandals"]
+            .iter()
+            .any(|fw| t.contains(fw))
+    });
+    let has_cam = tags.iter().any(|t| {
+        WIDE_SHOTS.contains(&t.as_str()) || CLOSE_SHOTS.contains(&t.as_str())
+    });
+    if has_footwear && !has_cam {
+        tags.insert(0, "full body".to_string());
+    }
+
+    // 3. Camera Paradox Resolution (Wide overrides Close)
+    let has_wide = tags.iter().any(|t| WIDE_SHOTS.contains(&t.as_str()));
+    if has_wide {
+        tags.retain(|t| !CLOSE_SHOTS.contains(&t.as_str()));
+    }
+
+    // 4. Archetype vs. Uniform Collision Purge
+    let has_uniform = tags.iter().any(|t| UNIFORMS.iter().any(|u| t.contains(u)));
+    if has_uniform {
+        tags.retain(|t| !ARCHETYPE_OVERRIDES.contains(&t.as_str()));
+    }
+
+    // 5. Bottomless Hazard Flagging
+    let has_top = tags.iter().any(|t| TOPS.iter().any(|top| t.contains(top)));
+    let has_bottom = tags.iter().any(|t| BOTTOMS.iter().any(|bot| t.contains(bot)));
+    if has_wide && has_top && !has_bottom {
+        tags.push("MISSING_BOTTOMS_FLAG".to_string());
+    }
+
+    // 6. Unrouted Limb Flagging
+    let has_static = tags.iter().any(|t| STATIC_POSES.contains(&t.as_str()));
+    let has_limb_anchor = tags.iter().any(|t| LIMB_ANCHORS.iter().any(|l| t.contains(l)));
+    if has_static && !has_limb_anchor {
+        tags.push("UNANCHORED_LIMBS_FLAG".to_string());
+    }
+
+    tags.join(", ")
+}
+
+/// Strips redundant uncolored parent garment tags (`shirt`, `skirt`, `thighhighs`, `shoes`, `socks`, `bikini`, `bow`, `thigh strap`)
+/// whenever a specific colored or modified child version (`white shirt`, `blue skirt`, `white thighhighs`, `o-ring thigh strap`) exists.
+pub fn dedup_color_parents(prompt: &str) -> String {
+    const PARENTS: &[&str] = &[
+        "hair",
+        "eyes",
+        "dress",
+        "china dress",
+        "shirt",
+        "jacket",
+        "skirt",
+        "shorts",
+        "pants",
+        "thighhighs",
+        "kneehighs",
+        "socks",
+        "gloves",
+        "boots",
+        "shoes",
+        "bikini",
+        "bra",
+        "panties",
+        "bow",
+        "ribbon",
+        "tail",
+        "ears",
+        "thigh strap",
+    ];
+    let items: Vec<&str> = prompt.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+    let norms: Vec<String> = items.iter().map(|s| key(s)).collect();
+    items
+        .into_iter()
+        .enumerate()
+        .filter(|(idx, _)| {
+            let n = &norms[*idx];
+            if !PARENTS.contains(&n.as_str()) {
+                return true;
+            }
+            // Drop bare parent if another token ends with ` <parent>` (e.g. `white thighhighs` -> drop `thighhighs`)
+            let suffix = format!(" {n}");
+            !norms.iter().enumerate().any(|(j, other)| j != *idx && other.ends_with(&suffix))
+        })
+        .map(|(_, raw)| raw)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Orders character tags into the 8 canonical Danbooru buckets from `master_synergy_rules.json`:
+/// 1. Count/Quality -> 2. Framing -> 3. Character/Species -> 4. Proportions -> 5. Hair/Face -> 6. Outfit/Synergy -> 7. Pose/Action -> 8. Other
+pub fn sort_canonical_buckets(prompt: &str) -> String {
+    let tokens = crate::parser::parse_prompt(prompt);
+    if tokens.is_empty() {
+        return String::new();
+    }
+    let bucket_of = |t: &crate::parser::PromptToken| -> u8 {
+        let n = t.normalized.as_str();
+        if crate::two::count_tag(n).is_some() || n == "solo" || n == "multiple girls" || n == "multiple boys" {
+            return 1;
+        }
+        if matches!(n, "full body" | "cowboy shot" | "upper body" | "lower body" | "portrait" | "close-up") {
+            return 2;
+        }
+        if is_character(n) || n.ends_with(" ears") || n.ends_with(" tail") || n.ends_with(" wings") || n.ends_with(" horns") {
+            return 3;
+        }
+        if crate::scene::is_body_shape_tag(n) || crate::scene::is_height_stature_tag(n) || n == "fair skin" || n == "dark skin" || n == "shiny skin" {
+            return 4;
+        }
+        if n.contains("hair") || n.contains("bangs") || n.contains("twintails") || n.contains("ponytail") || n.contains("bob cut") || n.contains("ahoge")
+            || n.contains("eyes") || n.contains("eyelashes") || n == "eyepatch" || n == "one eye covered" || n == "blush" || n.contains("smile") || n == "smiling"
+            || n.contains("mouth") || n.contains("lips") || n == "teeth" || n == "oval face"
+        {
+            return 5;
+        }
+        if crate::sceneref::is_action(t) || crate::scene::is_skeletal_or_prop_pose(n) || n == "relaxed" || n == "relaxed pose" || n == "head tilt" {
+            return 7;
+        }
+        6
+    };
+    let mut indexed: Vec<(u8, usize, String)> = tokens
+        .into_iter()
+        .enumerate()
+        .map(|(i, t)| (bucket_of(&t), i, t.raw.trim().to_string()))
+        .collect();
+    indexed.sort_by_key(|(b, i, _)| (*b, *i));
+    indexed.into_iter().map(|(_, _, raw)| raw).collect::<Vec<_>>().join(", ")
 }
 
 #[cfg(test)]

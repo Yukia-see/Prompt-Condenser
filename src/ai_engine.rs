@@ -1167,22 +1167,26 @@ const CHARACTER_CHECKLIST: &str = "Capture each character exactly: hair (length,
 
 /// Vision models gain nothing from huge images but get much slower: anything over
 /// 1024 px on its longest side is scaled down and sent as JPEG.
-fn shrink_for_vision(path: &std::path::Path) -> Result<Vec<u8>> {
+pub(crate) fn shrink_for_vision_custom(path: &std::path::Path, max_edge: u32) -> Result<Vec<u8>> {
     let original = std::fs::read(path).with_context(|| format!("Couldn't read {}", path.display()))?;
     let Ok(img) = image::load_from_memory(&original) else {
         return Ok(original);
     };
-    if img.width().max(img.height()) <= 1024 && original.starts_with(&[0xFF, 0xD8, 0xFF]) {
+    if img.width().max(img.height()) <= max_edge && original.starts_with(&[0xFF, 0xD8, 0xFF]) {
         return Ok(original);
     }
-    let small = if img.width().max(img.height()) > 1024 {
-        img.resize(1024, 1024, image::imageops::FilterType::Triangle).to_rgb8()
+    let small = if img.width().max(img.height()) > max_edge {
+        img.resize(max_edge, max_edge, image::imageops::FilterType::Triangle).to_rgb8()
     } else {
         img.to_rgb8()
     };
     let mut out = Vec::new();
     image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 85).encode_image(&small)?;
     Ok(out)
+}
+
+pub(crate) fn shrink_for_vision(path: &std::path::Path) -> Result<Vec<u8>> {
+    shrink_for_vision_custom(path, 1024)
 }
 
 fn image_system_prompt(config: &ScanConfig, tag_hints: &str) -> String {
@@ -1291,12 +1295,7 @@ pub fn describe_scene_pose(req: &ImageAiRequest) -> Result<ImageAiResult> {
     let mut prose_tags: Vec<&'static str> = Vec::new();
     let mut out = if let Some(ref encoder) = req.vision_encoder {
         if !same_model(encoder, &req.model) {
-            let ask = if req.scene_body_shape {
-                "Describe in detail the exact physical posture and skeletal pose: how the person is sitting, standing, or leaning, exact leg and knee positions, exact hand and arm actions including any garment or prop interaction, whether a foot is bare or wearing footwear, gaze direction, camera angle and depth of field, room or environment setting, and lighting. Also describe the person's body shape, build, and proportions (such as curvy, slender, athletic, fit, waist, hips, thighs, bust size). Do not describe hair color, eye color, or clothing identity."
-            } else {
-                "Describe in detail the exact physical posture and skeletal pose: how the person is sitting, standing, or leaning, exact leg and knee positions, exact hand and arm actions including any garment or prop interaction, whether a foot is bare or wearing footwear, gaze direction, camera angle and depth of field, room or environment setting, and lighting. Do not describe hair color, eye color, or personal identity traits."
-            };
-            let vision_desc = extract_visual_description(req, encoder, ask)?;
+            let vision_desc = extract_visual_description_from_path(&req.image_path, &req.host, req.mode, encoder)?;
             prose_tags = crate::danbooru::extract_tags_from_prose(&vision_desc);
             let mut enriched_hints = req.tag_hints.clone();
             for pt in &prose_tags {
@@ -1364,6 +1363,29 @@ pub fn run_dual_pass_pipeline(
     raw_wd14_tags: &str,
     opts: crate::prompt_condenser::PipelineOptions,
 ) -> crate::prompt_condenser::PipelineResult {
+    run_dual_pass_asymmetric_pipeline(
+        host,
+        mode_ai,
+        vision_model,
+        vision_model,
+        text_model,
+        image_path,
+        raw_wd14_tags,
+        opts,
+    )
+}
+
+/// Executes dual-pass vision with potentially different models for Pass 1 (spatial/body) and Pass 2 (identity/wardrobe).
+pub fn run_dual_pass_asymmetric_pipeline(
+    host: &str,
+    mode_ai: AiMode,
+    pass1_vision_model: &str,
+    pass2_vision_model: &str,
+    text_model: &str,
+    image_path: &std::path::Path,
+    raw_wd14_tags: &str,
+    opts: crate::prompt_condenser::PipelineOptions,
+) -> crate::prompt_condenser::PipelineResult {
     use base64::Engine as _;
     let base = match base_url(host) {
         Ok(b) => b,
@@ -1384,7 +1406,18 @@ pub fn run_dual_pass_pipeline(
     };
     let b64_image = base64::engine::general_purpose::STANDARD.encode(&img_bytes);
 
+    let effective_opts = crate::prompt_condenser::PipelineOptions {
+        mode: crate::prompt_condenser::Mode::SceneShape,
+        use_llm_synthesis: opts.use_llm_synthesis,
+        gemma_vision_pass: opts.gemma_vision_pass,
+    };
+
     let moondream_fn = |prompt: &str, temp: f32| -> Result<String, String> {
+        let vision_model = if prompt == effective_opts.mode.pass1_prompt() {
+            pass1_vision_model
+        } else {
+            pass2_vision_model
+        };
         let body = serde_json::json!({
             "model": vision_model,
             "prompt": prompt,
@@ -1393,7 +1426,10 @@ pub fn run_dual_pass_pipeline(
             "think": false,
             "keep_alive": "30m",
             "options": {
-                "temperature": temp,
+                "temperature": (temp * 0.5).min(0.05),
+                "top_p": 0.85,
+                "seed": 42,
+                "repeat_penalty": 1.15,
                 "num_predict": 500,
                 "num_ctx": 2048,
                 "num_gpu": if mode_ai == AiMode::CpuOnly { Some(0) } else { None::<i32> },
@@ -1428,10 +1464,14 @@ pub fn run_dual_pass_pipeline(
             Ok(true) => {
                 Some(Box::new(|req: &crate::prompt_condenser::GemmaRequest| -> Result<crate::prompt_condenser::GemmaReply, String> {
                     let img_opt = if req.with_image { Some(b64_image.as_str()) } else { None };
+                    let fixed_text = req.text.replace(
+                        "Place environment, lighting, camera and pose in scene_prompt. Place face, hair, body proportions, clothing and props in character_prompt.",
+                        "Place environment, lighting and camera in scene_prompt. Place face, hair, body proportions, clothing, props and skeletal pose in character_prompt.",
+                    );
                     let req_body = crate::prompt_condenser::ollama_chat_request_body(
                         text_model,
-                        req.text,
-                        req.temperature,
+                        &fixed_text,
+                        0.10, // Calibrated deterministic synthesis temperature (prevents tag improvisation)
                         crate::prompt_condenser::GEMMA_CONTEXT_WINDOW,
                         req.max_tokens,
                         img_opt,
@@ -1457,14 +1497,89 @@ pub fn run_dual_pass_pipeline(
     let vocab = crate::danbooru::get_prompt_condenser_vocab();
     let cfg = crate::prompt_condenser::Config::default();
     let gemma_ref = gemma_fn.as_ref().map(|f| f.as_ref());
+    let sanitized_wd14 = crate::danbooru::antigravity_tag_filter(raw_wd14_tags)
+        .replace(", MISSING_BOTTOMS_FLAG", "")
+        .replace(", UNANCHORED_LIMBS_FLAG", "");
+
+    // Enrich with multi-zone/quadrant prose detections if vision model is available
+    let multizone_tags = extract_visual_description_from_path(image_path, host, mode_ai, pass2_vision_model)
+        .ok()
+        .map(|desc| crate::danbooru::extract_tags_from_prose(&desc))
+        .unwrap_or_default();
+    let mut enriched_wd14 = sanitized_wd14;
+    for mt in multizone_tags {
+        if !enriched_wd14.to_lowercase().contains(&mt.to_lowercase()) {
+            enriched_wd14.push_str(", ");
+            enriched_wd14.push_str(mt);
+        }
+    }
+
     let mut result = crate::prompt_condenser::run_dual_pass(
-        raw_wd14_tags,
-        &opts,
+        &enriched_wd14,
+        &effective_opts,
         &cfg,
         vocab,
         &moondream_fn,
         gemma_ref,
     );
+
+    // Post-synthesis rule-engine upgrades (Deduplication, Layering, White-on-White, Gaze, and 8-Bucket Ordering)
+    if !result.character_prompt.is_empty() {
+        let mut char_tags = crate::danbooru::dedup_color_parents(&result.character_prompt);
+        let lower_char = char_tags.to_lowercase();
+        let lower_scene = result.scene_prompt.to_lowercase();
+
+        // White-on-White Silhouette & Contrast Protection
+        if lower_scene.contains("white background")
+            && (lower_char.contains("white bikini")
+                || lower_char.contains("white shirt")
+                || lower_char.contains("white dress")
+                || lower_char.contains("white hair"))
+            && !lower_char.contains("bold outlines")
+            && !lower_char.contains("distinct outlines")
+        {
+            char_tags.push_str(", bold outlines, drop shadow");
+        }
+
+        // Garment Layering Resolver (shirt + swimsuit)
+        if (lower_char.contains("white shirt") || lower_char.contains("blue shirt") || lower_char.contains("sailor shirt"))
+            && (lower_char.contains("school swimsuit") || lower_char.contains("one-piece swimsuit"))
+            && !lower_char.contains("swimsuit under clothes")
+            && !lower_char.contains("shirt over swimsuit")
+        {
+            char_tags.push_str(", swimsuit under clothes");
+        }
+
+        // Gaze vs. Eyelid Conflict Resolver
+        if lower_char.contains("closed eyes")
+            && !lower_char.contains("one eye closed")
+            && !lower_char.contains("eyepatch")
+            && !lower_char.contains("one eye covered")
+        {
+            char_tags = char_tags
+                .split(',')
+                .map(str::trim)
+                .filter(|t| !t.eq_ignore_ascii_case("looking at viewer"))
+                .collect::<Vec<_>>()
+                .join(", ");
+        }
+
+        // Multi-Character Stature & Posture Lock (strip global standing from scene when sitting is active)
+        if (lower_char.contains("2girls") || lower_char.contains("3girls") || lower_char.contains("multiple girls"))
+            && lower_char.contains("sitting")
+            && lower_scene.contains("standing")
+        {
+            result.scene_prompt = result
+                .scene_prompt
+                .split(',')
+                .map(str::trim)
+                .filter(|t| !t.eq_ignore_ascii_case("standing"))
+                .collect::<Vec<_>>()
+                .join(", ");
+        }
+
+        result.character_prompt = crate::danbooru::sort_canonical_buckets(&char_tags);
+    }
 
     if opts.use_llm_synthesis && gemma_fn.is_none() {
         let msg = crate::prompt_condenser::ollama_not_pulled_message(text_model);
@@ -1577,97 +1692,100 @@ pub fn extract_visual_description_from_path(
     let base = base_url(host)?;
     let img = image::open(path).with_context(|| format!("Couldn't open {}", path.display()))?;
 
-    let boxes = crate::detector::detect(&img).unwrap_or_default();
-
-    if boxes.len() > 1 {
-        // Multi-character spatial pass
-        let scene_b64 = encode_dynamic_image_b64(&img)?;
-        let scene_ask = "Describe the overall scene, background, lighting, and the exact spatial arrangement of characters from left to right (who is on the left, center, right, and their relative positions and poses).";
-        let scene_desc = ask_vision_encoder(&base, mode, encoder, scene_b64, scene_ask)?;
-
-        let count = boxes.len().min(4);
-        let chars = crate::detector::main_n(&boxes, count).unwrap_or_else(|| boxes.clone());
-        let pos_labels: &[&str] = match count {
-            2 => &["Left Character", "Right Character"],
-            3 => &["Left Character", "Center Character", "Right Character"],
-            _ => &["Far-Left Character", "Center-Left Character", "Center-Right Character", "Far-Right Character"],
-        };
-
-        let mut char_descs = Vec::new();
-        for (i, b) in chars.iter().enumerate() {
-            let label = pos_labels.get(i).copied().unwrap_or("Character");
-            let crop = crate::detector::crop(&img, b);
-            let b64 = encode_dynamic_image_b64(&crop)?;
-            let ask = format!(
-                "Describe the {} in detail: hair color and hairstyle, eyes, facial expression, body build, chest/breast size (e.g. flat chest, small, medium, large, or huge breasts), clothing (upper and lower), accessories, items held, pose, and footwear.",
-                label
-            );
-            let desc = ask_vision_encoder(&base, mode, encoder, b64, &ask).unwrap_or_default();
-            char_descs.push(format!("- **{}**: {}", label, desc));
-        }
-
-        return Ok(format!(
-            "### Scene & Environment (Spatial Overview):\n{scene_desc}\n\n\
-             ### Characters (Left-to-Right Positional Breakdown):\n{}",
-            char_descs.join("\n")
-        ));
-    }
-
-    // Pass 1: Global scene & environment pass
+    // 1. Pass 1: Global scene & environment overview
     let scene_b64 = encode_dynamic_image_b64(&img)?;
     let scene_ask = "Describe the overall scene: setting, background, atmosphere, lighting, camera framing, and character placement.";
     let scene_desc = ask_vision_encoder(&base, mode, encoder, scene_b64, scene_ask)?;
 
-    // Check for detected single character to run multi-zone anatomical inspection
-    // (fallback to full-frame box when anime detector finds no box on realistic/cosplay photos)
-    let main = boxes
-        .into_iter()
-        .max_by(|a, b| a.area().total_cmp(&b.area()))
-        .unwrap_or(crate::detector::PersonBox {
+    // 2. Pass 2: 4-Quadrant Environmental Object & Prop Pinpointing (plants, furniture, lamps, windows, decor)
+    let quads = crate::detector::quadrant_crops(&img);
+    let mut quad_parts = Vec::new();
+    for (name, q_img) in &quads {
+        if let Ok(q_tags) = crate::tagger::tag_dynamic(q_img) {
+            let triggers = crate::tagger::extract_zone_triggers(&q_tags, 0.40);
+            let has_objects = triggers.iter().any(|t| crate::tagger::is_concrete_scene_object(t));
+            if has_objects {
+                if let Ok(q_b64) = encode_dynamic_image_b64(q_img) {
+                    let q_ask = format!(
+                        "In this {} crop, pinpoint and describe any visible background or environmental objects (specifically: plants, potted plants, flowers, trees, furniture, lamps, windows, mirrors, wall art, or props). Triggers detected: {}. Be concrete and concise.",
+                        name,
+                        triggers.join(", ")
+                    );
+                    if let Ok(desc) = ask_vision_encoder(&base, mode, encoder, q_b64, &q_ask) {
+                        if !desc.trim().is_empty() {
+                            quad_parts.push(format!("- **{} (Objects & Decor)**: {}", name, desc.trim()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let quad_section = if quad_parts.is_empty() {
+        String::new()
+    } else {
+        format!("\n\n### Quadrant Environment & Objects (Plants, Decor & Props):\n{}", quad_parts.join("\n"))
+    };
+
+    // 3. Pass 3: Universal 3-Zone Anatomical Scan (Upper + Middle + Lower) for EVERY character
+    let boxes = crate::detector::detect(&img).unwrap_or_default();
+    let count = boxes.len().clamp(1, 4);
+    let chars = if boxes.is_empty() {
+        vec![crate::detector::PersonBox {
             x0: 0.0,
             y0: 0.0,
             x1: img.width() as f32,
             y1: img.height() as f32,
             score: 1.0,
-        });
+        }]
+    } else {
+        crate::detector::main_n(&boxes, count).unwrap_or_else(|| boxes.clone())
+    };
 
-    {
-        let h = (main.y1 - main.y0).max(1.0);
-        let ih = (img.height() as f32).max(1.0);
+    let pos_labels: &[&str] = match count {
+        1 => &["Character"],
+        2 => &["Left Character", "Right Character"],
+        3 => &["Left Character", "Center Character", "Right Character"],
+        _ => &["Far-Left Character", "Center-Left Character", "Center-Right Character", "Far-Right Character"],
+    };
 
-        // If the character is reasonably sized (> 30% of height), inspect upper, middle, and lower zones
-        if h / ih >= 0.30 {
-            let up_img = crate::detector::upper_crop(&img, &main);
-            let mid_img = crate::detector::middle_crop(&img, &main);
-            let low_img = crate::detector::lower_crop(&img, &main);
+    let mut char_sections = Vec::new();
+    for (i, b) in chars.iter().enumerate() {
+        let label = pos_labels.get(i).copied().unwrap_or("Character");
+        let zones = crate::detector::three_zone_crops(&img, b);
+        let up_b64 = encode_dynamic_image_b64(&zones[0].1)?;
+        let mid_b64 = encode_dynamic_image_b64(&zones[1].1)?;
+        let low_b64 = encode_dynamic_image_b64(&zones[2].1)?;
 
-            let up_b64 = encode_dynamic_image_b64(&up_img)?;
-            let mid_b64 = encode_dynamic_image_b64(&mid_img)?;
-            let low_b64 = encode_dynamic_image_b64(&low_img)?;
+        let up_ask = format!(
+            "Pinpoint head, hair, and facial attributes for {label}: exact hair color, length, bangs/parting, specific type of hairpin or hair ornament (e.g. flower hairpin, butterfly ornament, hairclip, hair bow, ribbon, headband, tiara), eyewear (glasses, sunglasses on head), earrings, choker/necklace, animal ears or horns, eye color, and facial expression."
+        );
+        let mid_ask = format!(
+            "Pinpoint torso, neckline, pose, and held items for {label}: exact upper clothing cut, color, and print/logo; whether cleavage, sideboob, underboob, or a keyhole cutout is visible vs. a closed neckline; chest/torso proportions and waist; exact arm and hand pose; and pinpoint any specific item she is holding or touching (e.g. holding phone, cup, drink, book, bag, umbrella, weapon/sword, fan, flower)."
+        );
+        let low_ask = format!(
+            "Pinpoint lower body, leg pose, and footwear for {label}: exact lower clothing (skirt, shorts, pants, bikini bottoms), hip and thigh build, exact skeletal leg and knee posture (sitting, standing, kneeling, legs crossed, knee up), legwear and straps (thighhighs, socks, o-ring thigh strap, garter straps, skindentation), hand actions on legs/stockings, and specific footwear (shoes, sneakers, boots, heels, sandals, or barefoot)."
+        );
 
-            let up_ask = "Describe in detail the head, face, skin tone, eye shade, hair color, length, and texture, headwear or eyewear placement, animal ears or horns, expressions, and collar accessories.";
-            let mid_ask = "Describe in detail the upper clothing cut, color, patterns or logos, fabric fit and tension, chest proportions, torso build, waist, sleeves, gloves, hands and what they are touching or holding, and belts.";
-            let low_ask = "Describe in detail the lower body and leg pose: bottoms, skirt, shorts or swimwear, leg positions, legwear, stockings, socks, hand actions on legs or clothes, and feet, bare feet, or shoes.";
+        let up_desc = ask_vision_encoder(&base, mode, encoder, up_b64, &up_ask).unwrap_or_default();
+        let mid_desc = ask_vision_encoder(&base, mode, encoder, mid_b64, &mid_ask).unwrap_or_default();
+        let low_desc = ask_vision_encoder(&base, mode, encoder, low_b64, &low_ask).unwrap_or_default();
 
-            let up_desc = ask_vision_encoder(&base, mode, encoder, up_b64, up_ask).unwrap_or_default();
-            let mid_desc = ask_vision_encoder(&base, mode, encoder, mid_b64, mid_ask).unwrap_or_default();
-            let low_desc = ask_vision_encoder(&base, mode, encoder, low_b64, low_ask).unwrap_or_default();
-
-            return Ok(format!(
-                "### Scene & Environment:\n{scene_desc}\n\n\
-                 ### Character Anatomy (Multi-Zone Detail Scan):\n\
-                 - Head, Face & Ears (Upper Zone): {up_desc}\n\
-                 - Torso, Arms & Chest Size (Middle Zone): {mid_desc}\n\
-                 - Legs, Feet & Claws/Tail (Lower Zone): {low_desc}"
-            ));
-        }
+        char_sections.push(format!(
+            "### Character: {}\n- **Head, Hair, Hairpins & Face (Upper Zone)**: {}\n- **Torso, Neckline/Cleavage, Arms & Held Items (Middle Zone)**: {}\n- **Hips, Legs, Straps & Footwear (Lower Zone)**: {}",
+            label, up_desc.trim(), mid_desc.trim(), low_desc.trim()
+        ));
     }
 
-    Ok(scene_desc)
+    Ok(format!(
+        "### Scene & Environment (Spatial Overview):\n{}{}\n\n{}",
+        scene_desc.trim(),
+        quad_section,
+        char_sections.join("\n\n")
+    ))
 }
 
-/// Sends a single image to a vision encoder (like Moondream) to extract an objective description.
-fn ask_vision_encoder(base: &str, mode: AiMode, encoder: &str, base64_image: String, ask: &str) -> Result<String> {
+/// Sends a single image to a vision encoder (like Moondream or Qwen 2.5-VL) to extract an objective description.
+pub(crate) fn ask_vision_encoder(base: &str, mode: AiMode, encoder: &str, base64_image: String, ask: &str) -> Result<String> {
     let body = json!({
         "model": encoder,
         "prompt": ask,
@@ -1676,7 +1794,10 @@ fn ask_vision_encoder(base: &str, mode: AiMode, encoder: &str, base64_image: Str
         "think": false,
         "keep_alive": "30m",
         "options": {
-            "temperature": 0.2,
+            "temperature": 0.05,
+            "top_p": 0.85,
+            "seed": 42,
+            "repeat_penalty": 1.15,
             "num_predict": 500,
             "num_ctx": 2048,
             "num_gpu": if mode == AiMode::CpuOnly { Some(0) } else { None::<i32> },
@@ -1693,14 +1814,6 @@ fn ask_vision_encoder(base: &str, mode: AiMode, encoder: &str, base64_image: Str
         return Err(anyhow!("The vision encoder returned an empty description."));
     }
     Ok(desc)
-}
-
-/// Uses a vision encoder (like moondream) to extract a detailed visual description of an image.
-fn extract_visual_description(req: &ImageAiRequest, encoder: &str, ask: &str) -> Result<String> {
-    use base64::Engine as _;
-    let base = base_url(&req.host)?;
-    let image = base64::engine::general_purpose::STANDARD.encode(shrink_for_vision(&req.image_path)?);
-    ask_vision_encoder(&base, req.mode, encoder, image, ask)
 }
 
 /// Formats a visual description into checkpoint-tailored prompt tags using a target text model.
@@ -1720,7 +1833,8 @@ fn describe_with_text_model(
         "think": false,
         "keep_alive": "30m",
         "options": {
-            "temperature": 0.2,
+            "temperature": 0.10,
+            "top_p": 0.90,
             "repeat_penalty": 1.18,
             "num_predict": 900,
             "num_ctx": 16384,
@@ -1812,7 +1926,8 @@ fn describe_image_with(req: &ImageAiRequest, system: &str, ask: &str) -> Result<
         "think": false,
         "keep_alive": "30m",
         "options": {
-            "temperature": 0.2,
+            "temperature": 0.10,
+            "top_p": 0.90,
             "repeat_penalty": 1.18,
             "num_predict": 900,
             "num_ctx": 16384,
@@ -1904,7 +2019,32 @@ fn split_image_pipelined(req: &TwoImageRequest, encoder: &str) -> Result<(crate:
 
     // 1. Describe each character crop and the overall scene with the vision encoder (one image per call)
     let mut vision_parts = Vec::new();
-    if let Some(ref chars) = req.split.chars {
+    if let Some(ref boxes) = req.split.boxes {
+        for (i, b) in boxes.iter().take(n).enumerate() {
+            let zones = crate::detector::three_zone_crops(&req.split.image, b);
+            let up_b64 = encode_dynamic_image_b64(&zones[0].1).unwrap_or_default();
+            let mid_b64 = encode_dynamic_image_b64(&zones[1].1).unwrap_or_default();
+            let low_b64 = encode_dynamic_image_b64(&zones[2].1).unwrap_or_default();
+
+            let up_ask = format!("Describe head, hair color and style, specific hairpins/hair ornaments, eyewear, earrings, choker, and expression for character {}.", i + 1);
+            let mid_ask = format!("Describe torso, neckline (verify cleavage vs closed top), chest proportions, clothing cut/color, arm pose, and any items held for character {}.", i + 1);
+            let low_ask = format!("Describe lower body, skirt/shorts/pants, leg posture, thigh straps, and footwear (shoes, socks, barefoot) for character {}.", i + 1);
+
+            let up_desc = ask_vision_encoder(&base, req.mode, encoder, up_b64, &up_ask).unwrap_or_default();
+            let mid_desc = ask_vision_encoder(&base, req.mode, encoder, mid_b64, &mid_ask).unwrap_or_default();
+            let low_desc = ask_vision_encoder(&base, req.mode, encoder, low_b64, &low_ask).unwrap_or_default();
+
+            vision_parts.push(format!(
+                "### Character {} ({} box):\n- **Upper (Hair/Hairpin/Face)**: {}\n- **Middle (Torso/Neckline/Held Items)**: {}\n- **Lower (Legs/Straps/Footwear)**: {}",
+                i + 1, BOX_COLORS[i].1, up_desc.trim(), mid_desc.trim(), low_desc.trim()
+            ));
+        }
+        let scene_b64 = crate::twoimg::encode(&req.split.image, 768)?;
+        let ask_scene = "Describe the camera angle, framing, setting, background, lighting, and the exact spatial arrangement of characters from left to right (who is on the left, center, right) and how they interact. Do not describe character outfits or hair.";
+        let scene_desc = ask_vision_encoder(&base, req.mode, encoder, scene_b64, ask_scene)
+            .unwrap_or_else(|e| format!("Scene: could not extract ({e})"));
+        vision_parts.push(format!("### Scene & Interactions:\n{}", scene_desc));
+    } else if let Some(ref chars) = req.split.chars {
         for (i, (crop, _)) in chars.iter().take(n).enumerate() {
             let b64 = crate::twoimg::encode(crop, 768)?;
             let ask = format!(
@@ -3671,6 +3811,222 @@ mod tests {
         assert!(!user_msg.contains("bunny girl"));
         assert!(user_msg.contains("MISSING_BOTTOMS_FLAG"));
         assert!(user_msg.contains("UNANCHORED_LIMBS_FLAG"));
+    }
+
+    #[test]
+    #[ignore]
+    fn live_dual_pass() {
+        let char_path = std::path::Path::new("packaging/arch/character.jpg");
+        let scene_path = std::path::Path::new("packaging/arch/scene.jpg");
+        assert!(char_path.exists(), "character.jpg exists");
+        assert!(scene_path.exists(), "scene.jpg exists");
+        assert!(crate::tagger::is_installed(), "tagger is installed");
+
+        println!("\n>>> STEP 1: WD14 Tagging on character.jpg and scene.jpg...");
+        let char_tags = crate::tagger::tag_image(char_path).expect("WD14 character tagging failed");
+        let raw_char_wd14 = crate::tagger::build_prompt(&char_tags, crate::prompt_condenser::WD14_GENERAL_THRESHOLD).prompt;
+
+        let scene_tags = crate::tagger::tag_image(scene_path).expect("WD14 scene tagging failed");
+        let raw_scene_wd14 = crate::tagger::build_prompt(&scene_tags, crate::prompt_condenser::WD14_GENERAL_THRESHOLD).prompt;
+
+        let opts_shape = crate::prompt_condenser::PipelineOptions {
+            mode: crate::prompt_condenser::Mode::SceneShape,
+            use_llm_synthesis: true,
+            gemma_vision_pass: true,
+        };
+        let opts_pose = crate::prompt_condenser::PipelineOptions {
+            mode: crate::prompt_condenser::Mode::ScenePose,
+            use_llm_synthesis: true,
+            gemma_vision_pass: true,
+        };
+
+        println!("\n================================================================================");
+        println!(">>> [MODE A: SCENE + BODY SHAPE] - Scene provides Environment, Pose & Silhouette");
+        println!("================================================================================");
+        println!(">>> Running Mode A on scene.jpg...");
+        let scene_shape_res = run_dual_pass_pipeline(
+            "http://localhost:11434",
+            AiMode::Gpu,
+            "huihui_ai/qwen2.5-vl-abliterated:3b",
+            "huihui_ai/gemma-4-abliterated:12b",
+            scene_path,
+            &raw_scene_wd14,
+            opts_shape,
+        );
+
+        println!(">>> Running Mode A on character.jpg...");
+        let char_shape_res = run_dual_pass_pipeline(
+            "http://localhost:11434",
+            AiMode::Gpu,
+            "huihui_ai/qwen2.5-vl-abliterated:3b",
+            "huihui_ai/gemma-4-abliterated:12b",
+            char_path,
+            &raw_char_wd14,
+            opts_shape,
+        );
+
+        // Merge Mode A (scene_body_shape = true)
+        let combined_scene_a = format!("{}, {}", scene_shape_res.scene_prompt, scene_shape_res.character_prompt);
+        let actions_a = crate::sceneref::from_single_with_shape(&combined_scene_a, false, true);
+        let plan_a = crate::sceneref::plan(&actions_a, &crate::sceneref::Overrides::default(), 1);
+        let combined_char_a = format!("{}, {}", char_shape_res.character_prompt, char_shape_res.scene_prompt);
+        let char_id_a = crate::scene::filter_identity_only_with_shape(&combined_char_a, true);
+        let merged_char_a = crate::sceneref::inject(&char_id_a, &plan_a.chars[0], &crate::sceneref::is_action);
+
+        println!("\n================================================================================");
+        println!(">>> [MODE B: SCENE + SKELETAL POSE] - Scene provides Environment & Pure Skeleton");
+        println!("================================================================================");
+        println!(">>> Running Mode B on scene.jpg...");
+        let scene_pose_res = run_dual_pass_pipeline(
+            "http://localhost:11434",
+            AiMode::Gpu,
+            "huihui_ai/qwen2.5-vl-abliterated:3b",
+            "huihui_ai/gemma-4-abliterated:12b",
+            scene_path,
+            &raw_scene_wd14,
+            opts_pose,
+        );
+
+        println!(">>> Running Mode B on character.jpg...");
+        let char_pose_res = run_dual_pass_pipeline(
+            "http://localhost:11434",
+            AiMode::Gpu,
+            "huihui_ai/qwen2.5-vl-abliterated:3b",
+            "huihui_ai/gemma-4-abliterated:12b",
+            char_path,
+            &raw_char_wd14,
+            opts_pose,
+        );
+
+        // Merge Mode B (scene_body_shape = false)
+        let combined_scene_b = format!("{}, {}", scene_pose_res.scene_prompt, scene_pose_res.character_prompt);
+        let actions_b = crate::sceneref::from_single_with_shape(&combined_scene_b, false, false);
+        let plan_b = crate::sceneref::plan(&actions_b, &crate::sceneref::Overrides::default(), 1);
+        let combined_char_b = format!("{}, {}", char_pose_res.character_prompt, char_pose_res.scene_prompt);
+        let char_id_b = crate::scene::filter_identity_only_with_shape(&combined_char_b, false);
+        let merged_char_b = crate::sceneref::inject(&char_id_b, &plan_b.chars[0], &crate::sceneref::is_action);
+
+        println!("\n================================================================================");
+        println!(">>> DUAL-REFERENCE MERGE COMPARISON (Character + Scene)");
+        println!("================================================================================");
+        println!("\n--- [MODE A: SCENE + BODY SHAPE] ---");
+        println!("SCENE PROMPT:\n  {}", plan_a.scene.join(", "));
+        println!("MERGED CHARACTER (Wardrobe from Char, Body Shape & Pose from Scene):\n  {}", merged_char_a);
+
+        println!("\n--- [MODE B: SCENE + SKELETAL POSE] ---");
+        println!("SCENE PROMPT:\n  {}", plan_b.scene.join(", "));
+        println!("MERGED CHARACTER (Wardrobe & Body Shape from Char, Pure Skeletal Pose from Scene):\n  {}", merged_char_b);
+        println!("================================================================================");
+    }
+
+    #[test]
+    #[ignore]
+    fn live_before_and_after_quadrant_test() {
+        use std::path::Path;
+        use std::time::Instant;
+
+        let img_path_str = std::env::var("TEST_IMAGE")
+            .unwrap_or_else(|_| "/home/yukia/Pictures/HWP1dffawAA5Y7K.jpg".to_string());
+        let img_path = Path::new(&img_path_str);
+        if !img_path.is_file() {
+            println!("Image not found at {}, skipping live test.", img_path.display());
+            return;
+        }
+
+        println!("\n================================================================================");
+        println!(">>> LIVE BEFORE & AFTER BENCHMARK ON: {}", img_path.display());
+        println!("================================================================================");
+
+        // ==========================================
+        // 1. BEFORE: Legacy Single-Pass Full Frame
+        // ==========================================
+        println!("\n[1/2] RUNNING 'BEFORE' (Single-Pass Full Frame, No Quadrants, No 3-Zone Crops)...");
+        let t_before_start = Instant::now();
+
+        // Single pass WD14 on full image only
+        let img_dynamic = image::open(img_path).expect("open image");
+        let raw_full_scores = crate::tagger::tag_dynamic(&img_dynamic).expect("tag full");
+        let before_wd14_prompt = crate::tagger::build_prompt(&raw_full_scores, 0.22).prompt;
+
+        // Legacy full frame vision prompt at temp 0.20
+        use base64::Engine as _;
+        let b64_img = base64::engine::general_purpose::STANDARD.encode(shrink_for_vision(img_path).unwrap());
+        let legacy_ask = "Describe the subject, appearance, clothing, pose, framing, setting, light and style.";
+        let before_vision_desc = ask_vision_encoder("http://localhost:11434", AiMode::Gpu, "huihui_ai/qwen2.5-vl-abliterated:3b", b64_img, legacy_ask).unwrap_or_default();
+        let before_prose_tags = crate::danbooru::extract_tags_from_prose(&before_vision_desc);
+
+        // Merge before tags
+        let mut before_merged_tags = before_wd14_prompt.clone();
+        for pt in &before_prose_tags {
+            if !before_merged_tags.to_lowercase().contains(&pt.to_lowercase()) {
+                before_merged_tags.push_str(", ");
+                before_merged_tags.push_str(pt);
+            }
+        }
+        let before_elapsed = t_before_start.elapsed().as_secs_f32();
+
+        // ==========================================
+        // 2. AFTER: 4-Quadrant + 3-Zone Auto-Detector
+        // ==========================================
+        println!("\n[2/2] RUNNING 'AFTER' (4-Quadrant Objects + 3-Zone Character Pinpointing at temp 0.05)...");
+        let t_after_start = Instant::now();
+
+        // Upgraded multi-zone + 4-quadrant WD14 tagger
+        let noop_progress = |_: String| {};
+        let after_scores = crate::twoimg::tag_one_fast(img_path, &noop_progress).expect("tag after");
+        let after_wd14_prompt = crate::tagger::build_prompt(&after_scores, 0.22).prompt;
+
+        // Upgraded 4-quadrant + universal 3-zone Qwen 2.5-VL scan
+        let after_vision_desc = extract_visual_description_from_path(
+            img_path,
+            "http://localhost:11434",
+            AiMode::Gpu,
+            "huihui_ai/qwen2.5-vl-abliterated:3b",
+        ).expect("extract after vision");
+        let after_prose_tags = crate::danbooru::extract_tags_from_prose(&after_vision_desc);
+
+        // Merge after tags
+        let mut after_merged_tags = after_wd14_prompt.clone();
+        for pt in &after_prose_tags {
+            if !after_merged_tags.to_lowercase().contains(&pt.to_lowercase()) {
+                after_merged_tags.push_str(", ");
+                after_merged_tags.push_str(pt);
+            }
+        }
+        let after_deduped = crate::danbooru::dedup_color_parents(&after_merged_tags);
+        let after_ordered = crate::danbooru::sort_canonical_buckets(&after_deduped);
+        let after_elapsed = t_after_start.elapsed().as_secs_f32();
+
+        println!("\n================================================================================");
+        println!(">>> BEFORE VS AFTER SCAN RESULTS COMPARISON");
+        println!("================================================================================");
+        println!("BEFORE (Single Pass): {:.2}s, {} tags", before_elapsed, before_merged_tags.split(',').count());
+        println!("AFTER  (4-Quadrant + 3-Zone): {:.2}s, {} tags", after_elapsed, after_ordered.split(',').count());
+
+        println!("\n--- [BEFORE: VISUAL DESCRIPTION (Single Pass Full Frame)] ---");
+        println!("{}", before_vision_desc);
+        println!("\n--- [BEFORE: EXTRACTED TAGS] ---");
+        println!("{}", before_merged_tags);
+
+        println!("\n--- [AFTER: MULTI-ZONE & QUADRANT PINPOINTED DESCRIPTION] ---");
+        println!("{}", after_vision_desc);
+        println!("\n--- [AFTER: CANONICALLY ORDERED PINPOINTED TAGS] ---");
+        println!("{}", after_ordered);
+
+        // Identify new tags discovered exclusively by the After pass
+        let before_lower = before_merged_tags.to_lowercase();
+        let new_discoveries: Vec<&str> = after_ordered
+            .split(',')
+            .map(str::trim)
+            .filter(|t| !t.is_empty() && !before_lower.contains(&t.to_lowercase()))
+            .collect();
+
+        println!("\n--- [NEW EXCLUSIVE DISCOVERIES BY AFTER PASS] ---");
+        println!("({} new pinpointed tags discovered):", new_discoveries.len());
+        for nd in &new_discoveries {
+            println!("  + {}", nd);
+        }
+        println!("================================================================================");
     }
 }
 

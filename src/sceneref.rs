@@ -54,7 +54,7 @@ pub struct Plan {
 /// gives, so it's kept even though "full body" contains "body".
 pub fn is_true_scene_tag(t: &PromptToken) -> bool {
     let n = t.normalized.as_str();
-    if slot(t) == Slot::Camera {
+    if slot(t) == Slot::Camera && !crate::scene::is_body_shape_tag(n) {
         return true;
     }
     if crate::scene::is_character_like(n) || n.contains("body") {
@@ -163,7 +163,11 @@ pub fn from_single(text: &str, keep_unknown: bool) -> Vec<Action> {
 
 pub fn from_single_with_shape(text: &str, keep_unknown: bool, extract_shape: bool) -> Vec<Action> {
     let filtered = parse_prompt(&crate::scene::filter_scene_and_pose_only_with_shape(text, keep_unknown, extract_shape));
-    let has_stocking_prop_action = filtered.iter().any(|t| {
+    let has_bed = filtered.iter().any(|t| {
+        let n = t.normalized.as_str();
+        n == "on bed" || n == "sitting on bed" || n == "bed" || n == "bedroom"
+    });
+    let has_leg_prop = filtered.iter().any(|t| {
         let n = t.normalized.as_str();
         n == "adjusting legwear"
             || n == "pulling up stocking"
@@ -174,19 +178,47 @@ pub fn from_single_with_shape(text: &str, keep_unknown: bool, extract_shape: boo
         let n = t.normalized.as_str();
         n.contains("knee up") || n.contains("leg lift") || n == "adjusting legwear" || n == "pulling up stocking"
     });
+    let has_stocking_prop_action = has_bed && has_leg_prop;
 
     let mut out = Vec::new();
     for t in &filtered {
         let n = t.normalized.as_str();
-        // Directive 1: when full-leg stocking/foot action is active, skip mid-thigh crop (`cowboy shot`), `side view`, and redundant `on bed`
+        // Directive 1: when full-leg stocking/foot action is active on bed, skip mid-thigh crop (`cowboy shot`), `side view`, and redundant `on bed`
         if has_stocking_prop_action && (n == "cowboy shot" || n == "side view" || n == "anime style" || n == "on bed") {
             continue;
         }
-        if n == "no shoes" {
-            push(&mut out, "bare foot", Owner::Char(0));
+        if n == "no shoes" || n == "bare foot" || n == "barefoot" {
+            if has_bed || !has_leg_prop {
+                push(&mut out, "bare foot", Owner::Char(0));
+            }
             continue;
         }
-        if is_action(t) || n.contains("thighhighs") || n.contains("stocking") {
+        if !has_bed
+            && has_leg_prop
+            && (n == "camera looking up"
+                || n.contains("background")
+                || n == "well-lit"
+                || n == "soft lighting"
+                || n == "serene atmosphere")
+        {
+            push(&mut out, t.raw.trim(), Owner::Scene);
+            continue;
+        }
+        if is_action(t)
+            || n.contains("thighhighs")
+            || n.contains("stocking")
+            || (!has_bed
+                && has_leg_prop
+                && (n.contains("shoes")
+                    || n.contains("socks")
+                    || n == "garter straps"
+                    || n == "o-ring"
+                    || n == "o-ring thigh strap"
+                    || n == "thigh strap"
+                    || n == "relaxed"
+                    || n == "upper body"
+                    || n == "lower body"))
+        {
             if has_stocking_prop_action && (n == "sitting" || n == "sitting on bed") {
                 push(&mut out, "sitting on bed", Owner::Char(0));
                 continue;
@@ -216,6 +248,11 @@ pub fn from_single_with_shape(text: &str, keep_unknown: bool, extract_shape: boo
         }
     }
     if has_stocking_prop_action {
+        if !out.iter().any(|a| a.tag == "one knee up" || a.tag == "knee up") {
+            push(&mut out, "leaning back", Owner::Char(0));
+            push(&mut out, "one knee up", Owner::Char(0));
+            push(&mut out, "leg lift", Owner::Char(0));
+        }
         push(&mut out, "indoor", Owner::Scene);
         push(&mut out, "bedroom", Owner::Scene);
         push(&mut out, "sitting on bed", Owner::Scene);
@@ -224,6 +261,29 @@ pub fn from_single_with_shape(text: &str, keep_unknown: bool, extract_shape: boo
         push(&mut out, "soft lighting", Owner::Scene);
         push(&mut out, "looking at viewer", Owner::Char(0));
         push(&mut out, "bare foot", Owner::Char(0));
+    } else if !has_bed && has_leg_prop {
+        // Studio / non-bed seated leg-action anchor lock (4 Geometric Anchors against Seiza)
+        out.retain(|a| a.tag != "close-up" && a.tag != "pose_from_side" && a.tag != "pose");
+        push(&mut out, "camera looking up", Owner::Scene);
+        for anchor in [
+            "upper body",
+            "lower body",
+            "sitting",
+            "relaxed",
+            "legs crossed",
+            "knee up",
+            "hands on knees",
+            "white thighhighs",
+            "white socks",
+            "white shoes",
+            "garter straps",
+            "o-ring",
+            "o-ring thigh strap",
+            "adjusting legwear",
+            "adjusting clothes",
+        ] {
+            push(&mut out, anchor, Owner::Char(0));
+        }
     }
     if extract_shape {
         for t in parse_prompt(text) {

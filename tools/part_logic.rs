@@ -441,13 +441,15 @@ pub struct Merged {
     pub pass1_tags: Vec<String>,
     pub pass2_tags: Vec<String>,
     pub subject_tags: Vec<String>,
-    pub dropped_moondream: Vec<String>,
+    pub dropped_vlm: Vec<String>,
     pub dropped_wd14: Vec<String>,
     pub dropped_hedged: Vec<String>,
-    pub negated_moondream: Vec<String>,
+    pub negated_vlm: Vec<String>,
     /// WD14 tags that matched no scene keyword and defaulted to Pass 2; grow the
     /// keyword lists from these.
     pub unrouted_wd14: Vec<String>,
+    pub dropped_moondream: Vec<String>,
+    pub negated_moondream: Vec<String>,
 }
 
 pub fn merge_tags(
@@ -468,7 +470,7 @@ pub fn merge_tags(
     let a1 = analyze_prose(pass1_txt, &is_known);
     let a2 = analyze_prose(pass2_txt, &is_known);
 
-    // Hedged Moondream tags count only if WD14 agrees.
+    // Hedged VLM tags count only if WD14 agrees.
     let weak: BTreeSet<&String> = a1.weak.iter().chain(a2.weak.iter()).collect();
     let strong: BTreeSet<&String> = a1.strong.iter().chain(a2.strong.iter()).collect();
     let hedged_unconfirmed: BTreeSet<String> = weak
@@ -505,15 +507,18 @@ pub fn merge_tags(
         v.sort();
         v
     };
+    let drop_vlm_sorted = sorted(&drop_md);
     Merged {
         pass1_tags: md1.into_iter().chain(wd1).collect(),
         pass2_tags: md2.into_iter().chain(wd2.iter().cloned()).collect(),
         subject_tags: subject,
-        dropped_moondream: sorted(&drop_md),
+        dropped_vlm: drop_vlm_sorted.clone(),
         dropped_wd14: sorted(&drop_wd),
         dropped_hedged: hedged_unconfirmed.into_iter().collect(),
-        negated_moondream: negated,
+        negated_vlm: negated.clone(),
         unrouted_wd14: wd2,
+        dropped_moondream: drop_vlm_sorted,
+        negated_moondream: negated,
     }
 }
 
@@ -986,9 +991,9 @@ pub fn ollama_not_pulled_message(model: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Moondream retry wrapper
+// VLM retry wrapper
 // ---------------------------------------------------------------------------
-fn valid_moondream(text: &str) -> bool {
+fn valid_vlm(text: &str) -> bool {
     let t = text.trim();
     if t.chars().count() < 20 {
         return false;
@@ -999,34 +1004,51 @@ fn valid_moondream(text: &str) -> bool {
         .any(|p| contains_whole_phrase(&head, p))
 }
 
-/// One Moondream pass: retry once if it errors, is empty or looks like a refusal.
+#[inline]
+fn valid_moondream(text: &str) -> bool {
+    valid_vlm(text)
+}
+
+/// One VLM pass: retry once if it errors, is empty or looks like a refusal.
 /// Gives up with "" (that pass then contributes only its WD14 tags) plus a warning.
-fn run_moondream(
-    moondream: &MoondreamFn<'_>,
+fn run_vlm(
+    vlm: &VlmFn<'_>,
     prompt: &str,
     label: &str,
     cfg: &Config,
     warnings: &mut Vec<String>,
 ) -> String {
     let mut last_error: Option<String> = None;
-    for attempt in 0..=cfg.moondream_retries {
-        let temp = cfg.moondream_temperature + if attempt > 0 { cfg.moondream_retry_temp_bump } else { 0.0 };
-        match moondream(prompt, temp) {
-            Ok(out) if valid_moondream(&out) => return out,
+    for attempt in 0..=cfg.vlm_retries {
+        let temp = cfg.vlm_temperature + if attempt > 0 { cfg.vlm_retry_temp_bump } else { 0.0 };
+        match vlm(prompt, temp) {
+            Ok(out) if valid_vlm(&out) => return out,
             Ok(_) => {}
             Err(e) => last_error = Some(e),
         }
     }
     let reason = last_error.unwrap_or_else(|| "empty or refusal-like output".to_string());
-    warnings.push(format!("Moondream {} unavailable ({}); used WD14 tags only for it", label, reason));
+    warnings.push(format!("VLM {} unavailable ({}); used WD14 tags only for it", label, reason));
     String::new()
+}
+
+#[inline]
+fn run_moondream(
+    vlm: &VlmFn<'_>,
+    prompt: &str,
+    label: &str,
+    cfg: &Config,
+    warnings: &mut Vec<String>,
+) -> String {
+    run_vlm(vlm, prompt, label, cfg, warnings)
 }
 
 // ---------------------------------------------------------------------------
 // Pipeline
 // ---------------------------------------------------------------------------
-/// Runs one Moondream pass on the image: `(prompt, temperature) -> text`.
-pub type MoondreamFn<'a> = dyn Fn(&str, f32) -> Result<String, String> + 'a;
+/// Runs one VLM pass on the image: `(prompt, temperature) -> text`.
+pub type VlmFn<'a> = dyn Fn(&str, f32) -> Result<String, String> + 'a;
+pub type MoondreamFn<'a> = VlmFn<'a>;
 /// Runs one Gemma request (attach the image when `with_image` is true).
 pub type GemmaFn<'a> = dyn Fn(&GemmaRequest) -> Result<GemmaReply, String> + 'a;
 
@@ -1049,7 +1071,7 @@ pub struct PipelineResult {
 
 /// Run the dual-pass pipeline.
 ///
-/// * `moondream(prompt, temperature)` runs one Moondream pass on the image.
+/// * `vlm(prompt, temperature)` runs one VLM pass on the image.
 /// * `gemma` is `None` when no Gemma backend is reachable (e.g. your Ollama health
 ///   check failed): the mechanical merge is used and a warning recorded.
 /// * Never fails: every error becomes a warning plus a fallback.
@@ -1058,13 +1080,13 @@ pub fn run_dual_pass(
     opts: &PipelineOptions,
     cfg: &Config,
     vocab: Option<&HashSet<String>>,
-    moondream: &MoondreamFn<'_>,
+    vlm: &VlmFn<'_>,
     gemma: Option<&GemmaFn<'_>>,
 ) -> PipelineResult {
     let mode = opts.mode;
     let mut warnings: Vec<String> = Vec::new();
-    let pass1 = run_moondream(moondream, mode.pass1_prompt(), "pass 1", cfg, &mut warnings);
-    let pass2 = run_moondream(moondream, mode.pass2_prompt(), "pass 2", cfg, &mut warnings);
+    let pass1 = run_vlm(vlm, mode.pass1_prompt(), "pass 1", cfg, &mut warnings);
+    let pass2 = run_vlm(vlm, mode.pass2_prompt(), "pass 2", cfg, &mut warnings);
 
     let mechanical = |reason: Option<String>, mut warnings: Vec<String>| {
         if let Some(r) = reason {

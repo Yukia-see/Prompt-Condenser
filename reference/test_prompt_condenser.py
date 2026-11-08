@@ -73,6 +73,7 @@ def test_prose_to_tags_longest_match():
 
 def test_wd14_wins_colors_moondream_wins_pose():
     m = p.merge_tags(WD, MD1, MD2, "scene_shape", VOCAB)
+    assert set(m["dropped_vlm"]) == {"red dress", "red hair"}
     assert set(m["dropped_moondream"]) == {"red dress", "red hair"}
     assert set(m["dropped_wd14"]) == {"sitting", "from above"}
 
@@ -134,7 +135,7 @@ def test_moondream_empty_pass_retries_then_uses_wd14_only():
 
     out = p.run_pipeline("img", "1girl, solo, sitting, blue_dress", True, "scene_shape", False, empty)
     assert len(calls) == 4  # 2 passes x (1 try + 1 retry)
-    assert calls[1] == pytest.approx(p.MOONDREAM_TEMPERATURE + p.MOONDREAM_RETRY_TEMP_BUMP)
+    assert calls[1] == pytest.approx(p.VLM_TEMPERATURE + p.VLM_RETRY_TEMP_BUMP)
     assert out["character_prompt"] == "1girl, solo, blue dress"
     assert "sitting" in out["scene_prompt"]
 
@@ -151,6 +152,7 @@ def test_moondream_refusal_retries_and_recovers():
 
 def test_attribute_groups_wd14_wins():
     m = p.merge_tags("short_hair, 1girl", "1. Hair: she has long hair and a smile", "", "scene_shape")
+    assert "long hair" in m["dropped_vlm"]
     assert "long hair" in m["dropped_moondream"]
     assert "short hair" in m["pass2_tags"] or "short hair" in m["pass1_tags"]
 

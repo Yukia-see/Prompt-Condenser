@@ -68,6 +68,7 @@ mod tests {
     fn wd14_wins_colors_moondream_wins_pose() {
         let v = vocab(&["red hair", "red dress", "black boots", "boots"]);
         let m = merge_tags(WD, MD1, MD2, Mode::SceneShape, Some(&v));
+        assert_eq!(m.dropped_vlm, vec!["red dress", "red hair"]);
         assert_eq!(m.dropped_moondream, vec!["red dress", "red hair"]);
         assert_eq!(m.dropped_wd14, vec!["from above", "sitting"]);
     }
@@ -152,7 +153,7 @@ mod tests {
             None,
         );
         assert_eq!(temps.borrow().len(), 4); // 2 passes x (1 try + 1 retry)
-        assert!((temps.borrow()[1] - (MOONDREAM_TEMPERATURE + MOONDREAM_RETRY_TEMP_BUMP)).abs() < 1e-6);
+        assert!((temps.borrow()[1] - (VLM_TEMPERATURE + VLM_RETRY_TEMP_BUMP)).abs() < 1e-6);
         assert_eq!(out.character_prompt, "1girl, solo, blue dress");
         assert!(out.scene_prompt.contains("sitting"));
         assert_eq!(out.warnings.len(), 2);
@@ -177,6 +178,7 @@ mod tests {
     #[test]
     fn attribute_groups_wd14_wins() {
         let m = merge_tags("short_hair, 1girl", "1. Hair: she has long hair and a smile", "", Mode::SceneShape, None);
+        assert!(m.dropped_vlm.contains(&"long hair".to_string()));
         assert!(m.dropped_moondream.contains(&"long hair".to_string()));
         let all: Vec<&String> = m.pass1_tags.iter().chain(m.pass2_tags.iter()).collect();
         assert!(all.contains(&&"short hair".to_string()));

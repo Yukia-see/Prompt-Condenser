@@ -539,6 +539,18 @@ pub fn recommended_negative(config: &ScanConfig, positive: &str) -> String {
         }
     }
 
+    // Posture collapse lock: prevent seiza/kneeling when pulling up stockings or lifting a knee
+    if pos_tokens.iter().any(|t| {
+        let n = t.normalized.as_str();
+        n == "pulling up stocking" || n == "adjusting legwear" || n == "one knee up"
+    }) {
+        for tag in ["kneeling", "seiza", "sitting on heels"] {
+            if !other_char_tags.contains(tag) && !auto_negs.iter().any(|t| t == tag) {
+                auto_negs.push(tag.to_string());
+            }
+        }
+    }
+
     let mut parts = vec![config.checkpoint.default_negative().to_string()];
     if !view_negs.is_empty() {
         parts.push(view_negs.to_string());

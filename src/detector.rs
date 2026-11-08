@@ -241,9 +241,58 @@ pub fn lower_crop(img: &image::DynamicImage, b: &PersonBox) -> image::DynamicIma
     crop(img, &low)
 }
 
+/// Returns all 3 overlapping anatomical zones (Upper: 0-55%, Middle: 30-70%, Lower: 55-100%)
+/// for a character bounding box as the universal norm for character inspection.
+pub fn three_zone_crops(img: &image::DynamicImage, b: &PersonBox) -> [(&'static str, image::DynamicImage); 3] {
+    [
+        ("Upper (Head, Hair & Face)", upper_crop(img, b)),
+        ("Middle (Torso, Neckline, Arms & Held Items)", middle_crop(img, b)),
+        ("Lower (Hips, Legs, Straps & Footwear)", lower_crop(img, b)),
+    ]
+}
+
+/// Slices the full image into 4 overlapping quadrants (Top-Left, Top-Right, Bottom-Left, Bottom-Right)
+/// with a 10% center overlap (0.0..0.55 and 0.45..1.0 on X and Y) so background objects (plants, lamps,
+/// furniture, props) crossing the center axes are never cut in half.
+pub fn quadrant_crops(img: &image::DynamicImage) -> [(&'static str, image::DynamicImage); 4] {
+    let (w, h) = (img.width().max(2), img.height().max(2));
+    let x_mid_end = ((w as f32 * 0.55).round() as u32).clamp(1, w);
+    let x_mid_start = ((w as f32 * 0.45).round() as u32).min(w - 1);
+    let y_mid_end = ((h as f32 * 0.55).round() as u32).clamp(1, h);
+    let y_mid_start = ((h as f32 * 0.45).round() as u32).min(h - 1);
+
+    let rw = (w - x_mid_start).max(1);
+    let bh = (h - y_mid_start).max(1);
+
+    [
+        ("Top-Left Quadrant", img.crop_imm(0, 0, x_mid_end, y_mid_end)),
+        ("Top-Right Quadrant", img.crop_imm(x_mid_start, 0, rw, y_mid_end)),
+        ("Bottom-Left Quadrant", img.crop_imm(0, y_mid_start, x_mid_end, bh)),
+        ("Bottom-Right Quadrant", img.crop_imm(x_mid_start, y_mid_start, rw, bh)),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quadrant_and_three_zone_crops_have_valid_dimensions() {
+        let img = image::DynamicImage::new_rgb8(1000, 800);
+        let quads = quadrant_crops(&img);
+        assert_eq!(quads.len(), 4);
+        for (_, q) in &quads {
+            assert_eq!(q.width(), 550);
+            assert_eq!(q.height(), 440);
+        }
+        let b = PersonBox { x0: 100.0, y0: 50.0, x1: 600.0, y1: 750.0, score: 0.95 };
+        let zones = three_zone_crops(&img, &b);
+        assert_eq!(zones.len(), 3);
+        for (_, z) in &zones {
+            assert!(z.width() > 400);
+            assert!(z.height() > 200);
+        }
+    }
 
     #[test]
     fn picks_the_two_biggest_left_to_right() {

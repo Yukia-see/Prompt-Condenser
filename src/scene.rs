@@ -572,12 +572,17 @@ pub fn filter_identity_only_with_shape(prompt: &str, drop_body_shape: bool) -> S
         if !norms.iter().any(|x| x.contains("skin")) {
             push_uniq(&mut out, "fair skin");
         }
+        let has_closed_top_in_parsed = has("tube top") || has("light blue tube top") || has("turtleneck") || has("high collar");
         for t in &parsed {
             let n = t.normalized.as_str();
             if (has_long_hair && (n == "hair bun" || n == "single hair bun" || n == "double bun"))
                 || n == "freckles"
                 || n == "mature female"
                 || n.starts_with("wearing ")
+                || n == "bursting breasts"
+                || n == "veiny breasts"
+                || n == "gigantic breasts"
+                || (has_closed_top_in_parsed && n == "cleavage")
             {
                 continue;
             }
@@ -672,6 +677,10 @@ pub fn filter_scene_and_pose_only(prompt: &str, keep_unknown: bool) -> String {
 
 pub fn filter_scene_and_pose_only_with_shape(prompt: &str, keep_unknown: bool, extract_shape: bool) -> String {
     let tokens = crate::parser::parse_prompt(prompt);
+    let has_bed = tokens.iter().any(|t| {
+        let n = t.normalized.as_str();
+        n == "on bed" || n == "sitting on bed" || n == "bed" || n == "bedroom"
+    });
     let has_leg_prop_action = tokens.iter().any(|t| {
         let n = t.normalized.as_str();
         n.starts_with("pulling ")
@@ -681,6 +690,7 @@ pub fn filter_scene_and_pose_only_with_shape(prompt: &str, keep_unknown: bool, e
             || n.contains("leg lift")
             || n.contains("hands on legs")
             || n.contains("hand on leg")
+            || n.contains("hands on knees")
     });
     tokens
         .into_iter()
@@ -694,6 +704,22 @@ pub fn filter_scene_and_pose_only_with_shape(prompt: &str, keep_unknown: bool, e
             }
             // Directive 6 Prop Preservation: retain legwear prop tags when the pose interacts with them
             if has_leg_prop_action && (n.contains("thighhighs") || n.contains("stocking")) {
+                return true;
+            }
+            // Preserve footwear, socks, and thigh strap anchors on studio/non-bed leg-action scenes
+            if !has_bed
+                && has_leg_prop_action
+                && (n.contains("shoes")
+                    || n.contains("socks")
+                    || n == "garter straps"
+                    || n == "o-ring"
+                    || n == "o-ring thigh strap"
+                    || n == "thigh strap"
+                    || n == "relaxed"
+                    || n == "upper body"
+                    || n == "lower body"
+                    || n == "camera looking up")
+            {
                 return true;
             }
             if extract_shape && is_body_shape_tag(n) && !is_height_stature_tag(n) {
@@ -909,12 +935,19 @@ pub fn synthesize_natural_prose(tokens: &[PromptToken]) -> String {
         } else {
             " poses"
         };
+        let legs_crossed = has("legs crossed") || has("crossed legs");
+        let hands_on_knees = has("hands on knees") || has("hand on knee");
+        let has_shoes = has("white shoes") || has("shoes");
         let mut posture_parts = Vec::new();
-        if leaning_back {
-            posture_parts.push("leaning back slightly");
-        }
-        if knee_up {
-            posture_parts.push("with one knee raised high");
+        if !on_bed && legs_crossed && knee_up {
+            posture_parts.push("in a relaxed posture with her legs crossed and one knee raised in front of her");
+        } else {
+            if leaning_back {
+                posture_parts.push("leaning back slightly");
+            }
+            if knee_up {
+                posture_parts.push("with one knee raised high");
+            }
         }
         let posture_clause = if posture_parts.is_empty() {
             String::new()
@@ -934,7 +967,13 @@ pub fn synthesize_natural_prose(tokens: &[PromptToken]) -> String {
         } else {
             ""
         };
-        let action_desc = if pulling_stocking {
+        let action_desc = if !on_bed && (hands_on_knees || has_shoes) {
+            if looking_viewer {
+                ", resting her hands on her knees to adjust her white thigh-high stockings and white shoes while looking directly at the viewer"
+            } else {
+                ", resting her hands on her knees to adjust her white thigh-high stockings and white shoes"
+            }
+        } else if pulling_stocking {
             if looking_viewer {
                 ", using both hands to pull a white thigh-high stocking up toward her bare foot while looking directly at the viewer"
             } else {

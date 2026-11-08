@@ -31,7 +31,8 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 // ---------------------------------------------------------------------------
 // Constants (Phase 0)
 // ---------------------------------------------------------------------------
-pub const MOONDREAM_TEMPERATURE: f32 = 0.1;
+pub const VLM_TEMPERATURE: f32 = 0.1;
+pub const MOONDREAM_TEMPERATURE: f32 = VLM_TEMPERATURE;
 pub const GEMMA_TEMPERATURE: f32 = 0.35;
 /// Pass these to your WD14 tagger; this module only receives the tag string.
 pub const WD14_GENERAL_THRESHOLD: f32 = 0.22;
@@ -41,8 +42,10 @@ pub const WD14_CHARACTER_THRESHOLD: f32 = 0.85;
 pub const GEMMA_CONTEXT_WINDOW: u32 = 131_072;
 pub const GEMMA_MAX_TOKENS: u32 = 768;
 pub const GEMMA_MAX_TOKENS_RETRY: u32 = 1024;
-pub const MOONDREAM_RETRIES: u32 = 1;
-pub const MOONDREAM_RETRY_TEMP_BUMP: f32 = 0.2;
+pub const VLM_RETRIES: u32 = 1;
+pub const MOONDREAM_RETRIES: u32 = VLM_RETRIES;
+pub const VLM_RETRY_TEMP_BUMP: f32 = 0.2;
+pub const MOONDREAM_RETRY_TEMP_BUMP: f32 = VLM_RETRY_TEMP_BUMP;
 
 /// Runtime settings; `Config::default()` matches the Python constants.
 #[derive(Clone, Debug)]
@@ -51,8 +54,11 @@ pub struct Config {
     pub quality_prefix: String,
     /// Write "(" as "\(" (A1111/ComfyUI prompt syntax).
     pub escape_parentheses: bool,
-    /// Mechanical path only: also append Moondream wording that matched no tag.
+    /// Mechanical path only: also append VLM wording that matched no tag.
     pub keep_unmatched_prose: bool,
+    pub vlm_temperature: f32,
+    pub vlm_retries: u32,
+    pub vlm_retry_temp_bump: f32,
     pub moondream_temperature: f32,
     pub moondream_retries: u32,
     pub moondream_retry_temp_bump: f32,
@@ -67,6 +73,9 @@ impl Default for Config {
             quality_prefix: QUALITY_PREFIX_DEFAULT.to_string(),
             escape_parentheses: false,
             keep_unmatched_prose: false,
+            vlm_temperature: VLM_TEMPERATURE,
+            vlm_retries: VLM_RETRIES,
+            vlm_retry_temp_bump: VLM_RETRY_TEMP_BUMP,
             moondream_temperature: MOONDREAM_TEMPERATURE,
             moondream_retries: MOONDREAM_RETRIES,
             moondream_retry_temp_bump: MOONDREAM_RETRY_TEMP_BUMP,

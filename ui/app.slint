@@ -1316,7 +1316,7 @@ export component AppWindow inherits Window {
     in-out property <string> pipeline_warnings: "";     // Pipeline fallback warnings (e.g. Ollama unreachable)
     in-out property <bool> image_identity_only: false;   // images supply only who + outfit
     callback identity_changed();
-    in-out property <bool> image_second_pass: false;    // 2nd pass visual check with vision-capable model
+    in-out property <bool> image_second_pass: true;     // 2nd pass visual check with vision-capable model
     callback second_pass_changed();
     in-out property <bool> scene_body_shape: false;     // swap body shape from scene reference, keep outfit/height/face
     callback scene_body_shape_changed();

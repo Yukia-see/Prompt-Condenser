@@ -4,6 +4,7 @@ mod condenser;
 mod danbooru;
 mod detector;
 mod dynamic;
+mod eval;
 mod parser;
 mod profiles;
 mod scene;
@@ -758,8 +759,10 @@ fn build_model_choices(installed: &[OllamaModel]) -> Vec<ModelChoice> {
         })
         .collect();
     for m in &installed {
-        // Hide Moondream from the text prompt model dropdown (it is a vision encoder used behind the scenes)
-        if m.to_lowercase().contains("moondream") {
+        // Hide dedicated vision encoders (Moondream, Qwen-VL) from the text prompt model dropdown
+        if m.to_lowercase().contains("moondream")
+            || (m.to_lowercase().contains("qwen") && (m.to_lowercase().contains("vl") || m.to_lowercase().contains("-vl")))
+        {
             continue;
         }
         if !AiModelTier::ALL.iter().any(|t| is_tier_match(m, *t)) {
@@ -1212,7 +1215,7 @@ fn read_scene_blocking(
     }
     if ctx.enable_dual_pass {
         if let (Some(enc), Some(model)) = (&ctx.vision_encoder, &ctx.model) {
-            let tags = tagger::tag_image(path)?;
+            let tags = twoimg::tag_one_fast(path, progress)?;
             let raw_wd14 = tagger::build_prompt(&tags, prompt_condenser::WD14_GENERAL_THRESHOLD).prompt;
             let mode = if ctx.scene_body_shape {
                 prompt_condenser::Mode::SceneShape
@@ -1236,7 +1239,7 @@ fn read_scene_blocking(
         }
     }
     progress("Tagging scene and character pose…".into());
-    let tags = tagger::tag_image(path)?;
+    let tags = twoimg::tag_one_fast(path, progress)?;
     let raw_prompt = tagger::build_prompt(&tags, ctx.threshold).prompt;
     let hints = scene::filter_scene_and_pose_only_with_shape(&raw_prompt, false, ctx.scene_body_shape);
     let Some(model) = ctx.model.clone() else {
@@ -1819,10 +1822,20 @@ fn default_text_model(ui: &AppWindow, state: &State) -> String {
         .unwrap_or_else(|| profiles::AiModelTier::Best.ollama_name().to_string())
 }
 
-/// The vision encoder for reading images: defaults to Moondream if installed, else selected or first vision model.
+/// The vision encoder for reading images: defaults to Qwen-VL (abliterated 3B preferred), then Moondream, else selected or first vision model.
 fn vision_model(ui: &AppWindow, state: &State) -> Option<String> {
     let st = state.borrow();
-    // Default to Moondream if available
+    // 1. Default to Qwen-VL 3B (especially abliterated) if available, or any Qwen-VL
+    if let Some(m) = st.vision_models.iter().find(|m| {
+        let l = m.to_lowercase();
+        l.contains("qwen") && (l.contains("vl") || l.contains("-vl")) && l.contains("3b")
+    }).or_else(|| st.vision_models.iter().find(|m| {
+        let l = m.to_lowercase();
+        l.contains("qwen") && (l.contains("vl") || l.contains("-vl"))
+    })) {
+        return Some(m.clone());
+    }
+    // 2. Fall back to Moondream if available
     if let Some(m) = st.vision_models.iter().find(|m| m.to_lowercase().contains("moondream")) {
         return Some(m.clone());
     }
@@ -1841,7 +1854,7 @@ fn run_ai_image(ui: &AppWindow, state: &State) {
     }
     let Some(encoder) = vision_model(ui, state) else {
         ui.set_image_status(
-            "AI mode needs a vision model (like Moondream): download it with `ollama run moondream:1.8b`.".into(),
+            "AI mode needs a vision model (like Qwen2.5-VL): download it with `ollama run huihui_ai/qwen2.5-vl-abliterated:3b`.".into(),
         );
         return;
     };
@@ -2187,7 +2200,7 @@ impl Default for Settings {
             char_break: true,
             scene_prompt: String::new(),
             image_identity_only: false,
-            image_second_pass: false,
+            image_second_pass: true,
             scene_body_shape: false,
             enable_dual_pass: true,
             dual_pass_mode_index: 0,
@@ -2347,6 +2360,15 @@ impl Zoom {
 }
 
 fn main() -> Result<(), slint::PlatformError> {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() > 1 && (args[1] == "eval" || args[1] == "--eval") {
+        if let Err(e) = eval::run_eval_cli(&args[2..]) {
+            eprintln!("Evaluation error: {e}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
     let ui = AppWindow::new()?;
     load_settings(&ui);
     ui.set_tagger_installed(tagger::is_installed());

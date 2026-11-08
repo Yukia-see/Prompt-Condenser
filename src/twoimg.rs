@@ -59,23 +59,40 @@ pub fn read(path: &Path, n: usize, close_ups: bool) -> Result<TagSplit> {
                     overlap = overlap.max(bs[i].overlap(&bs[j]));
                 }
             }
-            // zoom in on each face and outfit, unless they overlap so much that the
+            // zoom in on each face, torso, and outfit, unless they overlap so much that the
             // zoomed crop would mostly show another character
-            let zoom = close_ups && overlap <= 0.35;
+            let zoom = close_ups && overlap <= 0.40;
             // one view at a time: batching several in one run measured ~5x slower on CPU
-            let full = tagger::tag_dynamic(&image)?;
+            let mut full = tagger::tag_dynamic(&image)?;
+            for (_, quad) in detector::quadrant_crops(&image) {
+                if let Ok(q_tags) = tagger::tag_dynamic(&quad) {
+                    full = tagger::merge_quadrant_scene_crop(&full, &q_tags);
+                }
+            }
             let mut chars = Vec::new();
             for b in bs {
                 let crop = detector::crop(&image, b);
                 let mut tags = tagger::tag_dynamic(&crop)?;
                 if zoom {
-                    tags = tagger::merge_detail_crop(&tags, &tagger::tag_dynamic(&detector::upper_crop(&image, b))?);
+                    for (_, zone_img) in detector::three_zone_crops(&image, b) {
+                        if let Ok(z_tags) = tagger::tag_dynamic(&zone_img) {
+                            tags = tagger::merge_detail_crop(&tags, &z_tags);
+                        }
+                    }
                 }
                 chars.push((crop, tags));
             }
             (full, Some(chars), overlap)
         }
-        None => (tagger::tag_dynamic(&image)?, None, 0.0),
+        None => {
+            let mut full = tagger::tag_dynamic(&image)?;
+            for (_, quad) in detector::quadrant_crops(&image) {
+                if let Ok(q_tags) = tagger::tag_dynamic(&quad) {
+                    full = tagger::merge_quadrant_scene_crop(&full, &q_tags);
+                }
+            }
+            (full, None, 0.0)
+        }
     };
     Ok(TagSplit { image, full, chars, overlap, boxes: picked, people: boxes.len(), wanted: n })
 }
@@ -122,37 +139,31 @@ pub fn tag_one_fast(path: &Path, progress: &(dyn Fn(String) + Sync)) -> Result<V
         });
     }
     let full = tagger::tag_dynamic(&image)?;
-    if boxes.len() == 1 {
-        let main = &boxes[0];
-        let up = detector::upper_crop(&image, main);
-        let is_tall = (main.y1 - main.y0) / (image.height() as f32).max(1.0) >= 0.35;
-        if is_tall {
-            let mid = detector::middle_crop(&image, main);
-            let low = detector::lower_crop(&image, main);
-            let mut tags = [&up, &mid, &low]
-                .iter()
-                .map(|v| tagger::tag_dynamic(v))
-                .collect::<Result<Vec<_>>>()?
-                .into_iter();
-            let up_detail = tags.next().unwrap_or_default();
-            let mid_detail = tags.next().unwrap_or_default();
-            let low_detail = tags.next().unwrap_or_default();
-            let merged = tagger::merge_detail_crop(&full, &up_detail);
-            let merged = tagger::merge_detail_crop(&merged, &mid_detail);
-            return Ok(tagger::merge_detail_crop(&merged, &low_detail));
-        } else {
-            let detail = tagger::tag_dynamic(&up)?;
-            return Ok(tagger::merge_detail_crop(&full, &detail));
+    let mut merged = full;
+    // 1. Scan 4 Overlapping Quadrants (TL, TR, BL, BR) for environmental objects & props (plants, lamps, furniture)
+    for (_, quad) in detector::quadrant_crops(&image) {
+        if let Ok(q_tags) = tagger::tag_dynamic(&quad) {
+            merged = tagger::merge_quadrant_scene_crop(&merged, &q_tags);
         }
     }
-    // Multiple characters: zoom in on each main character so individual clothing/hair/breast tags are detected
+
+    // 2. Universal 3-Zone Anatomical Scan (Upper, Middle, Lower) for EVERY character
     let count = boxes.len().min(4);
     let chars = detector::main_n(&boxes, count).unwrap_or_else(|| boxes.clone());
-    let mut merged = full;
     for b in &chars {
-        let crop = detector::crop(&image, b);
-        let tags = tagger::tag_dynamic(&crop)?;
-        merged = tagger::merge_detail_crop(&merged, &tags);
+        let is_tall = (b.y1 - b.y0) / (image.height() as f32).max(1.0) >= 0.25;
+        if is_tall {
+            for (_, zone_img) in detector::three_zone_crops(&image, b) {
+                if let Ok(z_tags) = tagger::tag_dynamic(&zone_img) {
+                    merged = tagger::merge_detail_crop(&merged, &z_tags);
+                }
+            }
+        } else {
+            let up = detector::upper_crop(&image, b);
+            if let Ok(up_tags) = tagger::tag_dynamic(&up) {
+                merged = tagger::merge_detail_crop(&merged, &up_tags);
+            }
+        }
     }
     Ok(merged)
 }
