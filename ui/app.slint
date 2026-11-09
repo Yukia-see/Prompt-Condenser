@@ -1306,7 +1306,8 @@ export component AppWindow inherits Window {
     callback load_image_requested();
     callback remove_image_requested();
     callback image_mode_changed();
-    in-out property <bool> enable_dual_pass: true;       // Dual-pass Moondream + WD14
+    in-out property <bool> enable_dual_pass: false;      // Dual-pass Moondream + WD14 (Advanced)
+    in-out property <bool> image_advanced: false;        // show the older image-reading options (dual pass, synthesis, 2nd pass check)
     callback dual_pass_changed();
     in-out property <int> dual_pass_mode_index: 0;      // 0: Scene + Body Shape (Mode A), 1: Scene + Skeletal Pose (Mode B)
     in-out property <[string]> dual_pass_mode_labels: ["Scene + Body Shape (Mode A)", "Scene + Skeletal Pose (Mode B)"];
@@ -1316,7 +1317,7 @@ export component AppWindow inherits Window {
     in-out property <string> pipeline_warnings: "";     // Pipeline fallback warnings (e.g. Ollama unreachable)
     in-out property <bool> image_identity_only: false;   // images supply only who + outfit
     callback identity_changed();
-    in-out property <bool> image_second_pass: true;     // 2nd pass visual check with vision-capable model
+    in-out property <bool> image_second_pass: false;    // 2nd pass visual check with vision-capable model (Advanced)
     callback second_pass_changed();
     in-out property <bool> scene_body_shape: false;     // swap body shape from scene reference, keep outfit/height/face
     callback scene_body_shape_changed();
@@ -1909,7 +1910,13 @@ export component AppWindow inherits Window {
                                 enabled: !root.tagger_busy;
                                 clicked => { root.image_use_ai = true; root.image_mode_changed(); }
                             }
+                            // older image-reading options: hidden unless "Advanced" is open or one of them is on
                             FilterChip {
+                                text: root.image_advanced ? "Advanced ▴" : "Advanced ▾";
+                                checked <=> root.image_advanced;
+                                enabled: !root.tagger_busy;
+                            }
+                            if root.image_advanced || root.enable_dual_pass : FilterChip {
                                 text: "Dual-Pass Vision";
                                 checked <=> root.enable_dual_pass;
                                 enabled: !root.tagger_busy;
@@ -1934,7 +1941,7 @@ export component AppWindow inherits Window {
                                 enabled: !root.tagger_busy;
                                 toggled => { root.identity_changed(); }
                             }
-                            FilterChip {
+                            if root.image_advanced || root.image_second_pass : FilterChip {
                                 text: "2nd Pass Visual Check";
                                 checked <=> root.image_second_pass;
                                 enabled: !root.tagger_busy && (!root.enable_dual_pass || root.use_llm_synthesis);

@@ -2326,9 +2326,11 @@ impl Default for Settings {
             scene_prompt: String::new(),
             image_identity_only: false,
             ai_model: String::new(),
-            image_second_pass: true,
+            image_second_pass: false,
             scene_body_shape: false,
-            enable_dual_pass: true,
+            // the measured-best chain (tagger -> ToriiGate / checklist -> E4B -> polish) is the default;
+            // dual pass stays available under "Advanced"
+            enable_dual_pass: false,
             dual_pass_mode_index: 0,
             use_llm_synthesis: true,
             theme_index: 1,
