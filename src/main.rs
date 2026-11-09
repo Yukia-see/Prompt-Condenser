@@ -568,6 +568,8 @@ fn render(ui: &AppWindow, state: &State) {
     if ui.get_after_view() != 1 {
         ui.set_ai_dropped("".into());
     }
+    // Anima Ref Adapter mode: the reference image supplies the look, so the prompt keeps only the scene
+    let text = if ui.get_ref_adapter_mode() { scene::filter_for_ref_adapter(&text) } else { text };
     render_negative(ui, &config, &text, st.ai_scene.as_ref().filter(|_| ui.get_after_view() == 1 || ui.get_after_view() == 4));
     match shown_parts.filter(|_| two_char) {
         Some(c) => set_live_scene(ui, scene::describe_many(&c.chars, &c.shared)),
@@ -2279,6 +2281,9 @@ struct Settings {
     pinned_emphasis: String,
     lora_tags: String,
     arranged: bool,
+    /// Anima Ref Adapter mode: the After prompt keeps only the scene.
+    #[serde(default)]
+    ref_adapter_mode: bool,
     natural: bool,
     /// 0 = 1 Character, 1 = 2 Characters.
     app_tab: i32,
@@ -2329,6 +2334,7 @@ impl Default for Settings {
             pinned_emphasis: String::new(),
             lora_tags: String::new(),
             arranged: false,
+            ref_adapter_mode: false,
             natural: false,
             app_tab: 0,
             char2_prompt: String::new(),
@@ -2394,6 +2400,7 @@ fn load_settings(ui: &AppWindow) {
     ui.set_pinned_emphasis(st.pinned_emphasis.into());
     ui.set_lora_tags(st.lora_tags.into());
     ui.set_arranged_enabled(st.arranged);
+    ui.set_ref_adapter_mode(st.ref_adapter_mode);
     ui.set_natural_enabled(st.natural);
     ui.set_app_tab(st.app_tab.clamp(0, 3));
     ui.set_char2_prompt(st.char2_prompt.into());
@@ -2441,6 +2448,7 @@ fn save_settings(ui: &AppWindow) {
         pinned_emphasis: ui.get_pinned_emphasis().to_string(),
         lora_tags: ui.get_lora_tags().to_string(),
         arranged: ui.get_arranged_enabled(),
+        ref_adapter_mode: ui.get_ref_adapter_mode(),
         natural: ui.get_natural_enabled(),
         app_tab: ui.get_app_tab(),
         char2_prompt: ui.get_char2_prompt().to_string(),
@@ -2635,6 +2643,42 @@ fn main() -> Result<(), slint::PlatformError> {
             let Some(ui) = weak.upgrade() else { return };
             ui.set_after_view(view);
             render(&ui, &state);
+        });
+    }
+
+    // --- LuCiD VRP regions to the clipboard (2-4 Characters tabs) ---
+    {
+        let weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_copy_vrp_requested(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            let n = tab_chars(&ui);
+            let config = scan_config(&ui);
+            // each character's box, with its LoRA box in front
+            let prompts: Vec<String> = (0..n)
+                .map(|i| {
+                    let lora = config.lora_of(i).trim().trim_matches(',').trim().to_string();
+                    let text = char_box(&ui, i).to_string();
+                    if lora.is_empty() { text } else { format!("{lora}, {text}") }
+                })
+                .collect();
+            let json = {
+                let st = state.borrow();
+                let split = st.two_tags.as_ref();
+                let boxes = split.and_then(|s| s.boxes.as_deref());
+                let size = split.map(|s| (s.image.width(), s.image.height()));
+                two::vrp_state_json(&prompts, boxes, size)
+            };
+            let mut st = state.borrow_mut();
+            if st.clipboard.is_none() {
+                st.clipboard = arboard::Clipboard::new().ok();
+            }
+            let msg = match st.clipboard.as_mut().map(|c| c.set_text(json)) {
+                Some(Ok(())) => "VRP regions copied: paste them into the Anima VRP (core) node's vrp_state, and the Scene box into its global prompt.".to_string(),
+                Some(Err(e)) => format!("Copy failed: {e}"),
+                None => "Copy failed: no clipboard available.".to_string(),
+            };
+            ui.set_status_message(msg.into());
         });
     }
 

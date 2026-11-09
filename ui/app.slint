@@ -1167,6 +1167,7 @@ export component AppWindow inherits Window {
     in-out property <int> proportion_index: 0; // index into profiles::PROPORTIONS
     in-out property <bool> dynamic_enabled: false;
     in-out property <bool> arranged_enabled: false;   // After as grouped lines
+    in-out property <bool> ref_adapter_mode: false;   // Anima Ref Adapter: After keeps only the scene (the adapter copies the look)
     in-out property <bool> natural_enabled: false;    // natural-language sentences (NL checkpoints only)
     in-out property <int> detail_index: 1;     // 0 Faithful, 1 Balanced, 2 Rich (profiles::DetailLevel)
     in-out property <string> dynamic_note: "";
@@ -1302,6 +1303,7 @@ export component AppWindow inherits Window {
     callback ai_settings_changed();
     callback run_ai_scan_requested();
     callback cancel_requested();   // stop a Deep Scan / image read after its current step
+    callback copy_vrp_requested(); // LuCiD VRP regions (one per character) to the clipboard
     callback download_model_requested();
     callback connect_ollama_requested();
     callback load_image_requested();
@@ -1391,6 +1393,10 @@ export component AppWindow inherits Window {
                     clicked => { root.app_tab = 3; root.analyze_requested(); }
                 }
 
+                if root.app_tab >= 1 : PillButton {
+                    text: "🗺 Copy VRP regions";
+                    clicked => { root.copy_vrp_requested(); }
+                }
                 PillButton {
                     text: "📖 Danbooru Words…";
                     clicked => { root.translate_status = ""; root.translate_open = true; }
@@ -1600,6 +1606,11 @@ export component AppWindow inherits Window {
                     FilterChip {
                         text: "Arranged";
                         checked <=> root.arranged_enabled;
+                        toggled => { root.analyze_requested(); }
+                    }
+                    FilterChip {
+                        text: "Ref Adapter";
+                        checked <=> root.ref_adapter_mode;
                         toggled => { root.analyze_requested(); }
                     }
                     FilterChip {

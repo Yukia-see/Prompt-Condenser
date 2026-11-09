@@ -561,6 +561,54 @@ pub fn combine(texts: &[String], config: &ScanConfig, strip_conflicts: bool, sen
 /// - [Left Character (Character 1 Identity)]
 /// - [Right Character (Character 2 Identity)]
 ///   etc.
+/// The `vrp_state` JSON of LuCiD VRP's "Anima VRP (core)" node (state version 2): one region per
+/// character with its prompt, boxes as fractions of the canvas. The boxes come from the person detector
+/// (`boxes`, pixels in an image of `image_size`) when there are as many as characters, else even
+/// left-to-right strips. The canvas keeps the image's shape at ~1 MP in multiples of 64 (the node needs
+/// multiples of 8; without an image, 1216 x 832 landscape). The shared scene is not a region: it goes
+/// into the node's global prompt.
+pub fn vrp_state_json(prompts: &[String], boxes: Option<&[crate::detector::PersonBox]>, image_size: Option<(u32, u32)>) -> String {
+    let (w, h) = image_size.filter(|(w, h)| *w > 0 && *h > 0).unwrap_or((1216, 832));
+    let scale = (1_048_576.0 / (w as f64 * h as f64)).sqrt();
+    let round64 = |v: f64| (((v / 64.0).round() as u32).max(4)) * 64;
+    let (cw, ch) = (round64(w as f64 * scale), round64(h as f64 * scale));
+    let n = prompts.len().max(1);
+    let regions: Vec<serde_json::Value> = prompts
+        .iter()
+        .enumerate()
+        .map(|(i, prompt)| {
+            let (x, y, bw, bh) = match boxes.filter(|b| b.len() == prompts.len()) {
+                Some(b) => {
+                    let b = &b[i];
+                    let pad = 0.02;
+                    let x0 = (b.x0 as f64 / w as f64 - pad).clamp(0.0, 1.0);
+                    let y0 = (b.y0 as f64 / h as f64 - pad).clamp(0.0, 1.0);
+                    let x1 = (b.x1 as f64 / w as f64 + pad).clamp(0.0, 1.0);
+                    let y1 = (b.y1 as f64 / h as f64 + pad).clamp(0.0, 1.0);
+                    (x0, y0, (x1 - x0).max(0.01), (y1 - y0).max(0.01))
+                }
+                None => {
+                    // even strips with a little overlap, so nobody's edge is cut off
+                    let strip = 1.0 / n as f64;
+                    let x0 = (i as f64 * strip - 0.02).max(0.0);
+                    let x1 = ((i + 1) as f64 * strip + 0.02).min(1.0);
+                    (x0, 0.0, x1 - x0, 1.0)
+                }
+            };
+            let r4 = |v: f64| (v * 10_000.0).round() / 10_000.0;
+            serde_json::json!({
+                "id": format!("c{}", i + 1),
+                "label": format!("Character {}", i + 1),
+                "x": r4(x), "y": r4(y), "width": r4(bw), "height": r4(bh),
+                "prompt": prompt.trim(),
+                "negative_prompt": "",
+                "weight": 1.0,
+            })
+        })
+        .collect();
+    serde_json::json!({ "version": 2, "canvas": { "width": cw, "height": ch }, "regions": regions }).to_string()
+}
+
 pub fn combine_section_blocks(texts: &[String], config: &ScanConfig, strip_conflicts: bool, sentence: Option<&str>) -> String {
     let n = texts.len();
     if n == 0 {
@@ -1325,6 +1373,33 @@ masterpiece, 2girls, indoors, gym, polished floor
         );
         assert!(!out.contains("A scene with"), "{out}");
         assert!(out.contains("A lone girl with") || out.contains("A girl with"), "{out}");
+    }
+
+    #[test]
+    fn vrp_regions_match_the_nodes_format() {
+        let prompts = vec!["1girl, red hair".to_string(), "1girl, blue hair".to_string()];
+        // no image: two even strips on a 1216 x 832 canvas
+        let v: serde_json::Value = serde_json::from_str(&vrp_state_json(&prompts, None, None)).unwrap();
+        assert_eq!(v["version"], 2);
+        assert_eq!((v["canvas"]["width"].as_u64(), v["canvas"]["height"].as_u64()), (Some(1216), Some(832)));
+        let r = v["regions"].as_array().unwrap();
+        assert_eq!(r.len(), 2);
+        assert_eq!(r[1]["prompt"], "1girl, blue hair");
+        for region in r {
+            // exactly the fields the node accepts
+            let mut keys: Vec<&str> = region.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+            keys.sort();
+            assert_eq!(keys, vec!["height", "id", "label", "negative_prompt", "prompt", "weight", "width", "x", "y"]);
+            let (x, w) = (region["x"].as_f64().unwrap(), region["width"].as_f64().unwrap());
+            assert!(x >= 0.0 && w > 0.0 && x + w <= 1.0 + 1e-9);
+        }
+        // detector boxes on an 832 x 1216 image: regions follow them, canvas stays portrait
+        let b = |x0: f32, x1: f32| crate::detector::PersonBox { x0, y0: 100.0, x1, y1: 1200.0, score: 0.9 };
+        let boxes = vec![b(20.0, 400.0), b(430.0, 810.0)];
+        let v: serde_json::Value = serde_json::from_str(&vrp_state_json(&prompts, Some(&boxes), Some((832, 1216)))).unwrap();
+        let (cw, ch) = (v["canvas"]["width"].as_u64().unwrap(), v["canvas"]["height"].as_u64().unwrap());
+        assert!(cw % 8 == 0 && ch % 8 == 0 && ch > cw, "{cw}x{ch}");
+        assert!(v["regions"][1]["x"].as_f64().unwrap() > 0.45, "second region starts at the second box");
     }
 
 }

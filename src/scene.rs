@@ -365,6 +365,48 @@ pub(crate) enum Slot {
     Clause,
 }
 
+/// The prompt for the Anima Ref Adapter (ComfyUI-Anima-Ref-Adapter): the reference image gives the
+/// character's look, so the prompt should "describe only the scene". Kept: quality tags, LoRAs, the
+/// group count and solo, expression, pose, gaze, interaction, camera, setting, light, style and the
+/// "the girl on the left is…" sentences (the adapter's README names who is where that way). Dropped:
+/// traits, hair, eyes, body, outfit, character names and unknown words. Works line by line, so the
+/// arranged layout and the [Scene] / [Character] section headers stay.
+pub fn filter_for_ref_adapter(text: &str) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(':') {
+            lines.push(line.to_string());
+            continue;
+        }
+        let kept: Vec<String> = trimmed
+            .split(',')
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .filter(|t| {
+                let Some(tok) = crate::parser::parse_prompt(t).into_iter().next() else { return false };
+                let n = tok.normalized.as_str();
+                if crate::danbooru::is_character(n) {
+                    return false;
+                }
+                if crate::two::count_tag(n).is_some() || n == "solo" || crate::two::is_interaction(n) {
+                    return true;
+                }
+                matches!(
+                    slot(&tok),
+                    Slot::Quality | Slot::Lora | Slot::Expression | Slot::Pose | Slot::Camera | Slot::Setting
+                        | Slot::Light | Slot::Style | Slot::Clause
+                )
+            })
+            .map(str::to_string)
+            .collect();
+        if !kept.is_empty() {
+            lines.push(kept.join(", "));
+        }
+    }
+    lines.join("\n")
+}
+
 pub(crate) fn slot(t: &PromptToken) -> Slot {
     let n = t.normalized.as_str();
     match t.category {
@@ -1262,4 +1304,21 @@ mod tests {
         assert!(!d.missing.contains(&"expression"));
         assert_eq!(describe(&parse_prompt("masterpiece, best quality")), SceneDescription::default());
     }
+    #[test]
+    fn ref_adapter_prompts_keep_only_the_scene() {
+        let out = filter_for_ref_adapter(
+            "masterpiece, best quality, 1girl, solo, white hair, raccoon ears, red eyes, glasses, yellow crop top, \
+             large breasts, smile, standing, arms behind back, looking back, cowboy shot, simple background, soft lighting",
+        );
+        for keep in ["masterpiece", "1girl", "solo", "smile", "standing", "arms behind back", "looking back", "cowboy shot", "simple background", "soft lighting"] {
+            assert!(out.split(", ").any(|t| t == keep), "{keep} dropped: {out}");
+        }
+        for gone in ["white hair", "raccoon ears", "red eyes", "glasses", "yellow crop top", "large breasts"] {
+            assert!(!out.split(", ").any(|t| t == gone), "{gone} kept: {out}");
+        }
+        // section headers and line layout survive
+        let blocks = filter_for_ref_adapter("[Scene / Environment & Shared Framing]:\nmasterpiece, 2girls, beach\n\n[Character 1]:\nred hair, smile");
+        assert!(blocks.starts_with("[Scene / Environment & Shared Framing]:\nmasterpiece, 2girls, beach") && blocks.contains("[Character 1]:\nsmile"), "{blocks}");
+    }
+
 }
