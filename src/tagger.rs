@@ -112,6 +112,14 @@ struct Loaded {
 /// Loading the 1.2 GB model takes a few seconds, so it stays loaded after first use.
 static MODEL: Mutex<Option<Loaded>> = Mutex::new(None);
 
+/// Frees the loaded tagger (about 1.5 GB of RAM) and the person detector. Called before a big text
+/// model loads: on this shared-memory machine the 12B didn't fit next to them and the system
+/// swapped. The next image read loads them again (~5 s).
+pub fn release() {
+    *MODEL.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    crate::detector::release();
+}
+
 fn load_tags(path: &Path) -> Result<Vec<(String, TagKind)>> {
     let text = std::fs::read_to_string(path)?;
     let mut tags = Vec::new();
@@ -152,6 +160,7 @@ fn preprocess(img: &image::DynamicImage) -> Result<Vec<f32>> {
 }
 
 /// Scores every Danbooru tag for the image.
+#[cfg(test)]
 pub fn tag_image(path: &Path) -> Result<Vec<ScoredTag>> {
     let img = image::open(path).with_context(|| format!("Couldn't open {}", path.display()))?;
     tag_dynamic(&img)
@@ -240,14 +249,21 @@ pub fn merge_detail_crop(base: &[ScoredTag], detail: &[ScoredTag]) -> Vec<Scored
         0.40,
     );
 
+    restore_kinds(base, merged)
+}
+
+/// Gives merged (name, score) pairs back their tag kind from `base` (General for new ones).
+/// The tagger scores all ~10,000 tags, so this uses one lookup table: searching `base` for
+/// every tag made each merge ~100 million string comparisons (minutes per image read).
+fn restore_kinds(base: &[ScoredTag], merged: Vec<(String, f32)>) -> Vec<ScoredTag> {
+    let mut kinds: std::collections::HashMap<String, TagKind> = std::collections::HashMap::with_capacity(base.len());
+    for b in base {
+        kinds.entry(crate::danbooru::key(&b.name)).or_insert(b.kind);
+    }
     merged
         .into_iter()
         .map(|(name, score)| {
-            let kind = base
-                .iter()
-                .find(|b| crate::danbooru::key(&b.name) == crate::danbooru::key(&name))
-                .map(|b| b.kind)
-                .unwrap_or(TagKind::General);
+            let kind = kinds.get(&crate::danbooru::key(&name)).copied().unwrap_or(TagKind::General);
             ScoredTag { name, score, kind }
         })
         .collect()
@@ -275,17 +291,7 @@ pub fn merge_quadrant_scene_crop(base: &[ScoredTag], quad: &[ScoredTag]) -> Vec<
         0.40,
     );
 
-    merged
-        .into_iter()
-        .map(|(name, score)| {
-            let kind = base
-                .iter()
-                .find(|b| crate::danbooru::key(&b.name) == crate::danbooru::key(&name))
-                .map(|b| b.kind)
-                .unwrap_or(TagKind::General);
-            ScoredTag { name, score, kind }
-        })
-        .collect()
+    restore_kinds(base, merged)
 }
 
 /// Extracts the top confident WD14 detections from a specific crop (Upper, Middle, Lower, or Quadrant)

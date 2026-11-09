@@ -8,3 +8,13 @@
 /packaging/arch/*.tar.gz
 /packaging/arch/*.sha256
 /scratch/
+# local scratch / agent working files
+__pycache__/
+.agents/
+*.zip
+/*.jpg
+/*.png
+/packaging/arch/*.jpg
+/packaging/arch/PROGRAM RESULT
+/Untitled Document
+/prompt_condenser.rs

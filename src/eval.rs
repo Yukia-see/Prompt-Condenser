@@ -77,7 +77,7 @@ impl TagTaxonomy {
         let mut characters = HashSet::new();
         let mut general = HashSet::new();
 
-        let default_path = PathBuf::from("/home/yukia/.local/share/prompt-condenser/wd-eva02-large-tagger-v3/selected_tags.csv");
+        let default_path = crate::tagger::tagger_dir().join("selected_tags.csv");
         let path = csv_path.unwrap_or(&default_path);
 
         if let Ok(content) = std::fs::read_to_string(path) {

@@ -973,7 +973,7 @@ mod tests {
         }
         let req = AiScanRequest {
             raw_prompt: raw.into(), config: c.clone(), mode: crate::profiles::AiMode::Gpu,
-            host: "localhost:11434".into(), model: "richardyoung/llama-3.1-8b-instruct-abliterated".into(),
+            host: "localhost:11434".into(), model: live_model(),
             keep_alive: "5m".into(), think: false,
         };
         let (out, place) = run_ai_scan(&req).unwrap();
@@ -999,8 +999,13 @@ mod tests {
             Case { name: "Anima 2", ckpt: CheckpointProfile::Anima, chars: vec!["1girl, red hair, long hair, red dress, smile", "1girl, blue hair, short hair, school uniform, glasses, shy"], scene: "park, sunset, standing side by side" },
             Case { name: "Pony 2", ckpt: CheckpointProfile::PonyV6, chars: vec!["1girl, red hair, red dress, smile", "1boy, black hair, armor, serious"], scene: "castle courtyard, night" },
             Case { name: "Pony 3", ckpt: CheckpointProfile::PonyV6, chars: vec!["1girl, red hair, ponytail, red dress", "1girl, blue hair, school uniform, glasses", "1girl, green hair, twintails, maid outfit"], scene: "park, sunset, full body" },
+            Case { name: "Anima 3", ckpt: CheckpointProfile::Anima, chars: vec!["1girl, red hair, ponytail, red kimono, smile", "1girl, blue hair, short hair, school uniform, glasses", "1girl, green hair, twintails, maid outfit, waving"], scene: "festival, night, paper lanterns, full body" },
+            Case { name: "Anima 4", ckpt: CheckpointProfile::Anima, chars: vec!["1girl, red hair, long hair, red dress", "1girl, blue hair, bob cut, sailor uniform", "1girl, green hair, twintails, hoodie", "1girl, pink hair, braid, white sundress"], scene: "beach, sunset, standing in a row, wide shot" },
         ];
-        let colors = ["red hair", "blue hair", "green hair"];
+        // `AUDIT_FILTER=Anima` runs only the cases whose name contains it
+        let filter = std::env::var("AUDIT_FILTER").unwrap_or_default();
+        let cases: Vec<Case> = cases.into_iter().filter(|c| filter.is_empty() || c.name.contains(filter.as_str())).collect();
+        let colors = ["red hair", "blue hair", "green hair", "pink hair"];
         let mut failures: Vec<String> = Vec::new();
         for case in cases {
             let n = case.chars.len();
@@ -1013,7 +1018,7 @@ mod tests {
             c.more_chars = case.chars.iter().skip(2).map(|p| (p.to_string(), String::new())).collect();
             let req = AiScanRequest {
                 raw_prompt: case.chars[0].into(), config: c.clone(), mode: crate::profiles::AiMode::Gpu,
-                host: "localhost:11434".into(), model: "richardyoung/llama-3.1-8b-instruct-abliterated".into(),
+                host: "localhost:11434".into(), model: live_model(),
                 keep_alive: "10m".into(), think: false,
             };
             let t = std::time::Instant::now();
@@ -1066,6 +1071,11 @@ mod tests {
         println!("\nAUDIT: {} failure(s) {:?}", failures.len(), failures);
     }
 
+    /// The model the live tests talk to: `AUDIT_MODEL=<ollama name>`, else the "Best" tier.
+    fn live_model() -> String {
+        std::env::var("AUDIT_MODEL").unwrap_or_else(|_| crate::profiles::AiModelTier::Best.ollama_name().to_string())
+    }
+
     /// Deep Scan on the prompts saved in settings.json (the user's real boxes):
     /// `cargo test live_user_scan -- --ignored --nocapture`
     #[test]
@@ -1088,7 +1098,7 @@ mod tests {
         let raw = g("raw_prompt");
         let req = AiScanRequest {
             raw_prompt: raw.clone(), config: c.clone(), mode: crate::profiles::AiMode::Gpu,
-            host: "localhost:11434".into(), model: "richardyoung/llama-3.1-8b-instruct-abliterated".into(),
+            host: "localhost:11434".into(), model: live_model(),
             keep_alive: "5m".into(), think: false,
         };
         let (out, place) = run_ai_scan(&req).unwrap();
@@ -1116,7 +1126,7 @@ mod tests {
             let raw = "1girl, solo, blonde hair, long hair, fox ears, red kimono, smile, holding hands, castle, sunset";
             let req = AiScanRequest {
                 raw_prompt: raw.into(), config: c.clone(), mode: crate::profiles::AiMode::Gpu,
-                host: "localhost:11434".into(), model: "richardyoung/llama-3.1-8b-instruct-abliterated".into(),
+                host: "localhost:11434".into(), model: live_model(),
                 keep_alive: "30m".into(), think: false,
             };
             let t = std::time::Instant::now();

@@ -157,6 +157,7 @@ fn push(out: &mut Vec<Action>, tag: &str, owner: Owner) {
 /// setting/camera/lighting go to the scene. Body parts and identity are dropped,
 /// except prop-preserved legwear (Directive 6) when actively interacted with.
 /// If `extract_shape` is true, body shape/proportions from the scene are extracted for character 1.
+#[cfg(test)]
 pub fn from_single(text: &str, keep_unknown: bool) -> Vec<Action> {
     from_single_with_shape(text, keep_unknown, false)
 }
@@ -299,6 +300,7 @@ pub fn from_single_with_shape(text: &str, keep_unknown: bool, extract_shape: boo
 /// A per-character reading (one prompt per detected character, left to right, plus the
 /// shared part). An action seen on every character becomes one "All" action.
 /// Non-action character tags (body parts, identity, clothes) are NEVER pushed to Scene.
+#[cfg(test)]
 pub fn from_split(chars: &[String], scene: &str, keep_unknown: bool) -> Vec<Action> {
     from_split_with_shape(chars, scene, keep_unknown, false)
 }

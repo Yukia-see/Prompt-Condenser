@@ -671,6 +671,7 @@ pub fn filter_identity_only(prompt: &str) -> String {
 /// style) and drops who is in it (count, species, hair, eyes, body, outfit), so a
 /// reference image can pose your own characters. `keep_unknown` keeps words the
 /// keyword lists don't know (the AI's props); the tagger's are dropped, to be safe.
+#[cfg(test)]
 pub fn filter_scene_and_pose_only(prompt: &str, keep_unknown: bool) -> String {
     filter_scene_and_pose_only_with_shape(prompt, keep_unknown, false)
 }

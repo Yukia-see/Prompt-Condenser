@@ -23,7 +23,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from reference import prompt_condenser_dual_pass as p
 
 def main():
-    image_path = Path("packaging/arch/character.jpg")
+    if len(sys.argv) > 1:
+        image_path = Path(sys.argv[1])
+    else:
+        image_path = Path("packaging/arch/character.jpg")
     if not image_path.exists():
         image_path = Path("tests/eval_dataset/HQwyhBIbAAAguCD.jpg")
 
@@ -32,9 +35,17 @@ def main():
     img_w, img_h = im.size
     print(f"Image Dimensions: {img_w}x{img_h}")
 
-    # 1. Detection Box (using YOLOv8s detected coordinates)
-    # Character box for packaging/arch/character.jpg is [10, 3, 1259, 1567]
-    fig_box = {"x0": 10.0, "y0": 3.0, "x1": 1259.0, "y1": 1567.0}
+    # 1. Detection Box
+    txt_path = image_path.with_suffix(".txt")
+    if "HWP1dffawAA5Y7K" in str(image_path):
+        fig_box = {"x0": 3.0, "y0": 12.0, "x1": 832.0, "y1": 1215.0}
+    elif "HWL8f8wbYAAMJ" in str(image_path):
+        fig_box = {"x0": 41.0, "y0": 8.0, "x1": 429.0, "y1": 956.0}
+    elif "HQwyhBIbAAAguCD" in str(image_path):
+        fig_box = {"x0": 222.0, "y0": 7.0, "x1": 440.0, "y1": 672.0}
+    else:
+        fig_box = {"x0": 10.0, "y0": 3.0, "x1": float(img_w) - 5.0, "y1": float(img_h) - 1.0}
+
     fig_w = fig_box["x1"] - fig_box["x0"]
     fig_h = fig_box["y1"] - fig_box["y0"]
     print(f"\n[Step 1] Figure Detection: Box ({fig_box['x0']}, {fig_box['y0']}) -> ({fig_box['x1']}, {fig_box['y1']})")
@@ -160,11 +171,15 @@ def main():
     print(f"  Ollama Status: {ollama_msg}")
 
     # Prepare WD14 tag list
-    wd14_tags = [
-        "1girl", "solo", "black hair", "long hair", "sunglasses on head",
-        "tube top", "cleavage", "light blue bikini bottoms",
-        "white thighhighs", "barefoot", "sitting on bed", "looking at viewer"
-    ]
+    if txt_path.exists():
+        wd14_tags = [t.strip() for t in txt_path.read_text().split(",") if t.strip()]
+        print(f"  Loaded {len(wd14_tags)} ground-truth/tagger tags from: {txt_path}")
+    else:
+        wd14_tags = [
+            "1girl", "solo", "black hair", "long hair", "sunglasses on head",
+            "tube top", "cleavage", "light blue bikini bottoms",
+            "white thighhighs", "barefoot", "sitting on bed", "looking at viewer"
+        ]
     # Simulate VLM prose
     vlm_prose = (
         "The artwork shows a woman with messy long black hair sitting on a bed. "
@@ -215,7 +230,7 @@ def main():
     if pipeline_result.get("warnings"):
         print(f"Warnings: {pipeline_result['warnings']}")
 
-    report_path = Path("live_pipeline_test_report.md")
+    report_path = Path(f"live_test_{image_path.stem}_report.md")
     with open(report_path, "w") as f:
         f.write("# Live Pipeline Test Report: Phases 0-5 End-to-End Validation\n\n")
         f.write(f"- **Image Tested:** `{image_path}` ({img_w}x{img_h})\n")

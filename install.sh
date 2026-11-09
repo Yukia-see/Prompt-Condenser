@@ -2,8 +2,8 @@
 # Installs ComfyUI Prompt Condenser for the current user and sets up its AI dependency:
 #   1. Ollama + Vulkan GPU support (ollama, ollama-vulkan) via pacman, service enabled
 #   2. binary -> ~/.local/bin/prompt-condenser, menu entry in ~/.local/share/applications
-#   3. optionally downloads the recommended AI model (Gemma 4 12B, uncensored) through
-#      Ollama as prompt-condenser-gemma4-12b (other sizes: "Download Model" in the app)
+#   3. optionally downloads the recommended AI model (Llama 3.1 8B Abliterated, uncensored)
+#      through Ollama (other models: "Download Model" in the app)
 #
 # Run from the installer bundle (scripts/build_installer.sh) or from the source tree
 # after `cargo build --release`.
@@ -28,7 +28,13 @@ if [[ "${1:-}" == "--uninstall" ]]; then
   rm -f "$BIN_DIR/prompt-condenser" "$DESKTOP_FILE"
   echo "Removed binary and menu entry."
   if command -v ollama >/dev/null && ollama_up && ask "Also remove the prompt-condenser models from Ollama?"; then
-    ollama rm prompt-condenser-gemma4-e2b-q8 prompt-condenser-gemma4-e4b prompt-condenser-gemma4-12b 2>/dev/null || true
+    # Only the models registered under this app's own names (the current one, then older ones).
+    # General models it can use (Llama 3.1 8B, Gemma 4 12B, Qwen-VL, Moondream) are left alone,
+    # since other apps may use them. One `ollama rm` each: it stops at the first missing name.
+    for m in prompt-condenser-gemma4-e4b prompt-condenser-gemma4-e2b-q8 prompt-condenser-gemma4-12b; do
+      if ollama rm "$m" >/dev/null 2>&1; then echo "Removed $m"; fi
+    done
+    echo "General models (Llama 3.1 8B, Gemma 4 12B, vision models) were kept; remove them with 'ollama rm <name>'."
   fi
   echo "Ollama itself was left installed (sudo pacman -R ollama-vulkan ollama to remove it)."
   exit 0
@@ -108,7 +114,7 @@ if command -v ollama >/dev/null && ollama_up; then
   elif ask "Download the recommended AI model now (Llama 3.1 8B Abliterated, ~4.9 GB, needs ~5 GB VRAM)?"; then
     ollama pull "$MODEL_SRC"
   else
-    echo "    Skipped. Pick a model in the app and click 'Download Model' (smaller ones: Light ~3 GB, Balanced ~3.5 GB)."
+    echo "    Skipped. Pick a model in the app and click 'Download Model' (Good: Gemma 4 E4B ~3.5 GB, Best: Gemma 4 12B Abliterated ~8 GB)."
   fi
 else
   echo "==> Ollama isn't running; download a model later from the app ('Download Model')."

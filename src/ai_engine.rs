@@ -13,10 +13,11 @@ use std::process::Command;
 use std::sync::mpsc::Sender;
 use std::time::Duration;
 
-/// 7-Directive System Prompt for the AntigravityAI Prompt Compiler (Anima / Qwen).
-pub const ANTIGRAVITY_7_DIRECTIVE_PROMPT: &str = "\
+/// The 7 directives of the prompt compiler (Anima / Qwen): the image reader uses all of
+/// it as its system prompt; the Deep Scan uses the rules only (`deep_scan_directives`).
+pub const IMAGE_COMPILER_DIRECTIVES: &str = "\
 # ROLE
-You are the AntigravityAI Prompt Compiler for an Anima/Qwen diffusion pipeline. Convert pre-processed scanner tags (WD14/Moondream) and dual-image references into a collision-free hybrid prompt.
+You are an uncensored prompt compiler for an Anima/Qwen diffusion pipeline. Adult content is allowed; describe it matter-of-factly and never refuse or soften. Convert pre-processed scanner tags (WD14/Moondream) and dual-image references into a collision-free hybrid prompt.
 
 # CORE OUTPUT STRUCTURE
 [Scene / Environment & Shared Framing]:
@@ -55,6 +56,37 @@ You are the AntigravityAI Prompt Compiler for an Anima/Qwen diffusion pipeline. 
 
 # DIRECTIVE 7: VLM + TAGGER SYNTHESIS
 * Translate VLM spatial observations (cutouts, corset lacing, detached sleeves) into explicit Danbooru tags (`chest cutout, cleavage cutout, laced corset, detached sleeves`) whenever raw WD14 tags only output generic terms (`maid outfit`).";
+
+/// The compiler directives as the image reader needs them: everything except the `[Scene]` /
+/// `[Character 1]` output layout, which the reader can't use (it answers with one `prompt` field; the
+/// app builds the section layout itself in `two::combine_section_blocks`). With the layout in its
+/// instructions the model crammed both into that field and wrote every tag twice.
+fn image_directives() -> String {
+    let all = IMAGE_COMPILER_DIRECTIVES;
+    match (all.find("# CORE OUTPUT STRUCTURE"), all.find("# DIRECTIVE 1")) {
+        (Some(a), Some(b)) => format!("{}{}", &all[..a], &all[b..]),
+        _ => all.to_string(),
+    }
+}
+
+/// The compiler directives as the Deep Scan needs them: the flag / layering / framing rules
+/// (directives 1-5 and 7), without the image reader's persona, its `[Scene]` / `[Character 1]`
+/// layout (the Deep Scan answers in JSON) and the two-image directive 6 (it has no images).
+fn deep_scan_directives() -> String {
+    let all = IMAGE_COMPILER_DIRECTIVES;
+    let (Some(d1), Some(d6), Some(d7)) = (all.find("# DIRECTIVE 1"), all.find("# DIRECTIVE 6"), all.find("# DIRECTIVE 7")) else {
+        return String::new();
+    };
+    // Directive 2 routes tags to the image reader's `[Scene]` / `[Character 1]` sections; the
+    // Deep Scan has no such sections (on the multi-character tabs "everything to Character 1"
+    // would push tags onto the wrong character), so it gets the same rule in its own terms.
+    format!("{}{}", &all[d1..d6], &all[d7..])
+        .replace(
+            "exclusively to `[Scene]`. Route expressions (`smiling`, `serene expression`) and anatomy/apparel exclusively to `[Character 1]`.",
+            "to the shared scene. Route expressions (`smiling`, `serene expression`) and anatomy/apparel to the character they belong to.",
+        )
+        .replace("In `[Scene]` prose,", "In a natural-language sentence,")
+}
 
 // ============================================================================
 // Local GPU info (status bar only; Ollama picks the device itself)
@@ -398,6 +430,30 @@ pub enum ModelFamily {
 }
 
 /// Parameter count in billions from a model name ("llama3.2:3b" -> 3.0, "qwen2.5:32b" -> 32.0).
+/// 10B parameters or more (the 12B): kept in memory only briefly after a Deep Scan.
+pub fn is_big_model(name: &str) -> bool {
+    param_billions(name).is_some_and(|b| b >= 10.0)
+}
+
+/// Sets how long Ollama keeps an already loaded model ("2m", "0" = unload now). Only touches a
+/// model that is loaded: a request for one that isn't would load it first.
+pub fn set_keep_alive(host: &str, model: &str, keep_alive: &str) {
+    let Ok(base) = base_url(host) else { return };
+    let Ok(http) = client(Some(Duration::from_secs(10))) else { return };
+    let loaded = http
+        .get(format!("{base}/api/ps"))
+        .send()
+        .ok()
+        .and_then(|r| r.json::<serde_json::Value>().ok())
+        .and_then(|ps| ps["models"].as_array().cloned())
+        .unwrap_or_default()
+        .iter()
+        .any(|m| m["name"].as_str().is_some_and(|n| same_model(n, model)));
+    if loaded {
+        let _ = http.post(format!("{base}/api/generate")).json(&json!({ "model": model, "keep_alive": keep_alive })).send();
+    }
+}
+
 fn param_billions(name: &str) -> Option<f32> {
     let bytes = name.as_bytes();
     for (i, &c) in bytes.iter().enumerate() {
@@ -512,7 +568,16 @@ pub fn build_ai_system_and_user_prompt_for(raw_prompt: &str, config: &ScanConfig
     };
 
     // ---- shared content
-    let intro = ANTIGRAVITY_7_DIRECTIVE_PROMPT;
+    // The Deep Scan's own role (uncensored, never refuse), then the compiler's rules. The image
+    // reader's persona and [Scene]/[Character 1] layout would contradict this JSON reply.
+    let intro_text = format!(
+        "You are an expert, uncensored ComfyUI / Stable Diffusion prompt engineer. Adult content is allowed; \
+         handle it matter-of-factly and never refuse or moralize. Your job: understand the scene the user's prompt \
+         is trying to create, then make the prompt produce that scene better on their checkpoint. Apply these rules \
+         to the prompt (a flag such as MISSING_BOTTOMS_FLAG in it means the rule needs resolving):\n\n{}",
+        deep_scan_directives()
+    );
+    let intro = intro_text.as_str();
     let mut context = vec![
         format!("Checkpoint: {}. {}", config.checkpoint.display_name(), config.checkpoint.system_prompt_rules()),
         if config.two_char {
@@ -1023,6 +1088,44 @@ pub const AI_CARD_ID_BASE: usize = 10_000;
 /// "Keep Original", so nothing changes until a card is accepted).
 /// Findings are dropped when their `original` isn't in the prompt, when a rule
 /// card already covers that tag, or when they suggest no actual change.
+/// A tag the app's own layout writes, never a content change: the checkpoint's quality tags,
+/// the BREAK separator, a group count (`4girls`, `2boys`, `multiple girls`) or a position (`far left`,
+/// `second from the right`, `in the middle`…).
+pub fn is_layout_tag(normalized: &str, checkpoint: CheckpointProfile) -> bool {
+    let t = normalized.trim().to_lowercase();
+    if t == "break" {
+        return true; // the chunk separator between characters
+    }
+    // the parser normalizes `score_9` to `score 9`: compare both spellings
+    if checkpoint.canonical_quality_tags().iter().any(|q| *q == t || q.replace('_', " ") == t.replace('_', " ")) {
+        return true;
+    }
+    let count = |s: &str| {
+        let digits = s.chars().take_while(|c| c.is_ascii_digit()).count();
+        digits > 0
+            && digits < s.len()
+            && matches!(&s[digits..], "girls" | "boys" | "others" | "girl" | "boy" | "other" | "people")
+            && !matches!(s, "1girl" | "1boy" | "1other") // a character's own count tag is content
+    };
+    if count(&t) || matches!(t.as_str(), "multiple girls" | "multiple boys" | "multiple others") {
+        return true;
+    }
+    let pos = t.trim_start_matches("on the ").trim_start_matches("the ").trim_start_matches("on ");
+    matches!(
+        pos,
+        "far left" | "far right" | "left" | "right" | "middle" | "center" | "in the middle" | "in the center"
+            | "second from left" | "second from right" | "second from the left" | "second from the right"
+    )
+}
+
+/// `is_layout_tag` for any checkpoint (quality tags of every profile count): used where the
+/// checkpoint isn't known, so an "add masterpiece" never becomes a card, since
+/// `ensure_quality_tags` writes the right quality tags itself.
+pub fn is_layout_tag_any(normalized: &str) -> bool {
+    use CheckpointProfile::*;
+    [Anima, PonyV6, Illustrious, Sdxl, Sd15].iter().any(|c| is_layout_tag(normalized, *c))
+}
+
 pub fn convert_ai_changes(
     ai_items: &[AiChangeItem],
     prompt_tokens: &[crate::parser::PromptToken],
@@ -1042,13 +1145,25 @@ pub fn convert_ai_changes(
     let mut out = Vec::new();
     for item in ai_items {
         let action = item.action.to_lowercase();
-        let targets: Vec<String> = if action == "add" && matches!(item.original.trim().to_lowercase().as_str(), "none" | "n/a" | "null") {
-            Vec::new()
-        } else {
-            parse_prompt(&item.original).into_iter().map(|t| t.normalized).collect()
-        };
         let suggestion: Vec<String> =
             parse_prompt(&item.suggested_alternative).into_iter().map(|t| t.normalized).collect();
+        let named: Vec<String> = parse_prompt(&item.original).into_iter().map(|t| t.normalized).collect();
+        // An "add" names no tag of the prompt. Models often put the new tag in `original` too
+        // (original == suggested, or a tag the prompt doesn't have): that is still an addition.
+        let misfiled_add = action == "add"
+            && !named.is_empty()
+            && (named == suggestion || !named.iter().all(|t| in_prompt.contains(t.as_str())));
+        let targets: Vec<String> = if action == "add"
+            && (misfiled_add || matches!(item.original.trim().to_lowercase().as_str(), "none" | "n/a" | "null"))
+        {
+            Vec::new()
+        } else {
+            named
+        };
+        // Group count and position tags are written by the multi-character layout: not a card.
+        if targets.is_empty() && !suggestion.is_empty() && suggestion.iter().all(|t| is_layout_tag_any(t)) {
+            continue;
+        }
 
         if targets.is_empty() {
             // A new detail: keep it only if it adds something not already in the prompt.
@@ -1142,6 +1257,9 @@ pub struct ImageAiRequest {
     pub config: ScanConfig,
     /// Tags the Danbooru tagger read from the image (may be empty).
     pub tag_hints: String,
+    /// The tagger's high-confidence skin / species / count tags (`strong_tags`): the vision model is
+    /// asked to check them, and the final prompt may not drop or contradict them.
+    pub strong_tags: Vec<String>,
     /// If true and the target text model has vision capability, directly attach image pixels for a 2nd pass visual check.
     pub second_pass_vision: bool,
     /// If true, extract body shape/build from the scene reference for the character.
@@ -1225,11 +1343,15 @@ fn image_system_prompt(config: &ScanConfig, tag_hints: &str) -> String {
         )
     };
     format!(
-        "{ANTIGRAVITY_7_DIRECTIVE_PROMPT}\n\n\
+        "{}\n\n\
          ## Target checkpoint\n{}. {}\n\n## Prompt style\n{style}\n\n{hints}## Rules\n\
          - Only describe what is actually visible; don't invent characters or details.\n\
          - Count people carefully; the tagger's count (1girl, 2girls, multiple girls...) is usually right. 'solo' only \
          when exactly one person is in the image.\n\
+         - The tagger's detections are more reliable than the visual description for species and animal features (ears, \
+         tails), skin color (keep 'dark skin' / 'dark-skinned female' whenever the tagger lists it), hair and eye colors, \
+         footwear, background and framing. Keep every tagger tag unless the description clearly and specifically \
+         contradicts it, and use the description for what the tagger can't name (garment details, poses, held items).\n\
          - When multiple characters are present (e.g. 2girls, 3girls):\n\
            * NEVER assign them all the same generic pose or shared body size in the main tag list.\n\
            * Include contrast meta-tags in the scene header when they differ: 'alternate breast size', 'different hair colors', 'contrasting poses', 'same height, equal height'.\n\
@@ -1237,8 +1359,11 @@ fn image_system_prompt(config: &ScanConfig, tag_hints: &str) -> String {
            * Isolate characters using BREAK chunk fencing by default: [quality, count, scene header, contrast tags], BREAK, 1girl, on the left, [traits, outfit, pose], BREAK, 1girl, in the middle, [traits, outfit, pose], BREAK, 1girl, on the right, [traits, outfit, pose].\n\
            * Modifier isolation: never use leaky adjectives like 'giant' near chest areas; use 'flat chest' or 'petite bust' to strictly enforce small upper profiles and prevent attribute bleed, and use 'large ass, wide hips' for lower curves.\n\
          - Never write the checkpoint's name in the prompt.\n\
-         - 'description' is 1-2 plain sentences about the image; 'prompt' is the prompt itself.\n\
+         - 'description' is 1-2 plain sentences about the image; 'prompt' is the prompt itself: ONE flat, \
+         comma-separated list of tags, quality tags first. No section headers such as [Scene] or [Character 1], no \
+         labels, no parentheses around groups of tags, no notes: the app builds its own layout from the list.\n\
          - Reply with JSON only.",
+        image_directives(),
         config.checkpoint.display_name(),
         config.checkpoint.system_prompt_rules(),
     )
@@ -1406,32 +1531,31 @@ pub fn run_dual_pass_asymmetric_pipeline(
     };
     let b64_image = base64::engine::general_purpose::STANDARD.encode(&img_bytes);
 
-    let effective_opts = crate::prompt_condenser::PipelineOptions {
-        mode: crate::prompt_condenser::Mode::SceneShape,
-        use_llm_synthesis: opts.use_llm_synthesis,
-        gemma_vision_pass: opts.gemma_vision_pass,
-    };
+    // The mode the user picked (Mode A: scene + body shape, Mode B: scene + skeletal pose)
+    // decides the vision prompts and the synthesis instruction. It used to be forced to A.
+    let effective_opts = opts;
 
+    // the pipeline below runs with `Config::default()`, so that is the first-try temperature
+    let first_try_temp = crate::prompt_condenser::Config::default().vlm_temperature;
+    // the vision encoders are unloaded once, before the first text-model call (or at the end)
+    let encoders_unloaded = std::cell::Cell::new(false);
     let moondream_fn = |prompt: &str, temp: f32| -> Result<String, String> {
-        let vision_model = if prompt == effective_opts.mode.pass1_prompt() {
-            pass1_vision_model
-        } else {
-            pass2_vision_model
-        };
+        let vision_model = vision_model_for_prompt(effective_opts.mode, prompt, pass1_vision_model, pass2_vision_model);
+        let (temperature, seed) = vlm_sampling(temp, first_try_temp);
         let body = serde_json::json!({
             "model": vision_model,
             "prompt": prompt,
             "images": [&b64_image],
             "stream": false,
             "think": false,
-            "keep_alive": "30m",
+            "keep_alive": encoder_keep_alive(vision_model),
             "options": {
-                "temperature": (temp * 0.5).min(0.05),
+                "temperature": temperature,
                 "top_p": 0.85,
-                "seed": 42,
+                "seed": seed,
                 "repeat_penalty": 1.15,
                 "num_predict": 500,
-                "num_ctx": 2048,
+                "num_ctx": 4096,
                 "num_gpu": if mode_ai == AiMode::CpuOnly { Some(0) } else { None::<i32> },
             },
         });
@@ -1464,20 +1588,23 @@ pub fn run_dual_pass_asymmetric_pipeline(
             Ok(true) => {
                 Some(Box::new(|req: &crate::prompt_condenser::GemmaRequest| -> Result<crate::prompt_condenser::GemmaReply, String> {
                     let img_opt = if req.with_image { Some(b64_image.as_str()) } else { None };
-                    let fixed_text = req.text.replace(
-                        "Place environment, lighting, camera and pose in scene_prompt. Place face, hair, body proportions, clothing and props in character_prompt.",
-                        "Place environment, lighting and camera in scene_prompt. Place face, hair, body proportions, clothing, props and skeletal pose in character_prompt.",
-                    );
-                    let req_body = crate::prompt_condenser::ollama_chat_request_body(
+                    // the vision encoders are done: free their memory before the big model loads
+                    if !encoders_unloaded.replace(true) {
+                        unload_dedicated_encoders(&base, &[pass1_vision_model, pass2_vision_model], text_model);
+                        // the image part is done: free the tagger's RAM for the text model too
+                        crate::tagger::release();
+                    }
+                    let req_body = crate::prompt_condenser::ollama_chat_request_body_with(
                         text_model,
-                        &fixed_text,
+                        req.text,
                         0.10, // Calibrated deterministic synthesis temperature (prevents tag improvisation)
                         crate::prompt_condenser::GEMMA_CONTEXT_WINDOW,
                         req.max_tokens,
                         img_opt,
                         true, // json_mode
-                    )
-                    .replacen("\"stream\":false,", "\"stream\":false,\"think\":false,", 1);
+                        Some(false), // think: off
+                        Some(1.1),   // repeat penalty: stops the endless tag lists the 12B writes on crowded images
+                    );
                     let c = client(Some(Duration::from_secs(300))).map_err(|e| e.to_string())?;
                     let resp = c.post(format!("{base}/api/chat"))
                         .header("Content-Type", "application/json")
@@ -1485,6 +1612,9 @@ pub fn run_dual_pass_asymmetric_pipeline(
                         .send()
                         .map_err(|e| if e.is_timeout() { "Gemma synthesis timed out after 5 minutes".to_string() } else { format!("Gemma chat error: {e}") })?;
                     let resp_text = resp.text().map_err(|e| e.to_string())?;
+                    if std::env::var_os("PC_DEBUG_GEMMA").is_some() {
+                        eprintln!("[gemma raw reply, max_tokens {}]\n{resp_text}\n[/gemma]", req.max_tokens);
+                    }
                     crate::prompt_condenser::parse_ollama_chat_response(&resp_text)
                 }))
             }
@@ -1502,10 +1632,14 @@ pub fn run_dual_pass_asymmetric_pipeline(
         .replace(", UNANCHORED_LIMBS_FLAG", "");
 
     // Enrich with multi-zone/quadrant prose detections if vision model is available
-    let multizone_tags = extract_visual_description_from_path(image_path, host, mode_ai, pass2_vision_model)
-        .ok()
-        .map(|desc| crate::danbooru::extract_tags_from_prose(&desc))
-        .unwrap_or_default();
+    let mut multizone_warning: Option<String> = None;
+    let multizone_tags = match extract_visual_description_from_path(image_path, host, mode_ai, pass2_vision_model) {
+        Ok(desc) => crate::danbooru::extract_tags_from_prose(&desc),
+        Err(e) => {
+            multizone_warning = Some(format!("Multi-zone scan skipped: {e}"));
+            Vec::new()
+        }
+    };
     let mut enriched_wd14 = sanitized_wd14;
     for mt in multizone_tags {
         if !enriched_wd14.to_lowercase().contains(&mt.to_lowercase()) {
@@ -1522,6 +1656,12 @@ pub fn run_dual_pass_asymmetric_pipeline(
         &moondream_fn,
         gemma_ref,
     );
+    if !encoders_unloaded.replace(true) {
+        unload_dedicated_encoders(&base, &[pass1_vision_model, pass2_vision_model], text_model);
+    }
+    if let Some(w) = multizone_warning {
+        result.warnings.push(w);
+    }
 
     // Post-synthesis rule-engine upgrades (Deduplication, Layering, White-on-White, Gaze, and 8-Bucket Ordering)
     if !result.character_prompt.is_empty() {
@@ -1596,7 +1736,7 @@ pub fn run_dual_pass_asymmetric_pipeline(
 pub fn describe_image(req: &ImageAiRequest) -> Result<ImageAiResult> {
     if let Some(ref encoder) = req.vision_encoder {
         if !same_model(encoder, &req.model) {
-            let vision_desc = extract_visual_description_from_path(&req.image_path, &req.host, req.mode, encoder)?;
+            let vision_desc = observe_image(&req.image_path, &req.host, req.mode, encoder, &req.tag_hints, &req.strong_tags)?;
             return describe_image_with_desc(req, &vision_desc, encoder);
         }
     }
@@ -1619,15 +1759,15 @@ pub fn describe_image_with_desc(
             enriched_hints.push_str(pt);
         }
     }
-    if !req.second_pass_vision {
+    // The plain tag merge (tagger + words from the description), used only if the text model fails.
+    // It used to be returned whenever the 2nd Pass Visual Check was off, so the selected text model
+    // never wrote the prompt in Combined mode. The check now only decides whether the image is
+    // attached to the text model's request (see `describe_with_text_model`).
+    let tag_merge = || {
         let tag_filter = AntigravityTagFilter::new();
         let tagged_prompt = tag_filter.process_tags(&enriched_hints);
-        let cleaned_prompt = tag_filter.resolve_and_strip_flags(&tagged_prompt);
-        return Ok(ImageAiResult {
-            description: vision_desc.to_string(),
-            prompt: cleaned_prompt,
-        });
-    }
+        ImageAiResult { description: vision_desc.to_string(), prompt: tag_filter.resolve_and_strip_flags(&tagged_prompt) }
+    };
 
     let candidates = crate::danbooru::list()
         .ok()
@@ -1643,24 +1783,33 @@ pub fn describe_image_with_desc(
         .unwrap_or_default();
 
     let system = image_system_prompt(&req.config, &enriched_hints);
-    let second_pass_note = "\n\n## 2nd Pass Visual Verification\nAn image is attached for direct visual verification. Cross-examine the visual description and tagger detections against the actual image to ensure exact hair, eyes, body build, bust size, clothing, and details are 100% accurate.";
+    let second_pass_note = if !req.second_pass_vision { "" } else { "\n\n## 2nd Pass Visual Verification\nAn image is attached for direct visual verification. Cross-examine the visual description and tagger detections against the actual image to ensure exact hair, eyes, body build, bust size, clothing, and details are 100% accurate." };
+    // The vision model's description is usually richer than what the writer kept (it dropped ToriiGate's
+    // "two long locks", "wing-shaped hair ornaments", "jacket slipping off her shoulders", "white boots").
+    let keep_details = "\n\n## Keep every detail\nTurn EVERY concrete visual detail in the description into tags: hair style \
+         (locks, sidelocks, bangs, how it is tied), hair ornaments and their shape, how each garment is worn (open, off the \
+         shoulders, unbuttoned), garment colors and materials, footwear type and color, where the arms and hands are, the \
+         framing and the background. Do not summarize or drop details. Leave out character names, scores and notes.";
     let user_prompt = if enriched_hints.trim().is_empty() {
         format!(
-            "## Visual description from vision encoder ({encoder_name}):\n{vision_desc}{candidates}{second_pass_note}\n\nWrite the prompt for this image."
+            "## Visual description from vision encoder ({encoder_name}):\n{vision_desc}{candidates}{second_pass_note}{keep_details}\n\nWrite the prompt for this image."
         )
     } else {
         format!(
-            "## Visual description from vision encoder ({encoder_name}):\n{vision_desc}{candidates}{second_pass_note}\n\n\
+            "## Visual description from vision encoder ({encoder_name}):\n{vision_desc}{candidates}{second_pass_note}{keep_details}\n\n\
              ## Task\n\
              Synthesize the visual description and tagger detections into a complete, accurate, conflict-free Danbooru prompt according to the combination instructions."
         )
     };
-    let mut res = describe_with_text_model(req, &system, &user_prompt)?;
-    for pt in prose_tags {
-        if !res.prompt.to_lowercase().contains(&pt.to_lowercase()) {
-            res.prompt.push_str(", ");
-            res.prompt.push_str(pt);
-        }
+    // The words found in the description are already in the hints the model saw; adding them again
+    // after it answered overrode its choices (and brought back what it rightly left out).
+    let mut res = match describe_with_text_model(req, &system, &user_prompt) {
+        Ok(r) => r,
+        Err(_) => tag_merge(),
+    };
+    // PC_NO_POLISH=1 turns the last pass off, to measure what it adds (testing only)
+    if std::env::var_os("PC_NO_POLISH").is_none() {
+        res.prompt = polish_image_prompt_with(&res.prompt, vision_desc, &req.strong_tags, &req.tag_hints);
     }
     Ok(res)
 }
@@ -1689,18 +1838,116 @@ pub fn extract_visual_description_from_path(
     mode: AiMode,
     encoder: &str,
 ) -> Result<String> {
+    extract_visual_description_with_hints(path, host, mode, encoder, &[])
+}
+
+/// `extract_visual_description_from_path` with the tagger's high-confidence skin / species / count
+/// tags (`strong_tags`), which the vision model is asked to confirm or correct instead of guessing.
+pub fn extract_visual_description_with_hints(
+    path: &std::path::Path,
+    host: &str,
+    mode: AiMode,
+    encoder: &str,
+    verify: &[String],
+) -> Result<String> {
     let base = base_url(host)?;
     let img = image::open(path).with_context(|| format!("Couldn't open {}", path.display()))?;
 
     // 1. Pass 1: Global scene & environment overview
     let scene_b64 = encode_dynamic_image_b64(&img)?;
-    let scene_ask = "Describe the overall scene: setting, background, atmosphere, lighting, camera framing, and character placement.";
+    // Nothing used to ask for skin tone or what animal the ears and tail are, so the description never
+    // said "dark skin" and called every pair of animal ears cat ears. The tagger's sure tags are given
+    // to check, not to copy.
+    let verify_note = if verify.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " An image tagger detected these with high confidence: {}. Check each against the image and say whether it is right; correct it if not.",
+            verify.join(", ")
+        )
+    };
+    let scene_ask = format!(
+        "Describe the image: the setting and background, the lighting, the camera framing (how much of the body is visible and from which side), \
+         each character's skin tone, any animal features (ears, tail, horns: say which animal they belong to, judging by their shape and by the \
+         tail's color and pattern), the hair (color, length, style), the clothing and the pose. Describe only what you can see.{verify_note}"
+    );
+    let scene_ask = scene_ask.as_str();
     let scene_desc = ask_vision_encoder(&base, mode, encoder, scene_b64, scene_ask)?;
 
-    // 2. Pass 2: 4-Quadrant Environmental Object & Prop Pinpointing (plants, furniture, lamps, windows, decor)
+    // The calls below run one after another: they get a total time budget and a cap, so a
+    // crowded image can't turn one read into minutes of vision calls. The people come first
+    // (they matter most); the quadrant decor pass only uses what time is left.
+    let budget = ScanBudget::new(MULTIZONE_BUDGET);
+
+    // 2. Per-person zone scan (Upper + Middle + Lower; one zone each for 3+ people)
+    let boxes = crate::detector::detect(&img).unwrap_or_default();
+    let mut char_sections = Vec::new();
+    if !boxes.is_empty() {
+        let count = boxes.len().clamp(1, 4);
+        let chars = crate::detector::main_n(&boxes, count).unwrap_or_else(|| boxes.clone());
+
+        let pos_labels: &[&str] = match count {
+            1 => &["Character"],
+            2 => &["Left Character", "Right Character"],
+            3 => &["Left Character", "Center Character", "Right Character"],
+            _ => &["Far-Left Character", "Center-Left Character", "Center-Right Character", "Far-Right Character"],
+        };
+
+        let upper_only = count >= 3;
+        let mut zone_calls = 0usize;
+        for (i, b) in chars.iter().enumerate() {
+            let label = pos_labels.get(i).copied().unwrap_or("Character");
+            let zones = crate::detector::three_zone_crops(&img, b);
+            let mut zone_lines = Vec::new();
+
+            for (z_name, z_img) in &zones {
+                if upper_only && !z_name.contains("Upper") {
+                    continue; // 3+ people: one call each (head, hair, upper outfit)
+                }
+                if zone_calls >= MULTIZONE_MAX_ZONE_CALLS || budget.spent() {
+                    break;
+                }
+                zone_calls += 1;
+                if let Ok(z_b64) = encode_dynamic_image_b64(z_img) {
+                    let ask = if z_name.contains("Upper") {
+                    format!(
+                        "This crop shows the head of the {label}. Describe what you see: hair color, length and style, eye color, \
+                         eyewear, ears or horns (which animal?), hair ornaments, skin tone and facial expression. Describe only what is \
+                         actually there; don't mention things that are absent."
+                    )
+                } else if z_name.contains("Middle") {
+                    format!(
+                        "This crop shows the upper body of the {label}. Describe what you see: each garment (type, color, pattern, how it \
+                         is worn), skin tone, arm positions and anything held. Describe only what is actually there; don't list things \
+                         that are absent."
+                    )
+                } else {
+                    format!(
+                        "This crop shows the lower body of the {label}. Describe what you see: the clothing, legwear and footwear (type \
+                         and color), a tail if there is one (its color and pattern), and the leg position. Describe only what is actually \
+                         there; don't list things that are absent."
+                    )
+                };
+                    let desc = ask_vision_encoder(&base, mode, encoder, z_b64, &ask).unwrap_or_default();
+                    if !desc.trim().is_empty() {
+                        zone_lines.push(format!("- **{}**: {}", z_name, desc.trim()));
+                    }
+                }
+            }
+
+            if !zone_lines.is_empty() {
+                char_sections.push(format!("### Character: {}\n{}", label, zone_lines.join("\n")));
+            }
+        }
+    }
+
+    // 3. 4-Quadrant environmental objects & props (plants, furniture, lamps, windows, decor)
     let quads = crate::detector::quadrant_crops(&img);
     let mut quad_parts = Vec::new();
     for (name, q_img) in &quads {
+        if budget.spent() {
+            break; // out of time: the people above matter more than the decor
+        }
         if let Ok(q_tags) = crate::tagger::tag_dynamic(q_img) {
             let triggers = crate::tagger::extract_zone_triggers(&q_tags, 0.40);
             let has_objects = triggers.iter().any(|t| crate::tagger::is_concrete_scene_object(t));
@@ -1726,8 +1973,7 @@ pub fn extract_visual_description_from_path(
         format!("\n\n### Quadrant Environment & Objects (Plants, Decor & Props):\n{}", quad_parts.join("\n"))
     };
 
-    // 3. Pass 3: Universal Zone Anatomical Scan (Upper + Middle + Lower where valid) for detected characters
-    let boxes = crate::detector::detect(&img).unwrap_or_default();
+
     if boxes.is_empty() {
         return Ok(format!(
             "### Scene & Environment (Spatial Overview):\n{}{}\n\n*Warning: No figure detected; processed full frame and scene quadrants only.*",
@@ -1735,55 +1981,455 @@ pub fn extract_visual_description_from_path(
             quad_section
         ));
     }
-    let count = boxes.len().clamp(1, 4);
-    let chars = crate::detector::main_n(&boxes, count).unwrap_or_else(|| boxes.clone());
-
-    let pos_labels: &[&str] = match count {
-        1 => &["Character"],
-        2 => &["Left Character", "Right Character"],
-        3 => &["Left Character", "Center Character", "Right Character"],
-        _ => &["Far-Left Character", "Center-Left Character", "Center-Right Character", "Far-Right Character"],
-    };
-
-    let mut char_sections = Vec::new();
-    for (i, b) in chars.iter().enumerate() {
-        let label = pos_labels.get(i).copied().unwrap_or("Character");
-        let zones = crate::detector::three_zone_crops(&img, b);
-        let mut zone_lines = Vec::new();
-
-        for (z_name, z_img) in &zones {
-            if let Ok(z_b64) = encode_dynamic_image_b64(z_img) {
-                let ask = if z_name.contains("Upper") {
-                    format!(
-                        "Pinpoint head, hair, and facial attributes for {label}: exact hair color, length, bangs/parting, specific type of hairpin or hair ornament (e.g. flower hairpin, butterfly ornament, hairclip, hair bow, ribbon, headband, tiara), eyewear (glasses, sunglasses on head), earrings, choker/necklace, animal ears or horns, eye color, and facial expression."
-                    )
-                } else if z_name.contains("Middle") {
-                    format!(
-                        "Pinpoint torso, neckline, pose, and held items for {label}: exact upper clothing cut, color, and print/logo; whether cleavage, sideboob, underboob, or a keyhole cutout is visible vs. a closed neckline; chest/torso proportions and waist; exact arm and hand pose; and pinpoint any specific item she is holding or touching (e.g. holding phone, cup, drink, book, bag, umbrella, weapon/sword, fan, flower)."
-                    )
-                } else {
-                    format!(
-                        "Pinpoint lower body, leg pose, and footwear for {label}: exact lower clothing (skirt, shorts, pants, bikini bottoms), hip and thigh build, exact skeletal leg and knee posture (sitting, standing, kneeling, legs crossed, knee up), legwear and straps (thighhighs, socks, o-ring thigh strap, garter straps, skindentation), hand actions on legs/stockings, and specific footwear (shoes, sneakers, boots, heels, sandals, or barefoot)."
-                    )
-                };
-                let desc = ask_vision_encoder(&base, mode, encoder, z_b64, &ask).unwrap_or_default();
-                if !desc.trim().is_empty() {
-                    zone_lines.push(format!("- **{}**: {}", z_name, desc.trim()));
-                }
-            }
-        }
-
-        if !zone_lines.is_empty() {
-            char_sections.push(format!("### Character: {}\n{}", label, zone_lines.join("\n")));
-        }
-    }
-
     Ok(format!(
         "### Scene & Environment (Spatial Overview):\n{}{}\n\n{}",
         scene_desc.trim(),
         quad_section,
         char_sections.join("\n\n")
     ))
+}
+
+/// Sampling for one vision pass. The first try is near-deterministic (low temperature, seed 42);
+/// `run_vlm`'s retry asks for a higher temperature, and gets it with a different seed, so the
+/// retry is a real second attempt instead of the same request again.
+fn vlm_sampling(temp: f32, first_try_temp: f32) -> (f32, u32) {
+    let retry = temp > first_try_temp + 1e-3;
+    if retry {
+        (temp, 1042)
+    } else {
+        ((temp * 0.5).min(0.05), 42)
+    }
+}
+
+/// Total time the multi-zone scan may spend on its extra (zone and quadrant) vision calls.
+const MULTIZONE_BUDGET: Duration = Duration::from_secs(60);
+/// After this long, a Deep Scan starts no more re-scans or follow-ups.
+const DEEP_SCAN_BUDGET: Duration = Duration::from_secs(180);
+/// Most per-person zone calls one multi-zone scan makes (2 people x 3 zones, or 1 each for 3-4).
+const MULTIZONE_MAX_ZONE_CALLS: usize = 6;
+
+/// A deadline for a run of model calls: `spent()` once the time is up.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ScanBudget {
+    deadline: std::time::Instant,
+}
+
+impl ScanBudget {
+    pub(crate) fn new(limit: Duration) -> Self {
+        Self { deadline: std::time::Instant::now() + limit }
+    }
+    pub(crate) fn spent(&self) -> bool {
+        std::time::Instant::now() >= self.deadline
+    }
+}
+
+/// One structured look at the whole image: a fixed checklist with one short answer per line, and the
+/// clues stated before the conclusion for the error-prone items (animal, framing). Small vision models
+/// guess less when they have to fill in a form than when asked to "describe" freely.
+pub const OBSERVATION_CHECKLIST: &str = "Look at the image carefully and fill in this form. One short answer per line, \
+only what you can actually see; write 'none' if something isn't there.\n\
+PEOPLE: how many people\n\
+SKIN: skin tone\n\
+HAIR: color; length; style (bangs, locks, tied parts)\n\
+EYES: eye color; eyewear\n\
+EARS: describe their shape and color first, then say which animal they come from\n\
+TAIL: describe its shape, color and pattern (stripes or rings?) first, then say which animal it comes from\n\
+HEAD ACCESSORIES:\n\
+TOP: garment type, color, sleeves, neckline\n\
+OUTERWEAR: garment, color, and how it is worn (open, off the shoulders, tied...)\n\
+BOTTOM: garment type, color, material\n\
+LEGWEAR:\n\
+FOOTWEAR: type, color, height\n\
+OTHER ACCESSORIES:\n\
+BODY: build and proportions\n\
+POSE: stance; where the arms and hands are\n\
+GAZE AND EXPRESSION:\n\
+FRAMING: from where to where the body is visible (e.g. head to thighs), and from which side\n\
+BACKGROUND: color and contents\n\
+LIGHTING:";
+
+/// True for ToriiGate (Minthy's anime captioning model), which needs its own prompt format.
+pub fn is_toriigate(model: &str) -> bool {
+    model.to_lowercase().replace(['-', '_'], "").contains("toriigate")
+}
+
+/// ToriiGate's official request (its `scripts/prompts.py`: the system prompt, the "min_structured_md"
+/// captioning format, the image's booru tags, and "avoid to guess names"). Its card says other prompts are
+/// "highly discouraged". On the raccoon-girl test image it read hair, ornaments, jacket, boots, pose and
+/// framing correctly in 14 s, where the general models failed; its weakness is inventing character names.
+pub fn observe_with_toriigate(path: &std::path::Path, host: &str, mode: AiMode, model: &str, booru_tags: &str) -> Result<String> {
+    const SYSTEM: &str = "You are image captioning expert. Describe user's picture according to requested format and instructions.";
+    const FORMAT: &str = "Your answer must contain 3 parts:\n<format>\n# 1. Thoughts about characters\n\
+You need to think here and compare peoples/creatures that you see on the picture  with given popular tags, or descriptions, or your memories for each characters to determine who is who.\n\
+If no characters are listed in input - just write here \"No named characters\"\n# 2. Key details\n\
+Here you need to write about the key details on image, prefere using regular text.\n# 3. Structured description\n## General\n\
+Write about general composition, content of image, background and all things that are not related to characters directly.\n\
+## Character name 1 (put here the name if any)\nWrite about datails and content related to specific character, including features, poses, look, used objects, interactions, and other things.\n\
+## Character name 2 (put here the name if any)\nSame for each character.\n## Image effects\nMention image effect, style, camera angle\n</format>\nIn general stick to shorter descriptions.\n";
+    let base = base_url(host)?;
+    let img = image::open(path).with_context(|| format!("Couldn't open {}", path.display()))?;
+    let mut prompt = format!("# Captioning format:\n{FORMAT}\n");
+    if !booru_tags.trim().is_empty() {
+        prompt.push_str(&format!("# Booru tags for the image\n[{}]\n\n", booru_tags.trim()));
+    }
+    prompt.push_str("# Characters on picture:\nAvoid to guess names for characters.\n");
+    let body = json!({
+        "model": model,
+        "system": SYSTEM,
+        "prompt": prompt,
+        "images": [encode_dynamic_image_b64(&img)?],
+        "stream": false,
+        "think": false,
+        "keep_alive": "30s",
+        "options": {
+            "temperature": 0.2,
+            "num_predict": 900,
+            "num_ctx": 8192,
+            "num_gpu": if mode == AiMode::CpuOnly { Some(0) } else { None::<i32> },
+        },
+    });
+    let resp = client(Some(Duration::from_secs(240)))?
+        .post(format!("{base}/api/generate"))
+        .json(&body)
+        .send()
+        .map_err(|e| anyhow!("Couldn't reach Ollama at {base}: {e}"))?;
+    let gen: GenerateResponse = check(resp, "ToriiGate")?.json()?;
+    Ok(gen.response.trim().to_string())
+}
+
+/// The vision step for Combined mode: ToriiGate's own format when it is the vision model, else the
+/// `OBSERVATION_CHECKLIST` form.
+pub fn observe_image(path: &std::path::Path, host: &str, mode: AiMode, encoder: &str, booru_tags: &str, verify: &[String]) -> Result<String> {
+    if is_toriigate(encoder) {
+        observe_with_toriigate(path, host, mode, encoder, booru_tags)
+    } else {
+        observe_with_checklist(path, host, mode, encoder, verify)
+    }
+}
+
+/// Asks a vision model the `OBSERVATION_CHECKLIST` about a whole image, with the tagger's sure tags
+/// (`strong_tags`) to confirm or correct. Used by Combined mode instead of the multi-zone scan: on the
+/// test image it was more accurate (skin tone, striped tail → raccoon, boots, pose, framing, nothing
+/// invented) and 3x faster (12 s vs 34 s) with the 3B.
+pub fn observe_with_checklist(path: &std::path::Path, host: &str, mode: AiMode, encoder: &str, verify: &[String]) -> Result<String> {
+    let base = base_url(host)?;
+    let img = image::open(path).with_context(|| format!("Couldn't open {}", path.display()))?;
+    let ask = if verify.is_empty() {
+        OBSERVATION_CHECKLIST.to_string()
+    } else {
+        format!(
+            "{OBSERVATION_CHECKLIST}\nCHECK: an image tagger detected these with high confidence: {}. For each, say whether it is right.",
+            verify.join(", ")
+        )
+    };
+    ask_vision_encoder(&base, mode, encoder, encode_dynamic_image_b64(&img)?, &ask)
+}
+
+const COLOR_WORDS: &[&str] = &[
+    "white", "black", "red", "blue", "green", "yellow", "orange", "pink", "purple", "brown", "grey", "gray", "silver",
+    "gold", "golden", "light", "dark", "pale", "navy", "beige", "cream", "teal", "aqua", "violet", "magenta", "crimson",
+];
+
+/// The tags the checklist form states reliably: framing (how much of the body, from which side),
+/// background and gaze. Deterministic, so they can't be forgotten by the writer (it kept dropping
+/// `cowboy shot` and the background color). The pose line is left to the writer: the form gets it wrong
+/// too often.
+pub fn tags_from_form(form: &str) -> Vec<String> {
+    // "LABEL: answer", where the answer may also continue on the following lines (bullets) up to
+    // the next "LABEL:" line
+    let lines: Vec<String> = form.lines().map(|l| l.trim().trim_start_matches(['*', '-', ' ']).replace("**", "")).collect();
+    let is_label = |l: &str| l.split_once(':').is_some_and(|(k, _)| !k.is_empty() && k.chars().all(|c| c.is_ascii_uppercase() || c == ' '));
+    let field = |name: &str| -> String {
+        let Some(i) = lines.iter().position(|l| l.to_uppercase().starts_with(&format!("{name}:"))) else { return String::new() };
+        let mut text = lines[i][name.len() + 1..].trim().to_string();
+        for l in lines.iter().skip(i + 1).take_while(|l| !is_label(l)) {
+            text.push(' ');
+            text.push_str(l);
+        }
+        text.trim().to_lowercase()
+    };
+    let has = |text: &str, w: &str| crate::danbooru::prose_has_pub(text, w);
+    let mut out: Vec<String> = Vec::new();
+    let framing = field("FRAMING");
+    if !framing.is_empty() {
+        let to = framing.rsplit(" to ").next().unwrap_or(&framing).to_string();
+        if has(&to, "feet") || has(&to, "toe") || has(&to, "shoe") || has(&framing, "full body") || has(&framing, "entire body") {
+            out.push("full body".into());
+        } else if has(&to, "thigh") || has(&to, "knee") || has(&to, "mid-thigh") {
+            out.push("cowboy shot".into());
+        } else if has(&to, "waist") || has(&to, "hip") || has(&to, "chest") {
+            out.push("upper body".into());
+        }
+        if has(&framing, "behind") || has(&framing, "back view") || has(&framing, "from the back") {
+            out.push("from behind".into());
+        } else if has(&framing, "side") || has(&framing, "profile") {
+            out.push("from side".into());
+        } else if has(&framing, "above") {
+            out.push("from above".into());
+        } else if has(&framing, "below") {
+            out.push("from below".into());
+        }
+    }
+    let background = field("BACKGROUND");
+    if !background.is_empty() {
+        if ["plain", "solid", "simple", "blank", "no specific", "nothing", "empty"].iter().any(|w| background.contains(w)) {
+            out.push("simple background".into());
+        }
+        if let Some(c) = ["grey", "gray", "white", "black", "blue", "pink", "yellow", "green", "red", "purple", "brown", "orange"]
+            .iter()
+            .find(|c| has(&background, c))
+        {
+            let c = if *c == "gray" { "grey" } else { c };
+            out.push(format!("{c} background"));
+        }
+    }
+    let gaze = field("GAZE AND EXPRESSION");
+    if has(&gaze, "over her shoulder") || has(&gaze, "over his shoulder") || has(&gaze, "over shoulder") || has(&gaze, "looking back") {
+        out.push("looking back".into());
+    }
+    if has(&gaze, "viewer") || has(&gaze, "camera") || has(&gaze, "looking forward") {
+        out.push("looking at viewer".into());
+    }
+    if has(&gaze, "smile") || has(&gaze, "smiling") {
+        out.push("smile".into());
+    }
+    out
+}
+
+/// Phrases models write that are no tag, mapped to the tag they mean ("" = drop it).
+fn phrase_to_tag(tag: &str) -> Option<&'static str> {
+    Some(match tag {
+        "standing sideways" | "side view" | "side profile" | "facing sideways" | "facing left" | "facing right" => "from side",
+        "back view" | "facing away" | "facing away from viewer" | "standing away from viewer" => "from behind",
+        "looking over shoulder" | "looking over her shoulder" => "looking back",
+        "curvy hips" | "broad hips" => "wide hips",
+        "medium length hair" | "medium-length hair" | "shoulder-length hair" | "shoulder length hair" => "medium hair",
+        "smiling" | "gentle smile" | "slight smile" => "smile",
+        "hands behind back" | "hands behind her back" => "arms behind back",
+        "plain background" => "simple background",
+        "off the shoulders" | "off the shoulder" | "off-shoulder" | "off shoulders" => "off shoulder",
+        "plain grey background" | "plain gray background" => "grey background",
+        "soft shadows" | "even lighting" | "athletic build" | "slim build" | "blue trim" | "visible tail" | "tail visible" => "",
+        _ => return None,
+    })
+}
+
+/// Checks each tag against the tagger's Danbooru list (`danbooru::local`, ~10,000 common tags): a known
+/// tag stays, a near miss is corrected (`fix`), a color / material / style word in front of a known tag
+/// stays (`black leather shorts`), a known phrase is mapped (`phrase_to_tag`), anything else multi-word
+/// is dropped. Without the list everything is kept.
+pub fn validate_tags(tags: Vec<String>) -> Vec<String> {
+    let Some(list) = crate::danbooru::local() else { return tags };
+    let mut out: Vec<String> = Vec::new();
+    for t in tags {
+        let l = t.to_lowercase();
+        // weights "(tag:1.2)", LoRAs and dynamic groups pass untouched; a "Name: tags" label does not count
+        if l.contains('<') || l.contains('{') || (l.contains('(') && l.contains(')')) {
+            out.push(t);
+            continue;
+        }
+        if let Some((label, rest)) = t.split_once(':') {
+            // "Nagi: black hair ponytail" -> "black hair ponytail" (the name is a label, not a tag)
+            if !label.contains(' ') && !rest.trim().is_empty() {
+                out.extend(validate_tags(vec![rest.trim().to_string()]));
+                continue;
+            }
+        }
+        if let Some(m) = phrase_to_tag(&l) {
+            if !m.is_empty() {
+                out.push(m.to_string());
+            }
+            continue;
+        }
+        if list.get(&l).is_some() || matches!(l.as_str(), "masterpiece" | "best quality" | "score 9" | "score 8 up" | "score 7 up") {
+            out.push(t);
+            continue;
+        }
+        if let Some(fixed) = list.fix(&l) {
+            out.push(fixed.name.clone());
+            continue;
+        }
+        // Unknown multi-word tags are kept: the tag list is only the ~10,000 most common tags, and
+        // descriptive ones ("white teal bikini top") are what Anima reads best. Dropping them emptied a
+        // whole prompt in testing. Only phrases about nothing visible go.
+        const NOT_VISUAL: &[&str] = &["visible", "build", "shadows", "trim", "tone", "tones", "accents", "expression", "vibe", "aesthetic"];
+        if !l.split_whitespace().any(|w| NOT_VISUAL.contains(&w)) {
+            out.push(t);
+        }
+    }
+    out
+}
+
+/// Splits a tag the writer ran together without commas ("blue jacket open jacket off the shoulders")
+/// into the known tags it is made of ("blue jacket", "open jacket", "off shoulder"). Only when the whole
+/// phrase is not a tag itself and every word is covered by known tags (or `phrase_to_tag` phrases), using
+/// as few pieces as possible, so descriptive tags ("very short black leather shorts") stay whole.
+pub fn split_merged_tags(tag: String) -> Vec<String> {
+    let Some(list) = crate::danbooru::local() else { return vec![tag] };
+    let l = tag.to_lowercase();
+    let words: Vec<&str> = l.split_whitespace().collect();
+    if words.len() < 4 || list.get(&l).is_some() || l.contains(['(', ':', '<', '{']) {
+        return vec![tag];
+    }
+    let piece = |i: usize, j: usize| -> Option<String> {
+        let p = words[i..j].join(" ");
+        if let Some(m) = phrase_to_tag(&p) {
+            return (!m.is_empty()).then(|| m.to_string());
+        }
+        list.get(&p).map(|t| t.name.clone())
+    };
+    // fewest pieces covering every word (pieces of 1-5 words)
+    let n = words.len();
+    let mut best: Vec<Option<Vec<String>>> = vec![None; n + 1];
+    best[0] = Some(Vec::new());
+    for j in 1..=n {
+        for i in j.saturating_sub(5)..j {
+            if let (Some(prev), Some(p)) = (best[i].clone(), piece(i, j)) {
+                let mut cand = prev;
+                cand.push(p);
+                if best[j].as_ref().is_none_or(|b| cand.len() < b.len()) {
+                    best[j] = Some(cand);
+                }
+            }
+        }
+    }
+    match best[n].take() {
+        Some(parts) if parts.len() >= 2 => parts,
+        _ => vec![tag],
+    }
+}
+
+/// Hair tags that contradict a "short hair with long locks" description (twintails, long hair): the
+/// tagger reads the long locks as twintails or long hair, and the writer copies both.
+pub fn drop_contradicted_hair(tags: Vec<String>) -> Vec<String> {
+    let lower: Vec<String> = tags.iter().map(|t| t.to_lowercase()).collect();
+    let short_with_locks = lower.iter().any(|t| t == "short hair with long locks")
+        || (lower.iter().any(|t| t == "short hair") && lower.iter().any(|t| t.contains("sidelocks")));
+    if !short_with_locks {
+        return tags;
+    }
+    tags.into_iter()
+        .filter(|t| !matches!(t.to_lowercase().as_str(), "twintails" | "low twintails" | "long hair" | "very long hair"))
+        .collect()
+}
+
+/// One tag per body part where two can't both be true: eye color (unless heterochromia), skin tone,
+/// hair length (unless the tags say long locks / sidelocks), boot height. Of two, a tag from the
+/// Danbooru list beats an unknown one, then the first written wins.
+pub fn one_per_part(tags: Vec<String>) -> Vec<String> {
+    let list = crate::danbooru::local();
+    let known = |t: &str| list.is_some_and(|l| l.get(t).is_some());
+    let lower: Vec<String> = tags.iter().map(|t| t.to_lowercase()).collect();
+    let hetero = lower.iter().any(|t| t == "heterochromia");
+    let part = |t: &str| -> Option<&'static str> {
+        let first = t.split_whitespace().next().unwrap_or("");
+        let colorish = COLOR_WORDS.contains(&first) || first.contains('-') || first.ends_with("ish");
+        if t.ends_with(" eyes") && colorish && !hetero {
+            return Some("eye color");
+        }
+        if t.ends_with(" skin") && t != "shiny skin" && t != "oily skin" {
+            return Some("skin tone");
+        }
+        if matches!(t, "very short hair" | "short hair" | "medium hair" | "long hair" | "very long hair" | "absurdly long hair") {
+            return Some("hair length");
+        }
+        if matches!(t, "thigh boots" | "knee boots" | "ankle boots" | "knee high boots" | "knee-high boots" | "thigh-high boots" | "thigh high boots") {
+            return Some("boot height");
+        }
+        None
+    };
+    let mut chosen: std::collections::HashMap<&'static str, usize> = std::collections::HashMap::new();
+    for (i, t) in lower.iter().enumerate() {
+        if let Some(p) = part(t) {
+            match chosen.get(p) {
+                None => {
+                    chosen.insert(p, i);
+                }
+                Some(&j) if !known(&lower[j]) && known(t) => {
+                    chosen.insert(p, i);
+                }
+                _ => {}
+            }
+        }
+    }
+    tags.into_iter()
+        .enumerate()
+        .filter(|(i, t)| part(&t.to_lowercase()).is_none_or(|p| chosen.get(p) == Some(i)))
+        .map(|(_, t)| t)
+        .collect()
+}
+
+/// The last pass over an image prompt written from a checklist form: the form's framing / background /
+/// gaze tags are added, every tag is checked against the Danbooru list, one tag per body part is kept,
+/// duplicates go, and the tagger's sure tags are enforced last.
+/// `polish_image_prompt`, plus: a Danbooru character name stays only if the tagger's tags (`tagger_tags`)
+/// name that character too. Vision models invent identities (ToriiGate called an OC "Musashi from Azur
+/// Lane"); the tagger only reports characters it recognizes.
+pub fn polish_image_prompt_with(prompt: &str, form: &str, strong: &[String], tagger_tags: &str) -> String {
+    let tagger: std::collections::HashSet<String> = tagger_tags.split(',').map(crate::danbooru::key).collect();
+    let mut tags: Vec<String> = prompt
+        .split(',')
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .filter(|t| !crate::danbooru::is_character(t) || tagger.contains(&crate::danbooru::key(t)))
+        .collect();
+    let mut tags: Vec<String> = tags.into_iter().flat_map(split_merged_tags).collect();
+    for t in tags_from_form(form) {
+        if !tags.iter().any(|x| crate::danbooru::key(x) == crate::danbooru::key(&t)) {
+            tags.push(t);
+        }
+    }
+    let tags = drop_contradicted_hair(one_per_part(validate_tags(tags)));
+    let mut seen = std::collections::HashSet::new();
+    let tags: Vec<String> = tags.into_iter().filter(|t| seen.insert(crate::danbooru::key(t))).collect();
+    enforce_strong_tags(&tags.join(", "), strong)
+}
+
+/// Which vision model reads which pass: the mode's pass-1 prompt goes to the spatial /
+/// body model, everything else to the identity / wardrobe model.
+fn vision_model_for_prompt<'a>(
+    mode: crate::prompt_condenser::Mode,
+    prompt: &str,
+    pass1_model: &'a str,
+    pass2_model: &'a str,
+) -> &'a str {
+    if prompt == mode.pass1_prompt() { pass1_model } else { pass2_model }
+}
+
+/// A model that only reads images (Moondream, Qwen-VL, LLaVA…), as opposed to a text model
+/// that happens to see (Gemma). Dedicated encoders are small and quick to reload.
+pub fn is_dedicated_encoder(name: &str) -> bool {
+    let l = name.to_lowercase();
+    l.contains("moondream") || l.contains("llava") || l.contains("minicpm-v") || (l.contains("qwen") && l.contains("vl")) || is_toriigate(&l)
+}
+
+/// How long Ollama keeps an encoder loaded after a request: a dedicated encoder stays for
+/// the burst of calls the pipeline makes in a row, then goes (it used to stay 30 minutes
+/// next to the 12B text model, which is too much on a shared-memory GPU).
+fn encoder_keep_alive(encoder: &str) -> &'static str {
+    if is_dedicated_encoder(encoder) { "30s" } else { "30m" }
+}
+
+/// Unloads the dedicated vision encoders that are currently loaded (never the text model,
+/// and never a model that isn't loaded: asking Ollama to unload one would load it first).
+fn unload_dedicated_encoders(base: &str, encoders: &[&str], text_model: &str) {
+    let Ok(http) = client(Some(Duration::from_secs(5))) else { return };
+    let Ok(resp) = http.get(format!("{base}/api/ps")).send() else { return };
+    let Ok(ps) = resp.json::<serde_json::Value>() else { return };
+    let loaded: Vec<String> = ps["models"]
+        .as_array()
+        .map(|m| m.iter().filter_map(|x| x["name"].as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
+    let mut done: Vec<&str> = Vec::new();
+    for enc in encoders {
+        if done.contains(enc) || !is_dedicated_encoder(enc) || same_model(enc, text_model) {
+            continue;
+        }
+        done.push(enc);
+        if loaded.iter().any(|l| same_model(l, enc)) {
+            let _ = http.post(format!("{base}/api/generate")).json(&json!({ "model": enc, "keep_alive": 0 })).send();
+        }
+    }
 }
 
 /// Sends a single image to a vision encoder (like Moondream or Qwen 2.5-VL) to extract an objective description.
@@ -1794,14 +2440,14 @@ pub(crate) fn ask_vision_encoder(base: &str, mode: AiMode, encoder: &str, base64
         "images": [base64_image],
         "stream": false,
         "think": false,
-        "keep_alive": "30m",
+        "keep_alive": encoder_keep_alive(encoder),
         "options": {
             "temperature": 0.05,
             "top_p": 0.85,
             "seed": 42,
             "repeat_penalty": 1.15,
             "num_predict": 500,
-            "num_ctx": 2048,
+            "num_ctx": 4096,
             "num_gpu": if mode == AiMode::CpuOnly { Some(0) } else { None::<i32> },
         },
     });
@@ -1858,6 +2504,7 @@ fn describe_with_text_model(
     let gen: GenerateResponse = check(resp, "Formatting the prompt")?.json()?;
     let mut out = parse_image_ai_result(gen.response.trim())?;
     clean_image_ai_prompt(&mut out, req.config.checkpoint);
+    out.prompt = enforce_strong_tags(&out.prompt, &req.strong_tags);
     Ok(out)
 }
 
@@ -1944,10 +2591,12 @@ fn describe_image_with(req: &ImageAiRequest, system: &str, ask: &str) -> Result<
     let gen: GenerateResponse = check(resp, "Reading the image")?.json()?;
     let mut out = parse_image_ai_result(gen.response.trim())?;
     clean_image_ai_prompt(&mut out, req.config.checkpoint);
+    out.prompt = enforce_strong_tags(&out.prompt, &req.strong_tags);
     Ok(out)
 }
 
 fn clean_image_ai_prompt(out: &mut ImageAiResult, checkpoint: crate::profiles::CheckpointProfile) {
+    out.prompt = strip_placeholders(&strip_instruction_leaks(&flatten_section_layout(&out.prompt)));
     out.prompt = AntigravityTagFilter::new().resolve_and_strip_flags(&out.prompt);
     // small cleanups: the checkpoint's name and bare category words aren't image content
     let name = checkpoint.display_name().to_lowercase();
@@ -2764,6 +3413,11 @@ struct GenerateResponse {
     /// The model's reasoning, when thinking was on and the model supports it.
     #[serde(default)]
     thinking: String,
+    /// "stop", or "length" when the reply hit `num_predict`.
+    #[serde(default)]
+    done_reason: String,
+    #[serde(default)]
+    eval_count: u32,
 }
 
 /// Everything a scan needs, collected from the UI so it can move to a worker thread.
@@ -2889,19 +3543,27 @@ pub fn run_ai_scan(req: &AiScanRequest) -> Result<(AiJsonOutput, String)> {
     // A scan must come back complete: scene analysis, negative prompt and usable cards.
     // Whatever is missing is asked for again (up to 2 more scans), keeping the good
     // parts of each attempt.
+    // No new follow-up or re-scan starts after this: the user gets the best result so far
+    // (the badge lists what's still missing) instead of "Working…" for many minutes.
+    let budget = ScanBudget::new(DEEP_SCAN_BUDGET);
+    if is_big_model(&req.model) {
+        // an earlier image read leaves the tagger loaded; the 12B needs that memory
+        crate::tagger::release();
+    }
     let mut best = scan_once(req, &http, &base, &system, &prompt, &mut send_think, &mut seed)?;
     let needs_negative = !req.config.checkpoint.default_negative().is_empty();
-    if needs_negative && best.recommended_negative.trim().is_empty() && !best.improved_prompt.trim().is_empty() {
+    if needs_negative && best.recommended_negative.trim().is_empty() && !best.improved_prompt.trim().is_empty() && !budget.spent() {
         // The model sometimes skips the negative; a short follow-up asks for just that.
         best.recommended_negative = generate_negative(req, &best.improved_prompt).unwrap_or_default();
     }
     let mut rescans = 0;
-    while !scan_problems(&best, req).is_empty() && rescans < 2 {
+    while !scan_problems(&best, req).is_empty() && rescans < 2 && !budget.spent() {
         rescans += 1;
         let Ok(next) = scan_once(req, &http, &base, &system, &prompt, &mut send_think, &mut seed) else { continue };
         merge_scan(&mut best, next, req);
     }
     best.recommended_negative = clean_negative(&best.recommended_negative);
+    enforce_checkpoint_rules(&mut best, req.config.checkpoint);
     let mut placement = model_placement(&req.host, &req.model).unwrap_or_else(|| "unknown device".to_string());
     let missing = scan_problems(&best, req);
     if rescans > 0 {
@@ -2911,6 +3573,257 @@ pub fn run_ai_scan(req: &AiScanRequest) -> Result<(AiJsonOutput, String)> {
         placement.push_str(&format!(" • still missing: {}", missing.join(", ")));
     }
     Ok((best, placement))
+}
+
+/// Rules a small model sometimes ignores, applied to its reply: Flux has no negative prompt,
+/// and the checkpoint's quality tags lead the rewrite (AI text only; the rule-based output
+/// never gets tags the user didn't write).
+fn enforce_checkpoint_rules(out: &mut AiJsonOutput, checkpoint: CheckpointProfile) {
+    if checkpoint.default_negative().is_empty() {
+        out.recommended_negative.clear();
+    }
+    out.improved_prompt = strip_placeholders(&out.improved_prompt);
+    out.dynamic_prompt = strip_placeholders(&out.dynamic_prompt);
+    out.recommended_negative = strip_placeholders(&out.recommended_negative);
+    out.improved_prompt = ensure_quality_tags(&out.improved_prompt, checkpoint);
+    out.dynamic_prompt = ensure_quality_tags(&out.dynamic_prompt, checkpoint);
+}
+
+/// Removes what a model copies out of its instructions instead of writing a tag:
+/// `[UNANCHORED_LIMBS_FLAG resolved: hands in lap]` becomes `hands in lap`, a bare `*_FLAG`
+/// goes, and so do placeholder tags such as `[framing]`, `{none}` or
+/// `{missing framing tag placeholder}`. Real tags, weights `(tag:1.2)` and dynamic groups
+/// `{a|b}` are kept; the separators and line breaks between the kept tags stay as written.
+pub fn strip_placeholders(text: &str) -> String {
+    if text.trim().is_empty() {
+        return text.to_string();
+    }
+    // Only words that are never a tag of their own. Real tags in brackets are A1111 / ComfyUI
+    // de-emphasis (`[background]`, `[lighting]`, `[missing tooth]`) and must stay.
+    const PLACEHOLDER_WORDS: &[&str] = &["none", "n/a", "null", "nil", "empty", "tbd", "todo", "...", "framing", "tag", "tags"];
+    let placeholder = |inner: &str| {
+        let l = inner.trim().to_lowercase();
+        l.is_empty() || PLACEHOLDER_WORDS.contains(&l.as_str()) || l.contains("placeholder") || l.contains("_flag")
+    };
+    let mut kept: Vec<String> = Vec::new();
+    for seg in text.split(',') {
+        let lead: String = seg.chars().take_while(|c| c.is_whitespace()).collect();
+        let tag = seg.trim();
+        // "[X_FLAG resolved: hands in lap]" -> "hands in lap"
+        // ASCII lowercasing keeps every byte where it was, so `i` is valid in `tag` (full Unicode
+        // lowercasing can change lengths and made this slice panic on some characters)
+        if let Some(i) = tag.to_ascii_lowercase().find("resolved:") {
+            if tag.contains("_FLAG") || tag.contains("_flag") {
+                let fix = tag[i + "resolved:".len()..].trim().trim_end_matches([']', ')', '}']).trim();
+                if !fix.is_empty() {
+                    kept.push(format!("{lead}{fix}"));
+                }
+                continue;
+            }
+        }
+        if tag.ends_with("_FLAG") && !tag.contains(' ') {
+            continue;
+        }
+        let bracketed = (tag.starts_with('[') && tag.ends_with(']')) || (tag.starts_with('{') && tag.ends_with('}'));
+        if bracketed && !tag.contains('|') && placeholder(&tag[1..tag.len() - 1]) {
+            continue;
+        }
+        kept.push(seg.to_string());
+    }
+    let joined = kept.join(",");
+    // a dropped first tag leaves the next one's leading space at the very start
+    if text.starts_with(char::is_whitespace) { joined } else { joined.trim_start().to_string() }
+}
+
+/// Turns a prompt a model wrote in a section layout back into one flat tag list: `[Scene …]:` and
+/// `[Character 1]:` labels go, a `[tag, tag]:` header and `(tag, tag)` groups are unwrapped (weights
+/// such as `(tag:1.2)` stay), prose sentences of 8+ words go (the app writes its own sentence), and
+/// repeated tags are kept once.
+pub fn flatten_section_layout(prompt: &str) -> String {
+    if !prompt.contains("]:") && !prompt.contains("[Scene") && !prompt.contains("[Character") {
+        return prompt.to_string();
+    }
+    let mut text = prompt.to_string();
+    // "[...]:" headers: a label is dropped, a tag list inside is kept
+    while let Some(open) = text.find('[') {
+        let Some(rel) = text[open..].find("]:") else { break };
+        let close = open + rel;
+        let inner = text[open + 1..close].to_string();
+        let keep = if inner.contains(',') { format!("{inner},") } else { String::new() };
+        text.replace_range(open..close + 2, &keep);
+    }
+    // "(tag, tag, …)" groups without a weight
+    let mut out = String::new();
+    let mut depth_start: Option<usize> = None;
+    for (i, c) in text.char_indices() {
+        match c {
+            '(' if depth_start.is_none() => depth_start = Some(i),
+            ')' if depth_start.is_some() => {
+                let start = depth_start.take().unwrap_or(i);
+                let inner = &text[start + 1..i];
+                if inner.contains(',') && !inner.contains(':') {
+                    // commas around it, so the next words (often a sentence) don't fuse with the last tag
+                    out.push_str(", ");
+                    out.push_str(inner);
+                    out.push_str(", ");
+                } else {
+                    out.push_str(&text[start..=i]);
+                }
+            }
+            _ if depth_start.is_none() => out.push(c),
+            _ => {}
+        }
+    }
+    if let Some(start) = depth_start {
+        out.push_str(&text[start..]);
+    }
+    let mut seen = std::collections::HashSet::new();
+    let tags: Vec<String> = out
+        .split([',', '\n'])
+        .map(|t| t.trim().trim_end_matches('.').trim().to_string())
+        .filter(|t| !t.is_empty() && t.split_whitespace().count() < 8)
+        .filter(|t| seen.insert(t.to_lowercase()))
+        .collect();
+    tags.join(", ")
+}
+
+/// A tag the tagger can be trusted on when it is very sure: skin tone, animal species parts
+/// (`raccoon ears`, `fox tail`, `cat girl`) and person counts (`1girl`, `2boys`).
+fn is_guarded_tag(name: &str) -> bool {
+    let t = name.to_lowercase();
+    let count = t.chars().next().is_some_and(|c| c.is_ascii_digit())
+        && ["girl", "girls", "boy", "boys", "other", "others"].iter().any(|s| t.ends_with(s));
+    let skin = t.ends_with(" skin") || t.contains("-skinned") || t == "tan" || t == "tanlines";
+    let species = (t.ends_with(" ears") || t.ends_with(" tail") || t.ends_with(" girl") || t.ends_with(" boy"))
+        && !t.starts_with("animal ")
+        && !t.starts_with("fake ")
+        && !count;
+    count || skin || species
+}
+
+/// The animal a one-word species tag stands for (`kitsune` → fox, `nekomimi` → cat …).
+fn species_word_animal(tag: &str) -> Option<&'static str> {
+    Some(match tag {
+        "kitsune" | "kyuubi" => "fox",
+        "nekomimi" | "catgirl" | "nekomata" => "cat",
+        "inumimi" | "doggirl" => "dog",
+        "usagimimi" | "bunnygirl" => "rabbit",
+        "okamimimi" | "wolfgirl" => "wolf",
+        "tanuki" => "tanuki",
+        "kemonomimi mode" => return None,
+        _ => return None,
+    })
+}
+
+/// The tagger's skin / species / count tags it is at least 80% sure of (prompt spelling).
+pub fn strong_tags(tags: &[crate::tagger::ScoredTag]) -> Vec<String> {
+    tags.iter()
+        .filter(|t| t.score >= 0.8 && is_guarded_tag(&t.name.replace('_', " ")))
+        .map(|t| t.name.replace('_', " "))
+        .collect()
+}
+
+/// Puts the tagger's sure tags back when the writer dropped or contradicted them: a different animal on
+/// the same part (`cat ears` vs. a sure `raccoon ears`) is replaced, an opposite skin tone removed, a
+/// different count of the same kind replaced; missing ones are added after the leading quality tags.
+pub fn enforce_strong_tags(prompt: &str, strong: &[String]) -> String {
+    if strong.is_empty() || prompt.trim().is_empty() {
+        return prompt.to_string();
+    }
+    let mut tags: Vec<String> = prompt.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect();
+    let key = |t: &str| crate::danbooru::key(t);
+    // sure tags never push each other out ("striped tail" is a pattern, not a rival to "raccoon tail")
+    let sure_keys: std::collections::HashSet<String> = strong.iter().map(|t| key(t)).collect();
+    for sure in strong {
+        let s = sure.to_lowercase();
+        let part = ["ears", "tail", "girl", "boy"].iter().find(|p| s.ends_with(&format!(" {p}")) ).copied();
+        let is_count = s.chars().next().is_some_and(|c| c.is_ascii_digit());
+        let is_skin = s.ends_with(" skin") || s.contains("-skinned");
+        tags.retain(|t| {
+            let l = t.to_lowercase();
+            if key(&l) == key(&s) || sure_keys.contains(&key(&l)) {
+                return true;
+            }
+            if is_count {
+                let kind = if s.contains("girl") { "girl" } else if s.contains("boy") { "boy" } else { "other" };
+                return !(l.chars().next().is_some_and(|c| c.is_ascii_digit()) && l.contains(kind));
+            }
+            if is_skin {
+                let dark = s.contains("dark") || s.contains("tan") || s.contains("brown");
+                let opposite = if dark { ["pale skin", "fair skin", "white skin", "light skin"] } else { ["dark skin", "tan skin", "brown skin", "dark-skinned female"] };
+                return !opposite.contains(&l.as_str());
+            }
+            if let Some(p) = part {
+                // another animal on the same part ("cat ears" vs "raccoon ears"); generic "animal ears" stays
+                let other = l.ends_with(&format!(" {p}")) && !l.starts_with("animal ") && !l.starts_with("fake ") && l.split_whitespace().count() == 2;
+                // or a one-word species tag for another animal ("kitsune" next to a sure "raccoon girl")
+                let sure_animal = s.split_whitespace().next().unwrap_or("");
+                let rival_species = species_word_animal(&l).is_some_and(|a| a != sure_animal);
+                return !other && !rival_species;
+            }
+            true
+        });
+        if !tags.iter().any(|t| key(t) == key(&s)) {
+            let quality = ["masterpiece", "best quality", "score 9", "score_9", "score 8 up", "score_8_up", "score 7 up", "score_7_up", "absurdres", "highres"];
+            let at = tags.iter().take_while(|t| quality.contains(&t.to_lowercase().as_str())).count();
+            tags.insert(at, sure.clone());
+        }
+    }
+    tags.join(", ")
+}
+
+/// Removes instruction text a model copied into its prompt: tag-count notes ("25-45 tags total",
+/// "tag count: 40") and explanatory parentheses ("raccoon tail (inferred from tagger/context)" becomes
+/// "raccoon tail"). Weights such as "(red hair:1.2)" and real parenthesised tags are kept.
+pub fn strip_instruction_leaks(prompt: &str) -> String {
+    const NOTE_WORDS: &[&str] = &[
+        "inferred", "tagger", "context", "note", "assumed", "assume", "guess", "likely", "possibly", "maybe",
+        "if visible", "optional", "approx", "uncertain", "presumably",
+    ];
+    let mut kept: Vec<String> = Vec::new();
+    for seg in prompt.split(',') {
+        let lead: String = seg.chars().take_while(|c| c.is_whitespace()).collect();
+        let mut tag = seg.trim().to_string();
+        let l = tag.to_lowercase();
+        let count_note = l.contains("tags total")
+            || l.contains("tag count")
+            || l.contains("total tags")
+            || (l.ends_with(" tags") && l.chars().next().is_some_and(|c| c.is_ascii_digit()));
+        if count_note {
+            continue;
+        }
+        // "(...)" with no weight inside and a note word: an explanation, not part of the tag
+        if let (Some(open), Some(close)) = (tag.find('('), tag.rfind(')')) {
+            if close > open {
+                let inner = tag[open + 1..close].to_lowercase();
+                if !inner.contains(':') && NOTE_WORDS.iter().any(|w| inner.contains(w)) {
+                    tag = format!("{}{}", tag[..open].trim_end(), &tag[close + 1..]).trim().to_string();
+                }
+            }
+        }
+        if !tag.is_empty() {
+            kept.push(format!("{lead}{tag}"));
+        }
+    }
+    let joined = kept.join(",");
+    if prompt.starts_with(char::is_whitespace) { joined } else { joined.trim_start().to_string() }
+}
+
+/// Puts the checkpoint's missing quality tags at the front when the prompt lacks its first one.
+/// An empty prompt stays empty.
+pub fn ensure_quality_tags(prompt: &str, checkpoint: CheckpointProfile) -> String {
+    let quality = checkpoint.canonical_quality_tags();
+    let Some(first) = quality.first() else { return prompt.to_string() };
+    if prompt.trim().is_empty() {
+        return prompt.to_string();
+    }
+    let norm = |t: &str| t.trim().trim_matches(|c| c == '(' || c == ')').split(':').next().unwrap_or("").trim().to_lowercase();
+    let present: Vec<String> = prompt.split(|c| c == ',' || c == '\n').map(norm).collect();
+    if present.iter().any(|t| *t == *first) {
+        return prompt.to_string();
+    }
+    let missing: Vec<&str> = quality.iter().copied().filter(|q| !present.iter().any(|t| t == q)).collect();
+    format!("{}, {}", missing.join(", "), prompt.trim_start())
 }
 
 /// One deep-scan request; an unreadable reply is retried (up to 3 tries).
@@ -2949,6 +3862,12 @@ fn scan_once(
             r => r?,
         };
         let gen: GenerateResponse = resp.json()?;
+        if std::env::var_os("PC_DEBUG_SCAN").is_some() {
+            eprintln!(
+                "[scan raw reply: done_reason {}, {} tokens of {}]\n{}\n[/scan]",
+                gen.done_reason, gen.eval_count, body.options.num_predict, gen.response
+            );
+        }
         if let Some(mut o) = extract_json_from_llm(&gen.response) {
             o.thinking = gen.thinking.clone();
             return Ok(o);
@@ -2990,9 +3909,18 @@ fn cards_ok(o: &AiJsonOutput, req: &AiScanRequest) -> bool {
         return false;
     }
     let tokens = request_tokens(req);
+    // Layout tags (quality, group count, "far left"…) are added by the app itself (`two::combine`,
+    // `ensure_quality_tags`), so they are no change that needs a card. Counting them made every
+    // 3-4 character scan re-scan twice and end with "still missing: cards".
+    // A layout tag the user wrote (their own `2girls`, `left`…) is content: changing it to `3girls`
+    // must still need a card. Only layout the AI added on top is ignored.
     let before: std::collections::HashSet<String> = tokens.iter().map(|t| t.normalized.clone()).collect();
-    let after: std::collections::HashSet<String> =
-        crate::parser::parse_prompt(&o.improved_prompt).into_iter().map(|t| t.normalized).collect();
+    let content = |t: &String| before.contains(t) || !is_layout_tag(t, req.config.checkpoint);
+    let after: std::collections::HashSet<String> = crate::parser::parse_prompt(&o.improved_prompt)
+        .into_iter()
+        .map(|t| t.normalized)
+        .filter(content)
+        .collect();
     if before == after {
         return true; // nothing to change, so no cards needed
     }
@@ -3310,6 +4238,375 @@ mod tests {
     }
 
     #[test]
+    fn rules_a_small_model_forgets_are_enforced() {
+        use crate::profiles::CheckpointProfile::*;
+        // missing quality tags are put in front, only the missing ones
+        assert_eq!(ensure_quality_tags("1girl, smile", PonyV6), "score_9, score_8_up, score_7_up, 1girl, smile");
+        assert_eq!(ensure_quality_tags("best quality, 1girl", Anima), "masterpiece, best quality, 1girl");
+        // already there (also weighted, or on the first line of an arranged prompt): untouched
+        assert_eq!(ensure_quality_tags("(masterpiece:1.2), 1girl", Anima), "(masterpiece:1.2), 1girl");
+        assert_eq!(ensure_quality_tags("score_9, 1girl", PonyV6), "score_9, 1girl");
+        assert_eq!(ensure_quality_tags("masterpiece,\n1girl", Anima), "masterpiece,\n1girl");
+        // Flux has no quality tags; empty stays empty
+        assert_eq!(ensure_quality_tags("a girl on a beach", Flux), "a girl on a beach");
+        assert_eq!(ensure_quality_tags("", PonyV6), "");
+        // Flux never keeps a negative, other checkpoints do
+        let mut o = AiJsonOutput { recommended_negative: "blurry, bad hands".into(), improved_prompt: "a girl".into(), ..Default::default() };
+        enforce_checkpoint_rules(&mut o, Flux);
+        assert!(o.recommended_negative.is_empty());
+        let mut o = AiJsonOutput { recommended_negative: "blurry, bad hands".into(), improved_prompt: "1girl".into(), ..Default::default() };
+        enforce_checkpoint_rules(&mut o, PonyV6);
+        assert_eq!(o.recommended_negative, "blurry, bad hands");
+        assert!(o.improved_prompt.starts_with("score_9"));
+    }
+
+    /// `PC_DEBUG_GEMMA=1 AUDIT_MODEL=<text model> cargo test live_synthesis -- --ignored --nocapture`:
+    /// runs the dual-pass pipeline with Gemma synthesis on packaging/arch/character.jpg and prints
+    /// the pipeline warnings (e.g. "Gemma output unusable") and the raw model reply.
+    /// `IMAGE_TEST=a.png VISION_ENCODER=<model> cargo test live_checklist -- --ignored --nocapture`:
+    /// the structured observation form for one image.
+    #[test]
+    #[ignore]
+    fn live_checklist() {
+        let img = std::env::var("IMAGE_TEST").expect("IMAGE_TEST");
+        let enc = std::env::var("VISION_ENCODER").unwrap_or_else(|_| "huihui_ai/qwen2.5-vl-abliterated:3b".into());
+        let t = std::time::Instant::now();
+        let form = observe_with_checklist(std::path::Path::new(&img), "localhost:11434", AiMode::Gpu, &enc, &[]).unwrap();
+        println!("=== {enc} ({:.0} s)\n{form}\n===", t.elapsed().as_secs_f32());
+    }
+
+    /// `IMAGE_TEST=a.png VISION_ENCODER=<model> cargo test live_vision_dump -- --ignored --nocapture`:
+    /// prints the vision model's raw multi-zone description of an image (what the writer gets to see).
+    #[test]
+    #[ignore]
+    fn live_vision_dump() {
+        let img = std::env::var("IMAGE_TEST").expect("IMAGE_TEST");
+        let enc = std::env::var("VISION_ENCODER").unwrap_or_else(|_| "huihui_ai/qwen2.5-vl-abliterated:3b".into());
+        let t = std::time::Instant::now();
+        let desc = extract_visual_description_from_path(std::path::Path::new(&img), "localhost:11434", AiMode::Gpu, &enc).unwrap();
+        println!("=== {enc} ({:.0} s)\n{desc}\n===", t.elapsed().as_secs_f32());
+    }
+
+    #[test]
+    #[ignore]
+    fn live_synthesis() {
+        use crate::prompt_condenser::{Mode, PipelineOptions};
+        let model = std::env::var("AUDIT_MODEL").unwrap_or_else(|_| AiModelTier::Best.ollama_name().to_string());
+        let vision = std::env::var("VISION_ENCODER").unwrap_or_else(|_| "huihui_ai/qwen2.5-vl-abliterated:3b".to_string());
+        let img_path = std::env::var("IMAGE_TEST").unwrap_or_else(|_| "packaging/arch/character.jpg".to_string());
+        let img = std::path::Path::new(&img_path);
+        let vision_pass = std::env::var_os("GEMMA_VISION_PASS").is_some();
+        let tags = image::open(img)
+            .ok()
+            .and_then(|d| crate::tagger::tag_dynamic(&d).ok())
+            .map(|t| t.iter().filter(|x| x.score >= 0.35).map(|x| x.name.clone()).collect::<Vec<_>>().join(", "))
+            .unwrap_or_default();
+        for mode in [Mode::SceneShape, Mode::ScenePose] {
+            let opts = PipelineOptions { mode, use_llm_synthesis: true, gemma_vision_pass: vision_pass };
+            let r = run_dual_pass_asymmetric_pipeline("localhost:11434", AiMode::Gpu, &vision, &vision, &model, img, &tags, opts);
+            println!("== {img_path} {mode:?}\nWARNINGS: {:?}\nscene: {}\ncharacter: {}", r.warnings, r.scene_prompt, r.character_prompt);
+        }
+    }
+
+    #[test]
+    fn copied_flags_and_placeholders_are_removed() {
+        // the three leaks seen in the live Anima audit
+        assert_eq!(
+            strip_placeholders("1girl, shrine, night, moonlit, [UNANCHORED_LIMBS_FLAG resolved: hands in lap]"),
+            "1girl, shrine, night, moonlit, hands in lap"
+        );
+        assert_eq!(strip_placeholders("2girls, park, sunset, [framing], BREAK, 1girl"), "2girls, park, sunset, BREAK, 1girl");
+        assert_eq!(strip_placeholders("bad hands, close-up, solo, crowded, {none}"), "bad hands, close-up, solo, crowded");
+        assert_eq!(strip_placeholders("worst quality, {missing framing tag placeholder}, blurry"), "worst quality, blurry");
+        assert_eq!(strip_placeholders("1girl, MISSING_BOTTOMS_FLAG, skirt"), "1girl, skirt");
+        // real syntax survives: dynamic groups, weights, de-emphasis of a real tag, line breaks
+        for keep in ["1girl, {smile|frown}, (red hair:1.2), [blurry background]", "masterpiece,\n1girl, beach", "{beach|forest}"] {
+            assert_eq!(strip_placeholders(keep), keep);
+        }
+        assert_eq!(strip_placeholders("{none}, 1girl"), "1girl");
+        // real de-emphasis tags stay
+        for keep in ["[background], 1girl", "1girl, [lighting]", "[missing tooth], smile", "[pose]"] {
+            assert_eq!(strip_placeholders(keep), keep);
+        }
+        // non-ASCII text before "resolved:" can't break the slicing (it used to panic)
+        assert_eq!(strip_placeholders("[İK UNANCHORED_LIMBS_FLAG resolved: hands in lap]"), "hands in lap");
+        assert_eq!(strip_placeholders(""), "");
+    }
+
+    #[test]
+    fn layout_only_rewrites_need_no_cards_and_misfiled_adds_count() {
+        use crate::profiles::{CheckpointProfile, DetailLevel, TargetView};
+        let config = ScanConfig {
+            checkpoint: CheckpointProfile::Anima, target_view: TargetView::None, pinned_emphasis_raw: String::new(),
+            emphasis_weight: 1.25, cleanup_enabled: true, resolve_conflicts_enabled: true, clamp_weights_enabled: true,
+            camera_angle: 0, pose: 0, proportion: 0, dynamic: false, lora_tags_raw: String::new(), arranged: false, natural: true,
+            two_char: true, char2_prompt_raw: "1girl, blue hair, bob cut, sailor uniform".into(), char2_lora_tags_raw: String::new(),
+            char_break: false, scene_prompt_raw: "beach, sunset, standing in a row, wide shot".into(),
+            more_chars: vec![("1girl, green hair, twintails, hoodie".into(), String::new()), ("1girl, pink hair, braid, white sundress".into(), String::new())],
+            detail: DetailLevel::Balanced,
+        };
+        let req = AiScanRequest {
+            raw_prompt: "1girl, red hair, long hair, red dress".into(), config, mode: AiMode::Gpu,
+            host: String::new(), model: "huihui_ai/gemma-4-abliterated:12b".into(), keep_alive: "30m".into(), think: false,
+        };
+        let add = |o: &str, sug: &str| AiChangeItem { original: o.into(), action: "add".into(), reason: "r".into(), suggested_alternative: sug.into(), framing_alternative: String::new() };
+        // the real 12B reply for 4 characters: only quality, count and position tags were added
+        let mut out = AiJsonOutput {
+            improved_prompt: "masterpiece, best quality, 4girls, standing in a row, beach, sunset, wide shot, BREAK, 1girl, on the far left, red hair, long hair, red dress, BREAK, 1girl, second from left, blue hair, bob cut, sailor uniform, BREAK, 1girl, second from right, green hair, twintails, hoodie, BREAK, 1girl, on the far right, pink hair, braid, white sundress".into(),
+            changes: vec![add("4girls", "4girls"), add("far left", "far left"), add("beach", "beach")],
+            ..Default::default()
+        };
+        assert!(cards_ok(&out, &req), "a layout-only rewrite needs no cards");
+        let tokens = request_tokens(&req);
+        assert!(convert_ai_changes(&out.changes, &tokens, &[]).is_empty(), "layout and existing tags make no cards");
+        // a real new detail filed the same wrong way still becomes an add card
+        out.improved_prompt.push_str(", seashells");
+        out.changes.push(add("seashells", "seashells"));
+        let cards = convert_ai_changes(&out.changes, &tokens, &[]);
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].suggested_alternative, "seashells");
+        assert!(cards_ok(&out, &req));
+        // an "add masterpiece" is no card either: the app writes the quality tags itself
+        assert!(convert_ai_changes(&[add("masterpiece", "masterpiece"), add("", "score_9")], &tokens, &[]).is_empty());
+        // a layout tag the user wrote is content: changing their own count needs a card
+        let mut own = req.clone();
+        own.raw_prompt = "2girls, red hair, long hair, red dress".into();
+        let changed = AiJsonOutput { improved_prompt: out.improved_prompt.replace("4girls", "3girls"), ..Default::default() };
+        assert!(!cards_ok(&changed, &own), "2girls -> 3girls with no card must not pass");
+        // the layout test itself
+        assert!(is_layout_tag("score 9", CheckpointProfile::PonyV6) && is_layout_tag("score_8_up", CheckpointProfile::PonyV6));
+        for t in ["break", "4girls", "2boys", "multiple girls", "on the far left", "second from the right", "in the middle", "masterpiece"] {
+            assert!(is_layout_tag(t, CheckpointProfile::Anima), "{t}");
+        }
+        for t in ["1girl", "red hair", "left hand", "beach"] {
+            assert!(!is_layout_tag(t, CheckpointProfile::Anima), "{t}");
+        }
+    }
+
+    #[test]
+    fn form_lines_become_tags_and_prompts_get_one_tag_per_part() {
+        // the 3B's real answers for the raccoon-girl image
+        let form = "PEOPLE: 1\nPOSE: standing, facing away from the camera, arms relaxed at sides\n\
+                    GAZE AND EXPRESSION:\n- Looking over shoulder towards back of head with a slight smile\n\
+                    FRAMING: from chest up to mid-thighs, slightly angled left side view\n\
+                    BACKGROUND: plain light grey or off-white color; no specific contents visible";
+        let t = tags_from_form(form);
+        for want in ["cowboy shot", "from side", "simple background", "grey background", "looking back", "smile"] {
+            assert!(t.iter().any(|x| x == want), "{want} missing from {t:?}");
+        }
+        assert!(!t.iter().any(|x| x == "arms at sides"), "the pose line is not trusted");
+        // one tag per part: a dictionary tag beats an unknown one, else the first wins
+        let one = one_per_part(
+            ["red eyes", "reddish-brown eyes", "dark skin", "light brown skin", "thigh boots", "knee high boots", "medium hair", "long hair", "smile"]
+                .iter().map(|x| x.to_string()).collect(),
+        );
+        assert_eq!(one, vec!["red eyes", "dark skin", "thigh boots", "medium hair", "smile"]);
+        // the dictionary check needs the tagger's tag list on disk
+        if crate::danbooru::local().is_some() {
+            let v = validate_tags(
+                ["black leather shorts", "standing sideways", "soft shadows", "blue jacket", "curvy hips", "gold wing hair clip", "raccoon girl", "masterpiece"]
+                    .iter().map(|x| x.to_string()).collect(),
+            );
+            assert_eq!(v, vec!["black leather shorts", "from side", "blue jacket", "wide hips", "gold wing hair clip", "raccoon girl", "masterpiece"], "{v:?}");
+            // descriptive tags the list doesn't have are kept; names as labels are not tags
+            let v2 = validate_tags(["white teal bikini top", "Nagi: black hair", "light skin tones"].iter().map(|x| x.to_string()).collect());
+            assert_eq!(v2, vec!["white teal bikini top", "black hair"], "{v2:?}");
+        }
+    }
+
+    #[test]
+    fn merged_tags_are_split_and_contradicted_hair_goes() {
+        if crate::danbooru::local().is_some() {
+            assert_eq!(split_merged_tags("blue jacket open jacket off the shoulders".into()), vec!["blue jacket", "open jacket", "off shoulder"]);
+            // descriptive tags and real multi-word tags stay whole
+            for keep in ["very short black leather shorts", "short hair with long locks", "golden wing hair ornament", "white teal bikini top"] {
+                assert_eq!(split_merged_tags(keep.into()), vec![keep.to_string()], "{keep}");
+            }
+        }
+        let hair: Vec<String> = ["white hair", "short hair with long locks", "low twintails", "long hair", "twintails", "smile"].iter().map(|x| x.to_string()).collect();
+        assert_eq!(drop_contradicted_hair(hair), vec!["white hair", "short hair with long locks", "smile"]);
+        let plain: Vec<String> = ["long hair", "twintails"].iter().map(|x| x.to_string()).collect();
+        assert_eq!(drop_contradicted_hair(plain.clone()), plain, "untouched without the short-hair-with-locks tag");
+    }
+
+    #[test]
+    fn the_taggers_sure_tags_cannot_be_dropped_or_contradicted() {
+        let sure: Vec<String> =
+            ["raccoon ears", "raccoon tail", "dark skin", "1girl", "striped tail"].iter().map(|t| t.to_string()).collect();
+        // the 12B run: fox instead of raccoon, no dark skin
+        let fixed = enforce_strong_tags("masterpiece, best quality, 1girl, fox ears, animal ears, fluffy tail, fox tail, pale skin, glasses", &sure);
+        for want in ["raccoon ears", "raccoon tail", "striped tail", "dark skin", "animal ears", "glasses", "1girl"] {
+            assert!(fixed.split(", ").any(|t| t == want), "{want} missing: {fixed}");
+        }
+        for gone in ["fox ears", "fox tail", "pale skin"] {
+            assert!(!fixed.split(", ").any(|t| t == gone), "{gone} kept: {fixed}");
+        }
+        assert!(fixed.starts_with("masterpiece, best quality,"), "added tags go after the quality tags: {fixed}");
+        // a one-word species tag for another animal goes too; generic "kemonomimi" stays
+        let fixed2 = enforce_strong_tags("1girl, kitsune, kemonomimi, nekomimi, smile", &["raccoon girl".to_string()]);
+        assert_eq!(fixed2, "raccoon girl, 1girl, kemonomimi, smile");
+        // a wrong count is replaced, nothing changes without sure tags
+        assert_eq!(enforce_strong_tags("2girls, smile", &["1girl".to_string()]), "1girl, smile");
+        assert_eq!(enforce_strong_tags("2girls, smile", &[]), "2girls, smile");
+        // only these kinds are guarded
+        for g in ["raccoon ears", "fox tail", "cat girl", "dark skin", "dark-skinned female", "1girl", "2boys"] {
+            assert!(is_guarded_tag(g), "{g}");
+        }
+        for n in ["animal ears", "fake animal ears", "long hair", "glasses", "multiple girls"] {
+            assert!(!is_guarded_tag(n), "{n}");
+        }
+    }
+
+    #[test]
+    fn section_layouts_are_flattened_out_of_image_prompts() {
+        // the 7B run: a tag list, then the same content again in section blocks
+        let doubled = "1girl, cat ears, dark skin, glasses, [Scene / Environment & Shared Framing]: (masterpiece, best quality, cowboy shot) \
+             A solo female character stands upright against a minimalistic light-colored backdrop., \
+             [Character 1]: (1girl, solo, dark skin, glasses, black shorts)";
+        assert_eq!(
+            flatten_section_layout(doubled),
+            "1girl, cat ears, dark skin, glasses, masterpiece, best quality, cowboy shot, solo, black shorts"
+        );
+        // the 3B run: a tag list used as the header
+        assert_eq!(
+            flatten_section_layout("[masterpiece, best quality, solo]: 1girl, smile"),
+            "masterpiece, best quality, solo, 1girl, smile"
+        );
+        // a normal prompt is untouched, weights included
+        for keep in ["1girl, (red hair:1.2), [blurry background], smile", "masterpiece, 1girl"] {
+            assert_eq!(flatten_section_layout(keep), keep);
+        }
+        // and the image reader no longer asks for the layout
+        assert!(!image_directives().contains("CORE OUTPUT STRUCTURE") && image_directives().contains("DIRECTIVE 6"));
+    }
+
+    #[test]
+    fn leaked_instructions_are_stripped_from_image_prompts() {
+        assert_eq!(
+            strip_instruction_leaks("1girl, raccoon tail (inferred from tagger/context), 25-45 tags total, smile"),
+            "1girl, raccoon tail, smile"
+        );
+        assert_eq!(strip_instruction_leaks("glasses, tag count: 40, boots (if visible)"), "glasses, boots");
+        // weights and real parenthesised tags stay
+        for keep in ["(red hair:1.2), 1girl", "kafuu chino (gochiusa), 1girl", "solo, (masterpiece)"] {
+            assert_eq!(strip_instruction_leaks(keep), keep);
+        }
+    }
+
+    #[test]
+    fn combined_mode_always_asks_the_text_model() {
+        use crate::profiles::{CheckpointProfile, DetailLevel, TargetView};
+        let (host, log) = fake_ollama();
+        let config = ScanConfig {
+            checkpoint: CheckpointProfile::Anima, target_view: TargetView::None, pinned_emphasis_raw: String::new(),
+            emphasis_weight: 1.25, cleanup_enabled: true, resolve_conflicts_enabled: true, clamp_weights_enabled: true,
+            camera_angle: 0, pose: 0, proportion: 0, dynamic: false, lora_tags_raw: String::new(), arranged: false, natural: false,
+            two_char: false, char2_prompt_raw: String::new(), char2_lora_tags_raw: String::new(), char_break: false,
+            scene_prompt_raw: String::new(), more_chars: Vec::new(), detail: DetailLevel::Balanced,
+        };
+        let req = ImageAiRequest {
+            host, model: "prompt-condenser-gemma4-e4b".into(), vision_encoder: Some("huihui_ai/qwen2.5-vl-abliterated:3b".into()),
+            mode: AiMode::Gpu, image_path: std::path::PathBuf::from("/nonexistent.png"), config,
+            tag_hints: "1girl, green hair, thighhighs".into(), strong_tags: Vec::new(), second_pass_vision: false, scene_body_shape: false,
+        };
+        let out = describe_image_with_desc(&req, "A girl with green hair wearing black thigh-highs.", "qwen").unwrap();
+        let calls: Vec<String> = log.lock().unwrap().iter().filter(|(p, _)| p == "/api/generate").map(|(_, b)| b.clone()).collect();
+        // the visual check is off, yet the text model still writes the prompt (without the image)
+        assert_eq!(calls.len(), 1, "the text model was not asked");
+        let body: serde_json::Value = serde_json::from_str(&calls[0]).unwrap();
+        assert_eq!(body["model"], "prompt-condenser-gemma4-e4b");
+        assert!(body.get("images").is_none(), "no image without the 2nd Pass Visual Check");
+        assert!(!body["prompt"].as_str().unwrap_or("").contains("An image is attached"), "no 'image attached' note");
+        // this fake reply has no prompt, so the read falls back to the tag merge instead of failing
+        assert!(out.prompt.contains("green hair"), "{}", out.prompt);
+    }
+
+    #[test]
+    fn only_big_models_get_the_short_keep_alive() {
+        assert!(is_big_model("huihui_ai/gemma-4-abliterated:12b"));
+        assert!(!is_big_model("prompt-condenser-gemma4-e4b"));
+        assert!(!is_big_model("richardyoung/llama-3.1-8b-instruct-abliterated"));
+        assert!(!is_big_model("huihui_ai/qwen2.5-vl-abliterated:3b"));
+        // a model that isn't loaded is left alone (fake server: only prompt-condenser-low is loaded)
+        let (host, log) = fake_ollama();
+        set_keep_alive(&host, "huihui_ai/gemma-4-abliterated:12b", "2m");
+        assert!(log.lock().unwrap().iter().all(|(path, _)| path != "/api/generate"));
+        set_keep_alive(&host, "prompt-condenser-low", "2m");
+        assert!(log.lock().unwrap().iter().any(|(path, body)| path == "/api/generate" && body.contains("\"2m\"")));
+    }
+
+    #[test]
+    fn vision_retry_is_a_real_second_attempt() {
+        use crate::prompt_condenser::{VLM_RETRY_TEMP_BUMP, VLM_TEMPERATURE};
+        let (t1, s1) = vlm_sampling(VLM_TEMPERATURE, VLM_TEMPERATURE);
+        let (t2, s2) = vlm_sampling(VLM_TEMPERATURE + VLM_RETRY_TEMP_BUMP, VLM_TEMPERATURE);
+        // a warmer configured first try is still a first try
+        assert_eq!(vlm_sampling(0.3, 0.3).1, s1);
+        assert!(t1 <= 0.05, "first try stays near-deterministic: {t1}");
+        assert!(t2 > t1 + 0.1, "the retry really is warmer: {t2} vs {t1}");
+        assert_ne!(s1, s2, "the retry uses another seed");
+    }
+
+    #[test]
+    fn scan_budgets_expire() {
+        assert!(!ScanBudget::new(Duration::from_secs(60)).spent());
+        assert!(ScanBudget::new(Duration::from_secs(0)).spent());
+        // the limits the app uses
+        assert_eq!(DEEP_SCAN_BUDGET, Duration::from_secs(180));
+        assert_eq!(MULTIZONE_BUDGET, Duration::from_secs(60));
+        assert_eq!(MULTIZONE_MAX_ZONE_CALLS, 6);
+    }
+
+    #[test]
+    fn dedicated_encoders_are_recognized_and_unloaded_quickly() {
+        assert!(is_toriigate("hf.co/DraconicDragon/ToriiGate-0.5-GGUF:Q4_K_M") && is_toriigate("minthy/torii_gate") && !is_toriigate("gemma"));
+        for enc in ["moondream:1.8b", "huihui_ai/qwen2.5-vl-abliterated:3b", "llava:7b", "Qwen2.5-VL-7B", "hf.co/DraconicDragon/ToriiGate-0.5-GGUF:Q4_K_M"] {
+            assert!(is_dedicated_encoder(enc), "{enc}");
+            assert_eq!(encoder_keep_alive(enc), "30s", "{enc}");
+        }
+        // text models (even ones that can see) stay loaded for the next scan
+        for text in ["huihui_ai/gemma-4-abliterated:12b", "prompt-condenser-gemma4-e4b", "richardyoung/llama-3.1-8b-instruct-abliterated"] {
+            assert!(!is_dedicated_encoder(text), "{text}");
+            assert_eq!(encoder_keep_alive(text), "30m", "{text}");
+        }
+        // only dedicated encoders that are actually loaded get unloaded, never anything else
+        let (host, log) = fake_ollama(); // /api/ps lists only prompt-condenser-low
+        unload_dedicated_encoders(&format!("http://{host}"), &["moondream:1.8b", "prompt-condenser-low"], "x");
+        assert!(log.lock().unwrap().iter().all(|(path, _)| path != "/api/generate"), "{:?}", log.lock().unwrap());
+    }
+
+    #[test]
+    fn dual_pass_honors_the_selected_mode() {
+        use crate::prompt_condenser::{Mode, PipelineOptions};
+        let (host, log) = fake_ollama();
+        let dir = std::env::temp_dir().join(format!("pc-mode-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let img = dir.join("t.png");
+        image::DynamicImage::new_rgb8(64, 96).save(&img).unwrap();
+        for (mode, wanted, other) in [
+            (Mode::ScenePose, Mode::ScenePose.pass1_prompt(), Mode::SceneShape.pass1_prompt()),
+            (Mode::SceneShape, Mode::SceneShape.pass1_prompt(), Mode::ScenePose.pass1_prompt()),
+        ] {
+            log.lock().unwrap().clear();
+            let opts = PipelineOptions { mode, use_llm_synthesis: false, gemma_vision_pass: false };
+            let _ = run_dual_pass_asymmetric_pipeline(
+                &host, AiMode::Gpu, "moondream:1.8b", "moondream:1.8b", "prompt-condenser-low", &img, "1girl, standing", opts,
+            );
+            let prompts: Vec<String> = log
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(path, _)| path == "/api/generate")
+                .filter_map(|(_, body)| serde_json::from_str::<serde_json::Value>(body).ok())
+                .filter_map(|v| v["prompt"].as_str().map(str::to_string))
+                .collect();
+            assert!(prompts.iter().any(|p| p == wanted), "{mode:?} never sent its own pass-1 prompt: {prompts:?}");
+            assert!(!prompts.iter().any(|p| p == other), "{mode:?} sent the other mode's pass-1 prompt");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn talks_to_ollama_api() {
         use crate::profiles::{CheckpointProfile, TargetView};
         let (host, log) = fake_ollama();
@@ -3509,7 +4806,10 @@ mod tests {
         };
         for path in std::env::var("IMAGE_TEST").unwrap().split(':') {
             let path = std::path::PathBuf::from(path);
-            let hints = crate::twoimg::tag_one_fast(&path, &|_| ()).map(|t| crate::tagger::build_prompt(&t, 0.35).prompt).unwrap_or_default();
+            let scored = crate::twoimg::tag_one_fast(&path, &|_| ()).unwrap_or_default();
+            let hints = crate::tagger::build_prompt(&scored, 0.35).prompt;
+            let strong = strong_tags(&scored);
+            println!("STRONG  : {}", strong.join(", "));
             let config = ScanConfig {
                 checkpoint: crate::profiles::CheckpointProfile::Anima, target_view: crate::profiles::TargetView::None, pinned_emphasis_raw: String::new(),
                 emphasis_weight: 1.25, cleanup_enabled: true, resolve_conflicts_enabled: true, clamp_weights_enabled: true,
@@ -3523,6 +4823,7 @@ mod tests {
                 image_path: path.clone(),
                 config,
                 tag_hints: hints.clone(),
+                strong_tags: strong.clone(),
                 second_pass_vision: false,
                 scene_body_shape: false,
             };
@@ -3672,6 +4973,21 @@ mod tests {
             two_char: false, char2_prompt_raw: String::new(), char2_lora_tags_raw: String::new(), char_break: false,
             scene_prompt_raw: String::new(), more_chars: Vec::new(), detail: DetailLevel::Balanced,
         };
+        // the Deep Scan has its own role and JSON reply; the image compiler's directives
+        // (flags, [Scene]/[Character 1] layout, dual-image merge) must not leak into it
+        for family in [ModelFamily::Gemma, ModelFamily::Generic, ModelFamily::Small] {
+            let (deep, _) = build_ai_system_and_user_prompt_for("1girl, smile, beach", &base(), family);
+            assert!(deep.contains("uncensored") && deep.contains("never refuse"), "{family:?}: no uncensored role");
+            assert!(deep.contains("DIRECTIVE 1") && deep.contains("DIRECTIVE 5") && deep.contains("DIRECTIVE 7"), "{family:?}: rules missing");
+            assert!(deep.contains("to the character they belong to"), "{family:?}: directive 2 not reworded");
+            for leak in ["AntigravityAI", "[Character 1]", "[Scene]", "DIRECTIVE 6", "Image 1 Authority", "CORE OUTPUT STRUCTURE"] {
+                assert!(!deep.contains(leak), "{family:?}: Deep Scan prompt contains {leak:?}");
+            }
+        }
+        // ...while the image reader keeps its directives and the uncensored / never-refuse line
+        let img = image_system_prompt(&base(), "");
+        assert!(img.contains("uncensored") && img.contains("never refuse") && img.contains("DIRECTIVE 6"), "{img}");
+        assert!(img.contains("more reliable than the visual description") && img.contains("dark skin"), "tagger rule missing");
         // image -> prompt: the quality tags are where the prompt says they are
         let sys = image_system_prompt(&base(), "");
         assert!(sys.contains("starting with the quality tags (score_9"), "{sys}");
@@ -3934,7 +5250,7 @@ mod tests {
         use std::time::Instant;
 
         let img_path_str = std::env::var("TEST_IMAGE")
-            .unwrap_or_else(|_| "/home/yukia/Pictures/HWP1dffawAA5Y7K.jpg".to_string());
+            .unwrap_or_else(|_| "tests/eval_dataset/HWP1dffawAA5Y7K.jpg".to_string());
         let img_path = Path::new(&img_path_str);
         if !img_path.is_file() {
             println!("Image not found at {}, skipping live test.", img_path.display());

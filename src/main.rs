@@ -12,7 +12,6 @@ mod sceneref;
 mod tagger;
 mod two;
 mod twoimg;
-#[allow(dead_code)]
 pub mod prompt_condenser;
 #[cfg(test)]
 mod prompt_condenser_parity;
@@ -63,6 +62,12 @@ struct AppState {
     vision_models: Vec<String>,
     /// Deep Scan was pressed while the AI was still reading the image: scan once it's done.
     scan_after_image: bool,
+    /// Set by an image read's hand-off to the Deep Scan: the image was just read, don't read it again.
+    scan_image_done: bool,
+    /// One counter per image slot, bumped when that image is loaded, removed or re-read, so a
+    /// read that finishes afterwards knows its result is for an old image. Separate per slot:
+    /// loading a character image must not throw away a read of the main image.
+    image_gens: ImageGens,
     /// 2 Characters tab: the detector + tagger reading of the image, and the AI's split.
     two_tags: Option<twoimg::TagSplit>,
     two_ai: Option<twoimg::SplitPrompt>,
@@ -759,8 +764,8 @@ fn build_model_choices(installed: &[OllamaModel]) -> Vec<ModelChoice> {
         })
         .collect();
     for m in &installed {
-        // Hide dedicated vision encoders (Moondream, Qwen-VL) from the text prompt model dropdown
-        if m.to_lowercase().contains("moondream")
+        // Hide dedicated vision encoders (Moondream, Qwen-VL, ToriiGate) from the text prompt model dropdown
+        if ai_engine::is_toriigate(m) || m.to_lowercase().contains("moondream")
             || (m.to_lowercase().contains("qwen") && (m.to_lowercase().contains("vl") || m.to_lowercase().contains("-vl")))
         {
             continue;
@@ -806,6 +811,7 @@ fn refresh_vision_encoder(ui: &AppWindow, state: &State) {
     }
     {
         let mut st = state.borrow_mut();
+        st.image_gens.bump_all();
         st.image_ai = None;
         st.two_ai = None;
         st.char_images = [None, None, None, None];
@@ -992,6 +998,7 @@ fn run_two_image(ui: &AppWindow, state: &State) {
     let n = tab_chars(ui);
     // a cached reading for another number of characters doesn't count
     let cached = state.borrow().two_tags.clone().filter(|t| t.wanted == n);
+    let gen = (state.borrow().image_gens, ImageSlots::Main);
     ui.set_tagger_busy(true);
     ui.set_image_status(format!("Finding the {n} characters…").into());
     let weak = ui.as_weak();
@@ -1048,6 +1055,9 @@ fn run_two_image(ui: &AppWindow, state: &State) {
         let secs = started.elapsed().as_secs_f32();
         let _ = weak.upgrade_in_event_loop(move |ui| {
             ui.set_tagger_busy(false);
+            if image_changed_since(&ui, gen) {
+                return;
+            }
             with_state(|state| match result {
                 Ok((tags, ai_split)) => {
                     state.borrow_mut().two_tags = Some(tags.clone());
@@ -1061,6 +1071,7 @@ fn run_two_image(ui: &AppWindow, state: &State) {
                     };
                     apply_two(&ui, state, &split, format!("{} • {secs:.0} s", two_status(&tags, &how)));
                     if std::mem::take(&mut state.borrow_mut().scan_after_image) {
+                        state.borrow_mut().scan_image_done = true; // the scan must not read it again
                         ui.invoke_run_ai_scan_requested();
                     }
                 }
@@ -1191,6 +1202,7 @@ fn read_char_blocking(path: &std::path::Path, ctx: &ReadCtx, progress: &(dyn Fn(
         image_path: path.to_path_buf(),
         config: ctx.config.clone(),
         tag_hints: hints.clone(),
+        strong_tags: ai_engine::strong_tags(&tags),
         second_pass_vision: ctx.second_pass,
         scene_body_shape: ctx.scene_body_shape,
     };
@@ -1270,6 +1282,7 @@ fn read_scene_blocking(
         image_path: path.to_path_buf(),
         config: ctx.config.clone(),
         tag_hints: hints.clone(),
+        strong_tags: Vec::new(),
         second_pass_vision: ctx.second_pass,
         scene_body_shape: ctx.scene_body_shape,
     };
@@ -1361,6 +1374,7 @@ fn run_scene_fast_scan(ui: &AppWindow, state: &State) {
     ctx.model = None;
     ctx.vision_encoder = None; // FORCE FAST SCAN (Skips slow AI LLM/VLM)
     let n = tab_chars(ui);
+    let gen = (state.borrow().image_gens, ImageSlots::Scene);
     ui.set_tagger_busy(true);
     let weak = ui.as_weak();
     std::thread::spawn(move || {
@@ -1371,6 +1385,9 @@ fn run_scene_fast_scan(ui: &AppWindow, state: &State) {
         let secs = started.elapsed().as_secs_f32();
         let _ = weak.upgrade_in_event_loop(move |ui| {
             ui.set_tagger_busy(false);
+            if image_changed_since(&ui, gen) {
+                return;
+            }
             with_state(|state| {
                 match scene_result {
                     Ok((actions, how, raw_tags, _)) => {
@@ -1406,6 +1423,7 @@ fn run_read_queue(ui: &AppWindow, state: &State) {
     };
     let ctx = read_ctx(ui, state);
     let n = tab_chars(ui);
+    let gen = (state.borrow().image_gens, ImageSlots::Refs);
     ui.set_tagger_busy(true);
     let weak = ui.as_weak();
     std::thread::spawn(move || {
@@ -1425,6 +1443,9 @@ fn run_read_queue(ui: &AppWindow, state: &State) {
         let secs = started.elapsed().as_secs_f32();
         let _ = weak.upgrade_in_event_loop(move |ui| {
             ui.set_tagger_busy(false);
+            if image_changed_since(&ui, gen) {
+                return;
+            }
             with_state(|state| {
                 let mut done = Vec::new();
                 let mut all_warnings = Vec::new();
@@ -1797,6 +1818,7 @@ fn inject_pose_into_prompt(current: &str, new_pose: &str) -> String {
 /// Removes the reference image completely.
 fn clear_scene_ref(ui: &AppWindow, state: &State) {
     state.borrow_mut().scene_ref_path = None;
+    state.borrow_mut().image_gens.scene += 1;
     let old = state.borrow_mut().scene_ref.take();
     if let Some(r) = old {
         restore_boxes(ui, &r.boxes);
@@ -1811,8 +1833,26 @@ fn clear_scene_ref(ui: &AppWindow, state: &State) {
 }
 
 /// The default target text model for writing prompts (from dropdown or default tier).
+/// A model name short enough for the status line: `huihui_ai/gemma-4-abliterated:12b` -> `gemma-4-abliterated:12b`.
+fn short_model_name(name: &str) -> &str {
+    let n = name.rsplit('/').next().unwrap_or(name);
+    n.strip_suffix(":latest").unwrap_or(n)
+}
+
 fn default_text_model(ui: &AppWindow, state: &State) -> String {
     let st = state.borrow();
+    let selected = st.model_choices.get(ui.get_model_index().max(0) as usize).filter(|c| c.installed);
+    // With the 2nd Pass Visual Check on, the text model has to see the image: keep the
+    // dropdown's model when it can (the 12B).
+    let selected_sees = selected.is_some_and(|c| st.vision_models.iter().any(|v| ai_engine::same_model(v, &c.name)));
+    if !(ui.get_image_second_pass() && selected_sees) {
+        // Otherwise image reads use E4B (Good): it wrote the best image prompts in the tests and
+        // keeps the 12B out of image reads, so it doesn't share the memory with the tagger and the
+        // vision model (that made the system swap). The Deep Scan still uses the dropdown's model.
+        if let Some(e4b) = st.model_choices.iter().find(|c| c.installed && c.tier == Some(AiModelTier::Good)) {
+            return e4b.name.clone();
+        }
+    }
     st.model_choices
         .get(ui.get_model_index().max(0) as usize)
         .filter(|c| c.installed)
@@ -1825,6 +1865,11 @@ fn default_text_model(ui: &AppWindow, state: &State) -> String {
 /// The vision encoder for reading images: defaults to Qwen-VL (abliterated 3B preferred), then Moondream, else selected or first vision model.
 fn vision_model(ui: &AppWindow, state: &State) -> Option<String> {
     let st = state.borrow();
+    // 0. ToriiGate when installed: an anime captioning model built to use booru tags as hints. In the
+    //    tests it beat the Qwen-VL 3B clearly on multi-character images (average F1 23% -> 30%).
+    if let Some(m) = st.vision_models.iter().find(|m| ai_engine::is_toriigate(m)) {
+        return Some(m.clone());
+    }
     // 1. Default to Qwen-VL 3B (especially abliterated) if available, or any Qwen-VL
     if let Some(m) = st.vision_models.iter().find(|m| {
         let l = m.to_lowercase();
@@ -1870,6 +1915,7 @@ fn run_ai_image(ui: &AppWindow, state: &State) {
         image_path: path.clone(),
         config: scan_config(ui),
         tag_hints: String::new(),
+        strong_tags: Vec::new(),
         second_pass_vision: second_pass,
         scene_body_shape: ui.get_scene_body_shape(),
     };
@@ -1884,15 +1930,23 @@ fn run_ai_image(ui: &AppWindow, state: &State) {
         Some(prompt_condenser::PipelineOptions {
             mode,
             use_llm_synthesis: ui.get_use_llm_synthesis(),
-            gemma_vision_pass: ui.get_image_second_pass() && ui.get_use_llm_synthesis(),
+            // only a text model that can see gets the image (`second_pass` checks that); sending it
+            // to E4B / Llama made Ollama reject the call and fall back to the mechanical merge
+            gemma_vision_pass: second_pass && ui.get_use_llm_synthesis(),
         })
     } else {
         None
     };
+    let gen = (state.borrow().image_gens, ImageSlots::Main);
     ui.set_tagger_busy(true);
     let status_name = if enable_dual_pass {
         let mode_name = if ui.get_dual_pass_mode_index() == 0 { "Shape" } else { "Pose" };
-        let synth = if ui.get_use_llm_synthesis() { " + Gemma" } else { " (No LLM)" };
+        // the text model that writes the prompt (the dropdown's model, not always Gemma)
+        let synth = if ui.get_use_llm_synthesis() {
+            format!(" + {}{}", short_model_name(&text_model), if second_pass { " (sees the image)" } else { "" })
+        } else {
+            " (No LLM)".to_string()
+        };
         format!("Dual-Pass [{mode_name}]: {encoder}{synth}")
     } else if ai_engine::same_model(&encoder, &text_model) {
         encoder.clone()
@@ -1918,6 +1972,7 @@ fn run_ai_image(ui: &AppWindow, state: &State) {
             } else {
                 String::new()
             };
+            let strong = tags.as_deref().map(ai_engine::strong_tags).unwrap_or_default();
             let dual_result = ai_engine::run_dual_pass_pipeline(
                 &req.host,
                 req.mode,
@@ -1930,6 +1985,9 @@ fn run_ai_image(ui: &AppWindow, state: &State) {
             let secs = started.elapsed().as_secs_f32();
             let _ = weak.upgrade_in_event_loop(move |ui| {
                 ui.set_tagger_busy(false);
+                if image_changed_since(&ui, gen) {
+                    return;
+                }
                 with_state(|state| {
                     if tags.is_some() {
                         state.borrow_mut().last_tags = tags;
@@ -1946,6 +2004,8 @@ fn run_ai_image(ui: &AppWindow, state: &State) {
                         (true, true) => wd14_tags.clone(),
                     };
                     let deduped_prompt = parser::AntigravityTagFilter::new().resolve_and_strip_flags(&raw_combined);
+                    // the tagger's sure skin / species / count tags can't be dropped or contradicted
+                    let deduped_prompt = ai_engine::enforce_strong_tags(&deduped_prompt, &strong);
                     let mode_str = match opts.mode {
                         prompt_condenser::Mode::SceneShape => "Shape",
                         prompt_condenser::Mode::ScenePose => "Pose",
@@ -1961,6 +2021,7 @@ fn run_ai_image(ui: &AppWindow, state: &State) {
                         ui.set_image_status(format!("Dual-Pass [{mode_str}]{timing}: Scene + Character merged.").into());
                     }
                     if std::mem::take(&mut state.borrow_mut().scan_after_image) {
+                        state.borrow_mut().scan_image_done = true; // the scan must not read it again
                         ui.invoke_run_ai_scan_requested();
                     }
                 });
@@ -1968,30 +2029,20 @@ fn run_ai_image(ui: &AppWindow, state: &State) {
             return;
         }
 
-        // In Combined mode: run tagger and vision encoder in parallel for maximum speed
-        let (tags, vision_desc_res) = if cached_tags.is_none() && tagger::is_installed() && !ai_engine::same_model(&encoder, &text_model) {
-            std::thread::scope(|s| {
-                let tagger_handle = s.spawn(|| twoimg::tag_one_fast(&path, &status_sender(&weak)).ok());
-                let vision_handle = s.spawn(|| {
-                    ai_engine::extract_visual_description_from_path(&path, &req.host, req.mode, &encoder)
-                });
-                (
-                    tagger_handle.join().unwrap_or(None),
-                    Some(vision_handle.join().unwrap_or_else(|_| Err(anyhow::anyhow!("Vision thread panicked")))),
-                )
-            })
-        } else {
-            (
-                cached_tags.or_else(|| {
-                    tagger::is_installed().then(|| twoimg::tag_one_fast(&path, &status_sender(&weak)).ok()).flatten()
-                }),
-                None,
-            )
-        };
+        // In Combined mode the tagger runs first: its sure skin / species / count tags are handed to the
+        // vision model to check (it used to guess them, running at the same time), and the final prompt
+        // may not drop them.
+        let tags = cached_tags.or_else(|| {
+            tagger::is_installed().then(|| twoimg::tag_one_fast(&path, &status_sender(&weak)).ok()).flatten()
+        });
         let mut req = req;
         if let Some(t) = &tags {
             req.tag_hints = tagger::build_prompt(t, threshold).prompt;
+            req.strong_tags = ai_engine::strong_tags(t);
         }
+        let vision_desc_res = (!ai_engine::same_model(&encoder, &text_model)).then(|| {
+            ai_engine::observe_image(&path, &req.host, req.mode, &encoder, &req.tag_hints, &req.strong_tags)
+        });
         let result = match vision_desc_res {
             Some(Ok(desc)) => ai_engine::describe_image_with_desc(&req, &desc, &encoder),
             Some(Err(e)) => Err(e),
@@ -2000,6 +2051,9 @@ fn run_ai_image(ui: &AppWindow, state: &State) {
         let secs = started.elapsed().as_secs_f32();
         let _ = weak.upgrade_in_event_loop(move |ui| {
             ui.set_tagger_busy(false);
+            if image_changed_since(&ui, gen) {
+                return;
+            }
             with_state(|state| {
                 if tags.is_some() {
                     state.borrow_mut().last_tags = tags;
@@ -2012,7 +2066,8 @@ fn run_ai_image(ui: &AppWindow, state: &State) {
                             apply_ai_image(&ui, state, &res, Some(secs));
                         }
                         if std::mem::take(&mut state.borrow_mut().scan_after_image) {
-                            ui.invoke_run_ai_scan_requested();
+                            state.borrow_mut().scan_image_done = true; // the scan must not read it again
+                        ui.invoke_run_ai_scan_requested();
                         }
                     }
                     Err(e) => {
@@ -2056,6 +2111,7 @@ fn apply_ai_image(ui: &AppWindow, state: &State, res: &ai_engine::ImageAiResult,
 /// Runs the Danbooru tagger on the loaded image (off the UI thread).
 fn run_tagger(ui: &AppWindow, state: &State) {
     let Some(path) = state.borrow().image_path.clone() else { return };
+    let gen = (state.borrow().image_gens, ImageSlots::Main);
     ui.set_tagger_busy(true);
     ui.set_image_status("Extracting Danbooru tags… (the first run loads the model)".into());
     let weak = ui.as_weak();
@@ -2065,6 +2121,9 @@ fn run_tagger(ui: &AppWindow, state: &State) {
         let secs = started.elapsed().as_secs_f32();
         let _ = weak.upgrade_in_event_loop(move |ui| {
             ui.set_tagger_busy(false);
+            if image_changed_since(&ui, gen) {
+                return;
+            }
             with_state(|state| match result {
                 Ok(scores) => {
                     state.borrow_mut().last_tags = Some(scores);
@@ -2101,6 +2160,57 @@ fn apply_tags(ui: &AppWindow, state: &State, secs: Option<f32>) {
         )
         .into(),
     );
+}
+
+/// Per-slot image counters (see `AppState::image_gens`).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct ImageGens {
+    main: u64,
+    scene: u64,
+    chars: [u64; 4],
+}
+
+impl ImageGens {
+    fn bump_all(&mut self) {
+        self.main += 1;
+        self.scene += 1;
+        for c in &mut self.chars {
+            *c += 1;
+        }
+    }
+    /// Did any slot this read uses change between `self` (when it started) and `now`?
+    fn changed(&self, now: &ImageGens, slots: ImageSlots) -> bool {
+        match slots {
+            ImageSlots::Main => self.main != now.main,
+            ImageSlots::Scene => self.scene != now.scene,
+            ImageSlots::Refs => self.scene != now.scene || self.chars != now.chars,
+        }
+    }
+}
+
+/// Which images a read uses: the main image, the scene reference, or the reference images
+/// (scene reference plus character images, read together by the Read queue).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ImageSlots {
+    Main,
+    Scene,
+    Refs,
+}
+
+/// For an image read finishing on the UI thread: true (and the result is to be dropped) when an
+/// image it read changed since it started, which also cancels a Deep Scan waiting for it.
+fn image_changed_since(ui: &AppWindow, started: (ImageGens, ImageSlots)) -> bool {
+    let mut changed = false;
+    with_state(|state| {
+        if started.0.changed(&state.borrow().image_gens, started.1) {
+            changed = true;
+            state.borrow_mut().scan_after_image = false;
+        }
+    });
+    if changed {
+        ui.set_image_status("The image changed while it was being read; that result was discarded.".into());
+    }
+    changed
 }
 
 fn with_state(f: impl FnOnce(&State)) {
@@ -2624,6 +2734,7 @@ fn main() -> Result<(), slint::PlatformError> {
             {
                 let mut st = state.borrow_mut();
                 st.image_path = Some(path);
+                st.image_gens.main += 1;
                 st.last_tags = None;
                 st.image_ai = None;
                 st.two_tags = None;
@@ -2676,6 +2787,7 @@ fn main() -> Result<(), slint::PlatformError> {
             {
                 let mut st = state.borrow_mut();
                 st.image_path = None;
+                st.image_gens.main += 1;
                 st.last_tags = None;
                 st.image_ai = None;
                 st.two_tags = None;
@@ -2719,6 +2831,7 @@ fn main() -> Result<(), slint::PlatformError> {
             let old_boxes = {
                 let mut st = state.borrow_mut();
                 st.scene_ref_path = Some(path);
+                st.image_gens.scene += 1;
                 st.scene_ref.take().map(|r| r.boxes).unwrap_or_default()
             };
             restore_boxes(&ui, &old_boxes);
@@ -2763,6 +2876,7 @@ fn main() -> Result<(), slint::PlatformError> {
             {
                 let mut st = state.borrow_mut();
                 st.char_paths[which] = Some(path);
+                st.image_gens.chars[which] += 1;
                 st.char_images[which] = None;
             }
             update_pending(&ui, &state);
@@ -2995,6 +3109,7 @@ fn main() -> Result<(), slint::PlatformError> {
             {
                 let mut st = state.borrow_mut();
                 st.char_paths[idx] = None;
+                st.image_gens.chars[idx] += 1;
                 st.char_images[idx] = None;
                 st.char_thumbs[idx] = None;
             }
@@ -3364,8 +3479,12 @@ fn main() -> Result<(), slint::PlatformError> {
         let state = state.clone();
         ui.on_run_ai_scan_requested(move || {
             let Some(ui) = weak.upgrade() else { return };
+            // Coming from an image read that just finished (successfully or not): scan with what it
+            // produced. Without this, a failed AI split left the image "unread" and the scan read it
+            // again, forever.
+            let image_done = std::mem::take(&mut state.borrow_mut().scan_image_done);
             // With an image loaded and the switch on AI, read the image first, then scan.
-            if ui.get_image_use_ai() && ui.get_image_loaded() {
+            if !image_done && ui.get_image_use_ai() && ui.get_image_loaded() {
                 if ui.get_tagger_busy() {
                     state.borrow_mut().scan_after_image = true;
                     ui.set_status_message("Deep scan starts as soon as the AI has read the image…".into());
@@ -3428,6 +3547,11 @@ fn main() -> Result<(), slint::PlatformError> {
             let weak = weak.clone();
             std::thread::spawn(move || {
                 let result = ai_engine::run_ai_scan(&req);
+                // a big model (10B+, the 12B) frees its memory 2 minutes after the scan instead of
+                // staying loaded 30 minutes; a scan again within 2 minutes still finds it loaded
+                if ai_engine::is_big_model(&req.model) {
+                    ai_engine::set_keep_alive(&req.host, &req.model, "2m");
+                }
                 let _ = weak.upgrade_in_event_loop(move |ui| {
                     ui.set_ai_busy(false);
                     // `state` is Rc (UI thread only), so fetch it via a thread-local handle.
@@ -3567,6 +3691,35 @@ thread_local! {
     /// The UI-thread `State`, reachable from `upgrade_in_event_loop` closures
     /// (those must be `Send`, so they can't capture the `Rc` directly).
     static STATE: RefCell<Option<State>> = const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+mod image_gen_tests {
+    use super::{short_model_name, ImageGens, ImageSlots};
+
+    #[test]
+    fn status_shows_the_real_text_model() {
+        assert_eq!(short_model_name("huihui_ai/gemma-4-abliterated:12b"), "gemma-4-abliterated:12b");
+        assert_eq!(short_model_name("prompt-condenser-gemma4-e4b:latest"), "prompt-condenser-gemma4-e4b");
+        assert_eq!(short_model_name("richardyoung/llama-3.1-8b-instruct-abliterated"), "llama-3.1-8b-instruct-abliterated");
+    }
+
+    #[test]
+    fn a_read_only_goes_stale_when_its_own_image_changes() {
+        let start = ImageGens::default();
+        let mut now = start;
+        now.chars[1] += 1; // a character image was loaded during the read
+        assert!(!start.changed(&now, ImageSlots::Main), "the main image read stays valid");
+        assert!(!start.changed(&now, ImageSlots::Scene));
+        assert!(start.changed(&now, ImageSlots::Refs), "the reference queue read it");
+        now.main += 1;
+        assert!(start.changed(&now, ImageSlots::Main));
+        let mut all = start;
+        all.bump_all();
+        for slots in [ImageSlots::Main, ImageSlots::Scene, ImageSlots::Refs] {
+            assert!(start.changed(&all, slots), "Redo Vision makes every read stale");
+        }
+    }
 }
 
 #[cfg(test)]

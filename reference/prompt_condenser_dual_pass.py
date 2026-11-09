@@ -186,8 +186,10 @@ MODE_CONFIG = {
             "Merge 'Scene & Pose' (Pass 1) with 'Character & Body Shape' (Pass 2). "
             "Map the proportions and clothing from Pass 2 onto the pose from "
             "Pass 1 without inventing proportions that are not in the input. "
-            "Place environment, lighting, camera and pose in scene_prompt. Place "
-            "face, hair, body proportions, clothing and props in character_prompt. "
+            "Place environment, lighting and camera in scene_prompt. Place face, "
+            "hair, body proportions, clothing, props and the skeletal pose in "
+            "character_prompt (the pose belongs to the character, so it never "
+            "becomes shared scene). "
             + _LLM_TAIL
         ),
     },

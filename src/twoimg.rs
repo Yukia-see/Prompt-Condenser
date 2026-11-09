@@ -506,6 +506,42 @@ mod tests {
     }
 
     /// Where the time goes: `TIMING_TEST=a.png cargo test live_timing -- --ignored --nocapture`
+    /// `TIMING_TEST=a.png cargo test live_tag_scores -- --ignored --nocapture`: the tagger's score for every tag >= 0.3.
+    #[test]
+    #[ignore]
+    fn live_tag_scores() {
+        let p = std::env::var("TIMING_TEST").unwrap();
+        let mut tags = tag_one_fast(Path::new(&p), &|_| ()).unwrap();
+        tags.retain(|t| t.score >= 0.3);
+        tags.sort_by(|a, b| b.score.total_cmp(&a.score));
+        for t in tags {
+            println!("{:.2}  {}", t.score, t.name);
+        }
+    }
+
+    /// `TIMING_TEST=a.png cargo test live_steps -- --ignored --nocapture`: times each step on its own.
+    #[test]
+    #[ignore]
+    fn live_steps() {
+        let p = std::env::var("TIMING_TEST").unwrap();
+        let img = image::open(&p).unwrap();
+        let lap = |what: &str, t: std::time::Instant| println!("{what}: {:.2}s", t.elapsed().as_secs_f32());
+        let t = std::time::Instant::now(); tagger::tag_dynamic(&img).unwrap(); lap("tagger pass 1 (loads model)", t);
+        let t = std::time::Instant::now(); tagger::tag_dynamic(&img).unwrap(); lap("tagger pass 2", t);
+        let t = std::time::Instant::now(); let boxes = detector::detect(&img).unwrap(); lap(&format!("detector ({} people)", boxes.len()), t);
+        let t = std::time::Instant::now(); let boxes2 = detector::detect(&img).unwrap(); lap(&format!("detector again ({})", boxes2.len()), t);
+        if let Some(b) = boxes.first() {
+            let t = std::time::Instant::now(); let (crop, _) = detector::crop_with_overlap_mask(&img, b, &boxes); lap("crop with overlap mask", t);
+            let t = std::time::Instant::now(); tagger::tag_dynamic(&crop).unwrap(); lap("tagger on one person crop", t);
+            for (name, z) in detector::three_zone_crops(&img, b) {
+                let t = std::time::Instant::now(); tagger::tag_dynamic(&z).unwrap(); lap(&format!("tagger on zone {name}"), t);
+            }
+        }
+        for (name, q) in detector::quadrant_crops(&img) {
+            let t = std::time::Instant::now(); tagger::tag_dynamic(&q).unwrap(); lap(&format!("tagger on quadrant {name}"), t);
+        }
+    }
+
     #[test]
     #[ignore]
     fn live_timing() {

@@ -209,6 +209,7 @@ impl TagList {
 
 /// Sentence continuation kinds from `Mexes/booru-tags-to-natural-language` (`phrases.csv`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // not wired to the UI yet
 pub enum PhraseKind {
     /// "She is ___" (posture, active verbs, expressions, gaze)
     Is,
@@ -226,6 +227,7 @@ pub enum PhraseKind {
 
 /// Converts a Danbooru tag into its `Mexes/booru-tags-to-natural-language` `(PhraseKind, String)`
 /// with `{pos}` expanded to `pos` (e.g. `"her"`, `"his"`, `"their"`).
+#[allow(dead_code)] // not wired to the UI yet
 pub fn tag_to_phrase(tag: &str, pos: &str) -> Option<(PhraseKind, String)> {
     let k = key(tag);
     if k.is_empty() {
@@ -293,11 +295,67 @@ pub fn tag_to_phrase(tag: &str, pos: &str) -> Option<(PhraseKind, String)> {
 /// Reverse-matches natural-language descriptions (from Moondream 1.8B or Gemma 4)
 /// against the `Mexes/booru-tags-to-natural-language` phrase patterns and
 /// `danbooru_tags_post_count.csv` canonical vocabulary to recover missing Danbooru tags.
+/// A clause that says something is absent: it contains a negating word ("no", "not", "without",
+/// "never", "none", "neither", "nor", "isn't"...).
+fn clause_is_negated(clause: &str) -> bool {
+    const NEGATIONS: &[&str] = &[
+        "no", "not", "without", "never", "none", "neither", "nor", "isn't", "aren't", "doesn't", "don't", "wasn't",
+        "weren't", "lacks", "lacking", "absent",
+    ];
+    clause
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '\''))
+        .any(|w| NEGATIONS.contains(&w))
+}
+
+/// `prose_has` for other modules (whole words, common endings allowed; `text` lowercase).
+pub fn prose_has_pub(text: &str, phrase: &str) -> bool {
+    prose_has(text, phrase)
+}
+
+/// `phrase` appears in `text` as whole words: the character before it is not a letter or digit,
+/// and after it comes either nothing or a common ending (s, es, ed, d, ing, plus the doubled-consonant
+/// forms like "sitting"), then a non-letter. So "sit" finds "sits" and "sitting" but not "visible",
+/// and "fit" doesn't find "outfit". `text` must already be lowercase.
+fn prose_has(text: &str, phrase: &str) -> bool {
+    const ENDINGS: &[&str] = &["", "s", "es", "ed", "d", "ing"];
+    let bytes = text.as_bytes();
+    let mut from = 0;
+    while let Some(pos) = text[from..].find(phrase) {
+        let i = from + pos;
+        let j = i + phrase.len();
+        let starts_word = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
+        let tail: String = text[j..].chars().take_while(|c| c.is_ascii_alphabetic()).collect();
+        // "sitting", "dropped": a doubled last consonant before -ing / -ed
+        let doubled = phrase.chars().last().is_some_and(|c| tail.starts_with(c) && ENDINGS.contains(&&tail[c.len_utf8()..]));
+        if starts_word && (ENDINGS.contains(&tail.as_str()) || doubled) {
+            return true;
+        }
+        from = i + 1;
+        while from < text.len() && !text.is_char_boundary(from) {
+            from += 1;
+        }
+    }
+    false
+}
+
 pub fn extract_tags_from_prose(prose: &str) -> Vec<&'static str> {
-    let lower = prose.to_lowercase();
-    if lower.trim().is_empty() {
+    let raw = prose.to_lowercase();
+    if raw.trim().is_empty() {
         return Vec::new();
     }
+    // Clauses that negate ("no keyhole cutout is visible", "she is not wearing garter straps") are left
+    // out: vision models answer checklists item by item, and every "no X" used to become the tag X.
+    let clauses: Vec<&str> = raw
+        .split(|c| matches!(c, '.' | ';' | ',' | '\n' | '!' | '?' | ':'))
+        .flat_map(|c| c.split(" but "))
+        .filter(|c| !clause_is_negated(c))
+        .collect();
+    let lower = clauses.join(". ");
+    // the few rules that are about an absence read the full text
+    let raw_has = |phrase: &str| prose_has(&raw, phrase);
+    // Whole words only (with common endings): plain substring matching turned "reference sheet"
+    // into a bedroom, "outfit" into athletic, "clamp" into a lamp and "visible" into sitting.
+    let has = |phrase: &str| prose_has(&lower, phrase);
     let mut out: Vec<&'static str> = Vec::new();
     let mut push = |t: &'static str| {
         if !out.contains(&t) {
@@ -306,102 +364,102 @@ pub fn extract_tags_from_prose(prose: &str) -> Vec<&'static str> {
     };
 
     // Scene & surface grounding
-    if lower.contains("bedroom") || lower.contains("bed") || lower.contains("mattress") || lower.contains("sheet") {
+    if has("bedroom") || has("bed") || has("mattress") || has("bed sheet") || has("bedsheet") {
         push("indoor");
         push("bedroom");
-        if lower.contains("sit") || lower.contains("seated") || lower.contains("sits") {
+        if has("sit") || has("seated") || has("sits") {
             push("sitting on bed");
         }
     }
-    if lower.contains("soft light") || lower.contains("soft ambient") || lower.contains("warm light") {
+    if has("soft light") || has("soft ambient") || has("warm light") {
         push("soft lighting");
     }
-    if lower.contains("depth of field") || lower.contains("shallow focus") || lower.contains("bokeh") {
+    if has("depth of field") || has("shallow focus") || has("bokeh") {
         push("depth of field");
     }
-    if lower.contains("dynamic angle") || lower.contains("low angle") || lower.contains("foreshorten") {
+    if has("dynamic angle") || has("low angle") || has("foreshorten") {
         push("dynamic angle");
     }
 
     // Skeletal posture & active prop/stocking interactions
-    if lower.contains("lean") && lower.contains("back") {
+    if has("lean") && has("back") {
         push("leaning back");
     }
-    if (lower.contains("knee") && (lower.contains("raised") || lower.contains("up") || lower.contains("high") || lower.contains("bent")))
-        || lower.contains("raised leg")
-        || lower.contains("leg lift")
+    if (has("knee") && (has("raised") || has("up") || has("high") || has("bent")))
+        || has("raised leg")
+        || has("leg lift")
     {
         push("one knee up");
         push("leg lift");
     }
-    if (lower.contains("pull") || lower.contains("adjust") || lower.contains("tug"))
-        && (lower.contains("stocking") || lower.contains("thigh-high") || lower.contains("thighhigh") || lower.contains("legwear") || lower.contains("sock"))
+    if (has("pull") || has("adjust") || has("tug"))
+        && (has("stocking") || has("thigh-high") || has("thighhigh") || has("legwear") || has("sock"))
     {
         push("white thighhighs");
         push("pulling up stocking");
         push("hands on legs");
         push("adjusting clothes");
     }
-    if lower.contains("bare foot") || lower.contains("barefoot") || lower.contains("bare feet") || lower.contains("no shoes") || lower.contains("unshod") {
+    if has("bare foot") || has("barefoot") || has("bare feet") || raw_has("no shoes") || has("unshod") {
         push("bare foot");
     }
-    if lower.contains("looking at the viewer") || lower.contains("looking at viewer") || lower.contains("looks at the camera") || lower.contains("direct gaze") {
+    if has("looking at the viewer") || has("looking at viewer") || has("looks at the camera") || has("direct gaze") {
         push("looking at viewer");
     }
 
     // Body shape, build, and proportions
-    let has_closed_top = lower.contains("tube top")
-        || lower.contains("turtleneck")
-        || lower.contains("high collar")
-        || lower.contains("closed neckline")
-        || lower.contains("covered chest")
-        || lower.contains("no cleavage");
-    let has_confirmed_cleavage = (lower.contains("cleavage")
-        || lower.contains("plunging neckline")
-        || lower.contains("deep neckline")
-        || lower.contains("open neckline")
-        || lower.contains("exposed cleavage"))
+    let has_closed_top = has("tube top")
+        || has("turtleneck")
+        || has("high collar")
+        || has("closed neckline")
+        || has("covered chest")
+        || raw_has("no cleavage");
+    let has_confirmed_cleavage = (has("cleavage")
+        || has("plunging neckline")
+        || has("deep neckline")
+        || has("open neckline")
+        || has("exposed cleavage"))
         && !has_closed_top;
 
-    if lower.contains("curvy") || lower.contains("hourglass") || lower.contains("voluptuous") {
+    if has("curvy") || has("hourglass") || has("voluptuous") {
         push("curvy");
         push("hourglass figure");
     }
-    if lower.contains("athletic") || lower.contains("fit") || lower.contains("toned") || lower.contains("muscular") {
+    if has("athletic") || has("toned") || has("muscular") {
         push("athletic");
         push("fit");
         push("toned");
     }
-    if lower.contains("slender") || lower.contains("slim") || lower.contains("skinny") {
+    if has("slender") || has("slim") || has("skinny") {
         push("slender");
         push("narrow waist");
     }
-    if lower.contains("chubby") || lower.contains("plump") {
+    if has("chubby") || has("plump") {
         push("chubby");
         push("soft chubby");
     }
-    if lower.contains("wide hip") || lower.contains("broad hip") {
+    if has("wide hip") || has("broad hip") {
         push("wide hips");
     }
-    if lower.contains("thick thigh") || lower.contains("thick leg") {
+    if has("thick thigh") || has("thick leg") {
         push("thick thighs");
     }
-    if lower.contains("narrow waist") || lower.contains("small waist") || lower.contains("tiny waist") {
+    if has("narrow waist") || has("small waist") || has("tiny waist") {
         push("narrow waist");
     }
-    if lower.contains("flat chest") || lower.contains("flat-chested") {
+    if has("flat chest") || has("flat-chested") {
         push("flat chest");
-    } else if lower.contains("small breast") || lower.contains("small chest") || lower.contains("petite breast") {
+    } else if has("small breast") || has("small chest") || has("petite breast") {
         push("small breasts");
-    } else if lower.contains("medium breast") || lower.contains("moderate breast") {
+    } else if has("medium breast") || has("moderate breast") {
         push("medium breasts");
-    } else if lower.contains("enormous") || lower.contains("gigantic") || lower.contains("massive") {
+    } else if (has("enormous") || has("gigantic") || has("massive")) && (has("breast") || has("chest") || has("bust")) {
         push("enormous breast size");
         push("huge breasts");
         if has_confirmed_cleavage {
             push("cleavage");
         }
-    } else if lower.contains("huge breast") || lower.contains("large breast") || lower.contains("big breast") || lower.contains("busty") {
+    } else if has("huge breast") || has("large breast") || has("big breast") || has("busty") {
         push("large breasts");
         if has_confirmed_cleavage {
             push("cleavage");
@@ -410,208 +468,216 @@ pub fn extract_tags_from_prose(prose: &str) -> Vec<&'static str> {
     if has_confirmed_cleavage {
         push("cleavage");
     }
-    if lower.contains("sideboob") {
+    if has("sideboob") {
         push("sideboob");
     }
-    if lower.contains("underboob") {
+    if has("underboob") {
         push("underboob");
     }
-    if lower.contains("keyhole") {
+    if has("keyhole") {
         push("keyhole");
     }
-    if lower.contains("off shoulder") || lower.contains("bare shoulders") {
+    if has("off shoulder") || has("bare shoulders") {
         push("off shoulder");
         push("bare shoulders");
     }
 
     // Character hair, skin, headwear, hairpins, and wardrobe
-    if lower.contains("fair skin") || lower.contains("pale skin") || lower.contains("light skin") {
+    if has("fair skin") || has("pale skin") || has("light skin") {
         push("fair skin");
     }
-    if lower.contains("black hair") || lower.contains("dark hair") {
+    if has("black hair") || has("dark hair") {
         push("black hair");
     }
-    if lower.contains("long hair") || lower.contains("long black hair") || lower.contains("long dark hair") {
+    if has("long hair") || has("long black hair") || has("long dark hair") {
         push("long hair");
     }
-    if lower.contains("messy hair") || lower.contains("tousled") || lower.contains("loose strands") {
+    if has("messy hair") || has("tousled") || has("loose strands") {
         push("messy hair");
     }
-    if lower.contains("dark eyes") || lower.contains("brown eyes") {
+    if has("dark eyes") || has("brown eyes") {
         push("dark eyes");
     }
-    if lower.contains("sunglasses") && (lower.contains("head") || lower.contains("top") || lower.contains("resting") || lower.contains("perched") || lower.contains("hair")) {
+    // only when they are worn up there, not merely mentioned next to the word "hair" or "head"
+    if has("sunglasses")
+        && (has("on her head") || has("on his head") || has("on head") || has("on top of her head") || has("in her hair")
+            || has("perched") || has("resting on") || has("pushed up"))
+    {
         push("sunglasses on head");
         push("eyewear on head");
     }
 
     // Specific hairpins, ornaments, and accessories
-    if lower.contains("flower hairpin") || lower.contains("flower hair ornament") || lower.contains("hair flower") {
+    if has("flower hairpin") || has("flower hair ornament") || has("hair flower") {
         push("flower hair ornament");
-    } else if lower.contains("butterfly hair ornament") || lower.contains("butterfly hairpin") {
+    } else if has("butterfly hair ornament") || has("butterfly hairpin") {
         push("butterfly hair ornament");
-    } else if lower.contains("star hair ornament") {
+    } else if has("star hair ornament") {
         push("star hair ornament");
-    } else if lower.contains("heart hair ornament") {
+    } else if has("heart hair ornament") {
         push("heart hair ornament");
-    } else if lower.contains("x hair ornament") {
+    } else if has("x hair ornament") {
         push("x hair ornament");
-    } else if lower.contains("hairclip") || lower.contains("hair clip") {
+    } else if has("hairclip") || has("hair clip") {
         push("hairclip");
-    } else if lower.contains("hair ribbon") || lower.contains("hair bow") {
+    } else if has("hair ribbon") || has("hair bow") {
         push("hair ribbon");
         push("hair bow");
-    } else if lower.contains("hairpin") {
+    } else if has("hairpin") {
         push("hairpin");
-    } else if lower.contains("hairband") || lower.contains("headband") {
+    } else if has("hairband") || has("headband") {
         push("hairband");
-    } else if lower.contains("scrunchie") {
+    } else if has("scrunchie") {
         push("scrunchie");
-    } else if lower.contains("tiara") {
+    } else if has("tiara") {
         push("tiara");
-    } else if lower.contains("crown") {
+    } else if has("crown") {
         push("crown");
-    } else if lower.contains("maid headdress") || lower.contains("headdress") {
+    } else if has("maid headdress") || has("headdress") {
         push("maid headdress");
     }
-    if lower.contains("earring") || lower.contains("earrings") {
+    if has("earring") || has("earrings") {
         push("earrings");
     }
-    if lower.contains("choker") {
+    if has("choker") {
         push("choker");
     }
-    if lower.contains("necklace") {
+    if has("necklace") {
         push("necklace");
     }
 
     // Held items and hand actions
-    if lower.contains("holding phone") || lower.contains("holding cellphone") || lower.contains("holding smartphone") || lower.contains("holding mobile") {
+    if has("holding phone") || has("holding cellphone") || has("holding smartphone") || has("holding mobile") {
         push("holding phone");
-    } else if lower.contains("holding cup") || lower.contains("holding mug") || lower.contains("holding teacup") {
+    } else if has("holding cup") || has("holding mug") || has("holding teacup") {
         push("holding cup");
-    } else if lower.contains("holding drink") || lower.contains("holding glass") || lower.contains("holding bottle") {
+    } else if has("holding drink") || has("holding glass") || has("holding bottle") {
         push("holding drink");
-    } else if lower.contains("holding book") {
+    } else if has("holding book") {
         push("holding book");
-    } else if lower.contains("holding umbrella") || lower.contains("holding parasol") {
+    } else if has("holding umbrella") || has("holding parasol") {
         push("holding umbrella");
-    } else if lower.contains("holding bag") || lower.contains("holding handbag") {
+    } else if has("holding bag") || has("holding handbag") {
         push("holding bag");
-    } else if lower.contains("holding sword") || lower.contains("holding blade") || lower.contains("holding katana") {
+    } else if has("holding sword") || has("holding blade") || has("holding katana") {
         push("holding sword");
-    } else if lower.contains("holding weapon") || lower.contains("holding gun") {
+    } else if has("holding weapon") || has("holding gun") {
         push("holding weapon");
-    } else if lower.contains("holding staff") || lower.contains("holding wand") {
+    } else if has("holding staff") || has("holding wand") {
         push("holding staff");
-    } else if lower.contains("holding fan") {
+    } else if has("holding fan") {
         push("holding fan");
-    } else if lower.contains("holding flower") || lower.contains("holding bouquet") {
+    } else if has("holding flower") || has("holding bouquet") {
         push("holding flower");
-    } else if lower.contains("holding food") {
+    } else if has("holding food") {
         push("holding food");
-    } else if lower.contains("holding plushie") || lower.contains("holding doll") {
+    } else if has("holding plushie") || has("holding doll") {
         push("holding plushie");
-    } else if lower.contains("holding camera") {
+    } else if has("holding camera") {
         push("holding camera");
-    } else if lower.contains("holding microphone") {
+    } else if has("holding microphone") {
         push("holding microphone");
     }
 
     // Hand gestures and pose anchors
-    if lower.contains("hand on hip") || lower.contains("hands on hips") {
+    if has("hand on hip") || has("hands on hips") {
         push("hand on hip");
     }
-    if lower.contains("hands on knees") || lower.contains("hand on knee") || lower.contains("hands on legs") {
+    if has("hands on knees") || has("hand on knee") || has("hands on legs") {
         push("hands on knees");
     }
-    if lower.contains("arms up") {
+    if has("arms up") {
         push("arms up");
     }
-    if lower.contains("crossed arms") || lower.contains("arms crossed") {
+    if has("crossed arms") || has("arms crossed") {
         push("crossed arms");
     }
-    if lower.contains("peace sign") || lower.contains("v sign") {
+    if has("peace sign") || has("v sign") {
         push("peace sign");
         push("v");
     }
 
     // Footwear, legwear, and straps
-    if lower.contains("o-ring") && (lower.contains("strap") || lower.contains("thigh")) {
+    if has("o-ring") && (has("strap") || has("thigh")) {
         push("o-ring thigh strap");
-    } else if lower.contains("thigh strap") {
+    } else if has("thigh strap") {
         push("thigh strap");
     }
-    if lower.contains("garter strap") || lower.contains("garter belt") {
+    if has("garter strap") || has("garter belt") {
         push("garter straps");
     }
-    if lower.contains("white shoe") || lower.contains("white sneakers") {
+    if has("white shoe") || has("white sneakers") {
         push("white shoes");
-    } else if lower.contains("shoe") || lower.contains("sneaker") {
+    } else if has("shoe") || has("sneaker") {
         push("shoes");
-    } else if lower.contains("boot") || lower.contains("boots") {
+    } else if has("boot") || has("boots") {
         push("boots");
-    } else if lower.contains("heel") || lower.contains("high heels") {
+    } else if has("heel") || has("high heels") {
         push("high heels");
-    } else if lower.contains("sandal") || lower.contains("sandals") {
+    } else if has("sandal") || has("sandals") {
         push("sandals");
     }
-    if lower.contains("white sock") || lower.contains("white socks") {
+    if has("white sock") || has("white socks") {
         push("white socks");
     }
 
     // Environmental plants and concrete objects
-    if lower.contains("potted plant") || lower.contains("houseplant") {
+    if has("potted plant") || has("houseplant") {
         push("potted plant");
-    } else if lower.contains("plant") && !lower.contains("plantation") {
+    } else if has("plant") && !has("plantation") {
         push("plant");
     }
-    if lower.contains("flower") && !lower.contains("flower hair") && !lower.contains("holding flower") {
+    if has("flower") && !has("flower hair") && !has("holding flower") {
         push("flower");
     }
-    if lower.contains("vase") {
+    if has("vase") {
         push("vase");
     }
-    if lower.contains("window") {
+    if has("window") {
         push("window");
     }
-    if lower.contains("curtain") || lower.contains("curtains") {
+    if has("curtain") || has("curtains") {
         push("curtains");
     }
-    if lower.contains("lamp") || lower.contains("lantern") {
+    if has("lamp") || has("lantern") {
         push("lamp");
     }
-    if lower.contains("chair") || lower.contains("armchair") {
+    if has("chair") || has("armchair") {
         push("chair");
     }
-    if lower.contains("couch") || lower.contains("sofa") {
+    if has("couch") || has("sofa") {
         push("couch");
     }
-    if lower.contains("table") || lower.contains("desk") {
+    if has("table") || has("desk") {
         push("table");
     }
-    if lower.contains("bookshelf") || lower.contains("bookcase") {
+    if has("bookshelf") || has("bookcase") {
         push("bookshelf");
     }
-    if lower.contains("mirror") {
+    if has("mirror") {
         push("mirror");
     }
-    if lower.contains("clock") {
+    if has("clock") {
         push("clock");
     }
-    if (lower.contains("tube top") || lower.contains("crop top") || lower.contains("camisole") || lower.contains("tank top") || lower.contains("bikini top"))
-        && (lower.contains("light blue") || lower.contains("pale blue") || lower.contains("baby blue") || lower.contains("blue"))
-    {
+    // a light blue top only when one clause says so ("a light blue crop top"), not any top plus
+    // "blue" anywhere (a blue jacket made every orange crop top light blue)
+    let light_blue_top = clauses.iter().any(|c| {
+        ["tube top", "crop top", "camisole", "tank top", "bikini top"].iter().any(|t| prose_has(c, t))
+            && ["light blue", "pale blue", "baby blue"].iter().any(|b| prose_has(c, b))
+    });
+    if light_blue_top {
         push("light blue tube top");
     }
-    if lower.contains("logo") || lower.contains("print") || lower.contains("text on") || lower.contains("clothes writing") || lower.contains("patterned") {
+    if has("logo") || has("print") || has("text on") || has("clothes writing") || has("patterned") {
         push("print shirt");
         push("text on clothes");
     }
-    if lower.contains("skin-tight") || lower.contains("skintight") || lower.contains("form-fitting") || lower.contains("taut") || lower.contains("tight") {
+    if has("skin-tight") || has("skintight") || has("form-fitting") || has("taut") || has("tight") {
         push("impossible clothes");
         push("taut clothes");
     }
-    if lower.contains("bikini bottom") || lower.contains("matching bottom") || lower.contains("matching bikini") {
+    if has("bikini bottom") || has("matching bottom") || has("matching bikini") {
         push("light blue bikini bottoms");
     }
 
@@ -863,4 +929,43 @@ mod tests {
         assert!(!result.contains("garter"));
         assert!(!result.contains("freckles"));
     }
+    #[test]
+    fn prose_keywords_match_whole_words_only() {
+        // what the image tests got wrong: "reference sheet" -> bedroom, "outfit" -> athletic,
+        // "clamp" -> lamp, "massive tail" -> huge breasts, "headband" -> sunglasses on head
+        let wrong = extract_tags_from_prose(
+            "A character design reference sheet. Her outfit is visible from the back view, with a massive bushy tail, \
+             a hair clamp, a headband and sunglasses in her bag. An outfitted adventurer in a plantation.",
+        );
+        for bad in ["bedroom", "sitting on bed", "athletic", "fit", "lamp", "huge breasts", "sunglasses on head", "plant", "leaning back"] {
+            assert!(!wrong.contains(&bad), "invented {bad:?} from {wrong:?}");
+        }
+        // real matches still work, word endings included
+        let right = extract_tags_from_prose(
+            "She sits on the bed, leaning back, sunglasses resting on her head. Toned build, gigantic breasts, \
+             black boots, earrings, a potted plant by the window and a lamp on the table.",
+        );
+        for good in ["bedroom", "sitting on bed", "leaning back", "sunglasses on head", "athletic", "huge breasts", "boots", "earrings", "potted plant", "window", "lamp", "table"] {
+            assert!(right.contains(&good), "missed {good:?} in {right:?}");
+        }
+        assert!(prose_has("she is sitting down", "sit") && prose_has("two lamps", "lamp"));
+        assert!(!prose_has("clearly visible", "sit") && !prose_has("an outfit", "fit") && !prose_has("a clamp", "lamp"));
+    }
+
+    #[test]
+    fn negated_checklist_answers_add_no_tags() {
+        // how the vision model answers the zone checklist, from the raccoon-girl test image
+        let tags = extract_tags_from_prose(
+            "Orange crop top with buttons. No keyhole cutout is visible, and there is no sideboob. \
+             She is not wearing garter straps. A blue jacket hangs off her shoulders.",
+        );
+        for bad in ["keyhole", "sideboob", "garter straps", "light blue tube top"] {
+            assert!(!tags.contains(&bad), "{bad:?} from a negation or a stray 'blue': {tags:?}");
+        }
+        // what really is there still counts, and the rules that are about an absence still work
+        assert!(extract_tags_from_prose("She wears a light blue crop top.").contains(&"light blue tube top"));
+        assert!(extract_tags_from_prose("She stands with no shoes on.").contains(&"bare foot"));
+        assert!(extract_tags_from_prose("A clear keyhole cutout on her top.").contains(&"keyhole"));
+    }
+
 }

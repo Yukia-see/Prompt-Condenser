@@ -37,9 +37,11 @@ pub const GEMMA_TEMPERATURE: f32 = 0.10;
 /// Pass these to your WD14 tagger; this module only receives the tag string.
 pub const WD14_GENERAL_THRESHOLD: f32 = 0.22;
 pub const WD14_CHARACTER_THRESHOLD: f32 = 0.85;
-/// 128K, the context the model page lists for the 12b tag. Input is only ~1.5K
-/// tokens, so lower this (8192 or 16384) if the GPU runs short of memory.
-pub const GEMMA_CONTEXT_WINDOW: u32 = 131_072;
+/// The model supports 128K, but the input is only ~1.5K tokens and every extra token of
+/// context costs KV-cache memory (shared with the system on the BC-250, and on a LAN
+/// server this request decides how much memory Ollama reserves). 16K matches the app's
+/// other calls.
+pub const GEMMA_CONTEXT_WINDOW: u32 = 16_384;
 pub const GEMMA_MAX_TOKENS: u32 = 768;
 pub const GEMMA_MAX_TOKENS_RETRY: u32 = 1024;
 pub const VLM_RETRIES: u32 = 1;
@@ -270,7 +272,7 @@ pub const MODE_A_PASS1_KEYWORDS: &[&str] = &[
 ];
 pub const MODE_B_PASS1_PROMPT: &str = "Analyze physical space and skeletal pose. Ignore clothing, face, and body thickness. 6 zones: 1. Scene & Lighting 2. Camera & Depth 3. Center of Gravity & Stance 4. Torso & Head Alignment 5. Limb Positioning 6. Environmental Anchors Format each zone on its own line exactly as 'N. Zone name: text'. Plain text only, no markdown.";
 pub const MODE_B_PASS2_PROMPT: &str = "Analyze physical body proportions, facial identity, and wardrobe. Ignore environment and underlying pose mechanics. 6 zones: 1. Head & Face 2. Upper Body Proportions & Clothing 3. Lower Body Proportions & Clothing 4. Legwear & Footwear 5. Skin & Fabric Physics 6. Accessories & Props Format each zone on its own line exactly as 'N. Zone name: text'. Plain text only, no markdown.";
-pub const MODE_B_LLM_INSTRUCTION: &str = "Merge 'Scene & Pose' (Pass 1) with 'Character & Body Shape' (Pass 2). Map the proportions and clothing from Pass 2 onto the pose from Pass 1 without inventing proportions that are not in the input. Place environment, lighting, camera and pose in scene_prompt. Place face, hair, body proportions, clothing and props in character_prompt. The tag lists have already been converted to WD-style tags and reconciled (WD14 wins on attributes such as colors, Moondream wins on pose and camera): treat them as ground truth and use the blueprints only for detail the tags lack. Output Danbooru-style tags only. Output valid JSON with exactly two keys: \"scene_prompt\" and \"character_prompt\". Both values must be single strings of comma-separated tags. No markdown, no commentary.";
+pub const MODE_B_LLM_INSTRUCTION: &str = "Merge 'Scene & Pose' (Pass 1) with 'Character & Body Shape' (Pass 2). Map the proportions and clothing from Pass 2 onto the pose from Pass 1 without inventing proportions that are not in the input. Place environment, lighting and camera in scene_prompt. Place face, hair, body proportions, clothing, props and the skeletal pose in character_prompt (the pose belongs to the character, so it never becomes shared scene). The tag lists have already been converted to WD-style tags and reconciled (WD14 wins on attributes such as colors, Moondream wins on pose and camera): treat them as ground truth and use the blueprints only for detail the tags lack. Output Danbooru-style tags only. Output valid JSON with exactly two keys: \"scene_prompt\" and \"character_prompt\". Both values must be single strings of comma-separated tags. No markdown, no commentary.";
 pub const MODE_B_PASS1_KEYWORDS: &[&str] = &[
     "all fours",
     "alley",
@@ -2054,6 +2056,90 @@ pub fn try_parse_gemma_json(raw: &str) -> Option<(String, String)> {
     }
 }
 
+/// Reads the string value of `"key": "..."` from a reply that may be cut off or not valid JSON.
+/// Returns the text up to the closing quote, or to the end of the reply when it was cut off
+/// (then `.1` is false, and the last, probably unfinished, tag is dropped by the caller).
+fn partial_json_string(text: &str, key: &str) -> Option<(String, bool)> {
+    let at = text.find(&format!("\"{key}\""))?;
+    let rest = &text[at + key.len() + 2..];
+    let rest = rest.trim_start().strip_prefix(':')?.trim_start().strip_prefix('"')?;
+    let mut out = String::new();
+    let mut chars = rest.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => return Some((out, true)),
+            '\\' => match chars.next() {
+                Some('n') | Some('t') => out.push(' '),
+                Some(o) => out.push(o),
+                None => {}
+            },
+            _ => out.push(c),
+        }
+    }
+    Some((out, false))
+}
+
+/// Keeps what a cut-off or slightly malformed reply did write: the complete tags of
+/// `character_prompt` (and `scene_prompt` when it finished). `None` when fewer than 3 tags survive.
+pub fn salvage_gemma_reply(raw: &str) -> Option<(String, String)> {
+    let text = strip_fences(raw);
+    let complete_tags = |(value, closed): (String, bool)| -> String {
+        let mut tags: Vec<&str> = value.split(',').map(str::trim).filter(|t| !t.is_empty()).collect();
+        if !closed {
+            tags.pop(); // the tag the reply stopped in
+        }
+        let mut seen = std::collections::HashSet::new();
+        tags.retain(|t| seen.insert(t.to_lowercase())); // a looping reply repeats its tags
+        tags.join(", ")
+    };
+    let character = complete_tags(partial_json_string(&text, "character_prompt")?);
+    if character.split(',').filter(|t| !t.trim().is_empty()).count() < 3 {
+        return None;
+    }
+    let scene = partial_json_string(&text, "scene_prompt")
+        .filter(|(_, closed)| *closed)
+        .map(complete_tags)
+        .unwrap_or_default();
+    Some((scene, character))
+}
+
+/// True when a reply repeats the same tags over and over (a generation loop): at least 5 tags
+/// in its character list are copies of an earlier one. A larger token cap can't finish such a reply.
+pub fn looks_like_a_loop(text: &str) -> bool {
+    let body = match text.find("character_prompt") {
+        Some(i) => &text[i..],
+        None => text,
+    };
+    let mut seen = std::collections::HashSet::new();
+    let mut repeats = 0;
+    for tag in body.split(',') {
+        let t = tag.trim().trim_matches(|c: char| c == '"' || c == '{' || c == '}' || c == ':').to_lowercase();
+        let t = t.trim_start_matches("character_prompt").trim_matches(|c: char| c == '"' || c == ':' || c == ' ').to_string();
+        if !t.is_empty() && !seen.insert(t) {
+            repeats += 1;
+        }
+    }
+    repeats >= 5
+}
+
+/// Why `try_parse_gemma_json` gave nothing usable, for the warning shown to the user.
+fn gemma_failure_reason(reply: &GemmaReply) -> String {
+    let raw = reply.text.trim();
+    let why = if raw.is_empty() {
+        "the model returned nothing".to_string()
+    } else if gemma_truncated(reply) && (reply.finish_reason.is_some() || raw.contains('{')) {
+        // cut off for real: the server said "length", or a JSON object was started and never closed
+        // (a reply with no `{` at all is plain text, reported as "not JSON" below)
+        "the reply was cut off before any tags were complete".to_string()
+    } else if try_parse_gemma_json(raw).is_some() {
+        "character_prompt was empty".to_string()
+    } else {
+        let head: String = raw.chars().take(60).collect::<String>().replace('\n', " ");
+        format!("the reply was not JSON, it began: {head}")
+    };
+    format!("Gemma output unusable ({why}); used the mechanical merge")
+}
+
 /// Never fails; on bad output returns a best-effort fallback.
 pub fn parse_gemma_json_response(raw: &str, cfg: &Config) -> Prompts {
     if let Some((scene, character)) = try_parse_gemma_json(raw) {
@@ -2112,18 +2198,40 @@ pub fn ollama_chat_request_body(
     image_b64: Option<&str>,
     json_mode: bool,
 ) -> String {
+    ollama_chat_request_body_with(model, text, temperature, num_ctx, num_predict, image_b64, json_mode, None, None)
+}
+
+/// Like `ollama_chat_request_body`, with Ollama's `think` switch (`Some(false)` turns
+/// thinking off for models that support it). `None` leaves the field out, which is
+/// byte-for-byte what `ollama_chat_request_body` always produced.
+#[allow(clippy::too_many_arguments)]
+pub fn ollama_chat_request_body_with(
+    model: &str,
+    text: &str,
+    temperature: f32,
+    num_ctx: u32,
+    num_predict: u32,
+    image_b64: Option<&str>,
+    json_mode: bool,
+    think: Option<bool>,
+    repeat_penalty: Option<f32>,
+) -> String {
     let images = image_b64
         .map(|b| format!(",\"images\":[\"{}\"]", json::escape(b)))
         .unwrap_or_default();
     let format = if json_mode { ",\"format\":\"json\"" } else { "" };
+    let think = think.map(|t| format!("\"think\":{t},")).unwrap_or_default();
+    let repeat = repeat_penalty.map(|r| format!(",\"repeat_penalty\":{r}")).unwrap_or_default();
     format!(
-        "{{\"model\":\"{}\",\"messages\":[{{\"role\":\"user\",\"content\":\"{}\"{}}}],\"stream\":false,\"options\":{{\"temperature\":{},\"num_ctx\":{},\"num_predict\":{}}}{}}}",
+        "{{\"model\":\"{}\",\"messages\":[{{\"role\":\"user\",\"content\":\"{}\"{}}}],\"stream\":false,{}\"options\":{{\"temperature\":{},\"num_ctx\":{},\"num_predict\":{}{}}}{}}}",
         json::escape(model),
         json::escape(text),
         images,
+        think,
         temperature,
         num_ctx,
         num_predict,
+        repeat,
         format
     )
 }
@@ -2182,6 +2290,7 @@ fn valid_vlm(text: &str) -> bool {
 }
 
 #[inline]
+#[allow(dead_code)] // old name kept for the Python-parity API
 fn valid_moondream(text: &str) -> bool {
     valid_vlm(text)
 }
@@ -2210,6 +2319,7 @@ fn run_vlm(
 }
 
 #[inline]
+#[allow(dead_code)] // old name kept for the Python-parity API
 fn run_moondream(
     vlm: &VlmFn<'_>,
     prompt: &str,
@@ -2305,8 +2415,8 @@ pub fn run_dual_pass(
             return mechanical(Some(format!("Gemma call failed ({}); used the mechanical merge", e)), warnings)
         }
     };
-    if gemma_truncated(&reply) {
-        // One retry with a higher cap. A still-truncated reply fails to parse below
+    if gemma_truncated(&reply) && !looks_like_a_loop(&reply.text) {
+        // One retry with a higher cap (not for a reply that is looping: more room only makes it longer). A still-truncated reply fails to parse below
         // and ends up in the "output unusable" fallback.
         reply = match call(cfg.gemma_max_tokens_retry) {
             Ok(r) => r,
@@ -2325,7 +2435,20 @@ pub fn run_dual_pass(
             character_prompt: style_tags(&character, cfg.escape_parentheses),
             warnings,
         },
-        _ => mechanical(Some("Gemma output unusable; used the mechanical merge".to_string()), warnings),
+        _ => match salvage_gemma_reply(&reply.text) {
+            Some((scene, character)) => {
+                warnings.push("Gemma reply was cut off or malformed; kept its complete tags".to_string());
+                PipelineResult {
+                    scene_prompt: style_tags(
+                        &if scene.is_empty() { cfg.quality_prefix.clone() } else { scene },
+                        cfg.escape_parentheses,
+                    ),
+                    character_prompt: style_tags(&character, cfg.escape_parentheses),
+                    warnings,
+                }
+            }
+            None => mechanical(Some(gemma_failure_reason(&reply)), warnings),
+        },
     }
 }
 
@@ -2464,19 +2587,20 @@ pub fn merge_crop_tags(
     );
 
     let mut out: Vec<(String, f32)> = base_tags.to_vec();
+    // first position of each normalized tag (one table instead of a scan of `out` per crop tag)
+    let mut index: HashMap<String, usize> = HashMap::with_capacity(out.len());
+    for (i, (b_tag, _)) in out.iter().enumerate() {
+        index.entry(norm_tag(b_tag)).or_insert(i);
+    }
 
     for (c_tag, c_score) in filtered {
         let norm_c = norm_tag(&c_tag);
-        let mut found = false;
-        for (b_tag, b_score) in out.iter_mut() {
-            if norm_tag(b_tag) == norm_c {
-                *b_score = b_score.max(c_score);
-                found = true;
-                break;
+        match index.get(&norm_c) {
+            Some(&i) => out[i].1 = out[i].1.max(c_score),
+            None => {
+                index.insert(norm_c, out.len());
+                out.push((c_tag, c_score));
             }
-        }
-        if !found {
-            out.push((c_tag, c_score));
         }
     }
     out
@@ -2677,7 +2801,7 @@ mod tests {
     #[test]
     fn defaults() {
         assert_eq!(GEMMA_OLLAMA_MODEL, "huihui_ai/gemma-4-abliterated:12b");
-        assert_eq!(GEMMA_CONTEXT_WINDOW, 131072);
+        assert_eq!(GEMMA_CONTEXT_WINDOW, 16384);
         assert_eq!(GEMMA_MAX_TOKENS, 768);
         assert_eq!(GEMMA_MAX_TOKENS_RETRY, 1024);
     }
@@ -2737,6 +2861,55 @@ mod tests {
         assert_eq!(out.scene_prompt, expected.scene_prompt);
         assert_eq!(out.character_prompt, expected.character_prompt);
         assert!(!out.warnings.is_empty());
+    }
+
+    #[test]
+    fn cut_off_gemma_reply_keeps_its_complete_tags() {
+        // cut inside a tag of character_prompt: scene is complete, the unfinished tag is dropped
+        let cut = r#"{"scene_prompt":"indoors, bed","character_prompt":"1girl, solo, black hair, long ha"#;
+        let (scene, ch) = salvage_gemma_reply(cut).expect("salvaged");
+        assert_eq!(scene, "indoors, bed");
+        assert_eq!(ch, "1girl, solo, black hair");
+        // fenced, escaped quotes, newline in a value
+        let fenced = "```json\n{\"scene_prompt\": \"x\", \"character_prompt\": \"1girl, \\\"miu miu\\\", a\\nb, c\"\n";
+        assert!(salvage_gemma_reply(fenced).is_some());
+        // too little to keep
+        assert!(salvage_gemma_reply(r#"{"character_prompt":"1girl, so"#).is_none());
+        assert!(salvage_gemma_reply("total garbage").is_none());
+        // through the pipeline: the model's tags are used and a warning says so
+        let gemma = |_r: &GemmaRequest| reply(cut, Some("length"));
+        let out = run_dual_pass(WD, &opts(Mode::SceneShape, true, false), &Config::default(), None, &md_ok, Some(&gemma));
+        assert!(out.character_prompt.starts_with("1girl, solo, black hair"), "{}", out.character_prompt);
+        assert!(out.warnings.iter().any(|w| w.contains("kept its complete tags")), "{:?}", out.warnings);
+    }
+
+    #[test]
+    fn unusable_reply_warning_says_why() {
+        let w = |text: &str, fin: Option<&str>| {
+            let gemma = |_r: &GemmaRequest| reply(text, fin);
+            run_dual_pass(WD, &opts(Mode::SceneShape, true, false), &Config::default(), None, &md_ok, Some(&gemma)).warnings.join(" | ")
+        };
+        assert!(w("total garbage", None).contains("not JSON, it began: total garbage"));
+        assert!(w(r#"{"scene_prompt":"x","character_prompt":""}"#, None).contains("character_prompt was empty"));
+        assert!(w("", None).contains("returned nothing"));
+    }
+
+    #[test]
+    fn looping_replies_are_detected_and_deduplicated() {
+        let looping = r#"{"scene_prompt":"a","character_prompt":"1girl, long hair, short hair, long hair, short hair, long hair, short hair, long hair, short hair, long hair, short hair, long hair, short hair, long ha"#;
+        assert!(looks_like_a_loop(looping));
+        assert!(!looks_like_a_loop(r#"{"scene_prompt":"a","character_prompt":"1girl, long hair, blue eyes, smile, hat"}"#));
+        // a normal list with a couple of repeated words is not a loop
+        assert!(!looks_like_a_loop(r#"{"character_prompt":"1girl, hair, eyes, hair ribbon, eyes closed"}"#));
+        // the salvaged tags keep each one once
+        let (_, ch) = salvage_gemma_reply(looping).expect("salvaged");
+        assert_eq!(ch, "1girl, long hair, short hair");
+        // a looping, cut-off reply is not retried with a larger cap
+        let calls = std::cell::Cell::new(0);
+        let gemma = |_r: &GemmaRequest| { calls.set(calls.get() + 1); reply(looping, Some("length")) };
+        let out = run_dual_pass(WD, &opts(Mode::SceneShape, true, false), &Config::default(), None, &md_ok, Some(&gemma));
+        assert_eq!(calls.get(), 1);
+        assert_eq!(out.character_prompt, "1girl, long hair, short hair");
     }
 
     #[test]
@@ -2871,6 +3044,14 @@ mod tests {
             }
             other => panic!("bad messages: {:?}", other),
         }
+        // `think` is a real JSON field, valid in any position; without it nothing changes
+        let off = ollama_chat_request_body_with("m", "t", 0.1, 8192, 64, None, true, Some(false), Some(1.1));
+        let v = json::parse(&off).expect("valid JSON");
+        assert!(matches!(v.get("think"), Some(json::Value::Bool(false))));
+        assert_eq!(
+            ollama_chat_request_body_with("m", "t", 0.1, 8192, 64, None, true, None, None),
+            ollama_chat_request_body("m", "t", 0.1, 8192, 64, None, true)
+        );
         let no_img = ollama_chat_request_body("m", "t", 0.1, 8192, 64, None, false);
         assert!(!no_img.contains("images") && !no_img.contains("\"format\""));
 

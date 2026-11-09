@@ -98,6 +98,11 @@ struct Loaded {
 
 static MODEL: Mutex<Option<Loaded>> = Mutex::new(None);
 
+/// Frees the loaded detector (see `tagger::release`).
+pub fn release() {
+    *MODEL.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
 /// Finds the characters in an image, most confident first (coordinates in pixels).
 pub fn detect(img: &image::DynamicImage) -> Result<Vec<PersonBox>> {
     detect_at(img, THRESHOLD)
@@ -310,7 +315,7 @@ pub fn three_zone_crops(img: &image::DynamicImage, b: &PersonBox) -> Vec<(&'stat
             let label = match zb.name {
                 "Upper" => "Upper (Head, Hair & Face)",
                 "Middle" => "Middle (Torso, Neckline, Arms & Held Items)",
-                "Lower" => "Lower (Hips, Legs, Straps & Footwear)",
+                "Lower" => "Lower (Hips, Legs & Footwear)",
                 _ => zb.name,
             };
             let z_box = PersonBox {
@@ -348,6 +353,7 @@ pub fn quadrant_crops(img: &image::DynamicImage) -> [(&'static str, image::Dynam
 
 /// Returns a bounding box centered on a wrist position with a proportional margin
 /// (e.g. 18% of figure height, min 32px) clamped to image boundaries.
+#[allow(dead_code)] // not wired to the UI yet
 pub fn wrist_hand_box(
     wrist_x: f32,
     wrist_y: f32,
@@ -366,6 +372,7 @@ pub fn wrist_hand_box(
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize, PartialEq)]
+#[allow(dead_code)] // not wired to the UI yet
 pub struct OpenPosePerson {
     pub person_id: Vec<i32>,
     pub pose_keypoints_2d: Vec<f32>,
@@ -375,6 +382,7 @@ pub struct OpenPosePerson {
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
+#[allow(dead_code)] // not wired to the UI yet
 pub struct OpenPoseExport {
     pub version: f32,
     pub people: Vec<OpenPosePerson>,
@@ -382,6 +390,7 @@ pub struct OpenPoseExport {
     pub canvas_height: u32,
 }
 
+#[allow(dead_code)] // not wired to the UI yet
 pub fn export_openpose_json(
     people: &[OpenPosePerson],
     canvas_width: u32,
@@ -398,6 +407,7 @@ pub fn export_openpose_json(
 
 /// Synthesizes estimated 18-point OpenPose keypoints from a detected PersonBox
 /// using standard anime anatomical ratios when full skeleton detector is offline.
+#[allow(dead_code)] // not wired to the UI yet
 pub fn person_box_to_estimated_keypoints(b: &PersonBox) -> Vec<f32> {
     let w = b.x1 - b.x0;
     let h = b.y1 - b.y0;

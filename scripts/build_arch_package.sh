@@ -26,6 +26,9 @@ tar -C "$ROOT" \
   --exclude=./.git --exclude=./target --exclude=./dist \
   --exclude=./packaging/arch/src --exclude=./packaging/arch/pkg \
   --exclude='*.pkg.tar.zst' --exclude='./packaging/arch/*.tar.gz' \
+  --exclude=./docs/reports --exclude=./.agents --exclude=__pycache__ --exclude='*.zip' \
+  --exclude='./*.jpg' --exclude='./packaging/arch/*.jpg' --exclude='./packaging/arch/PROGRAM RESULT' \
+  --exclude='./Untitled Document' --exclude=./prompt_condenser.rs \
   --transform "s,^\.,$NAME-$VER," \
   -czf "$PKGDIR/$NAME-$VER.tar.gz" .
 
