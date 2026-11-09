@@ -1,0 +1,262 @@
+//! Part of `ai_engine`; see mod.rs.
+use super::*;
+
+pub(crate) const COLOR_WORDS: &[&str] = &[
+    "white", "black", "red", "blue", "green", "yellow", "orange", "pink", "purple", "brown", "grey", "gray", "silver",
+    "gold", "golden", "light", "dark", "pale", "navy", "beige", "cream", "teal", "aqua", "violet", "magenta", "crimson",
+];
+
+/// The tags the checklist form states reliably: framing (how much of the body, from which side),
+/// background and gaze. Deterministic, so they can't be forgotten by the writer (it kept dropping
+/// `cowboy shot` and the background color). The pose line is left to the writer: the form gets it wrong
+/// too often.
+pub fn tags_from_form(form: &str) -> Vec<String> {
+    // "LABEL: answer", where the answer may also continue on the following lines (bullets) up to
+    // the next "LABEL:" line
+    let lines: Vec<String> = form.lines().map(|l| l.trim().trim_start_matches(['*', '-', ' ']).replace("**", "")).collect();
+    let is_label = |l: &str| l.split_once(':').is_some_and(|(k, _)| !k.is_empty() && k.chars().all(|c| c.is_ascii_uppercase() || c == ' '));
+    let field = |name: &str| -> String {
+        let Some(i) = lines.iter().position(|l| l.to_uppercase().starts_with(&format!("{name}:"))) else { return String::new() };
+        let mut text = lines[i][name.len() + 1..].trim().to_string();
+        for l in lines.iter().skip(i + 1).take_while(|l| !is_label(l)) {
+            text.push(' ');
+            text.push_str(l);
+        }
+        text.trim().to_lowercase()
+    };
+    let has = |text: &str, w: &str| crate::danbooru::prose_has_pub(text, w);
+    let mut out: Vec<String> = Vec::new();
+    let framing = field("FRAMING");
+    if !framing.is_empty() {
+        let to = framing.rsplit(" to ").next().unwrap_or(&framing).to_string();
+        if has(&to, "feet") || has(&to, "toe") || has(&to, "shoe") || has(&framing, "full body") || has(&framing, "entire body") {
+            out.push("full body".into());
+        } else if has(&to, "thigh") || has(&to, "knee") || has(&to, "mid-thigh") {
+            out.push("cowboy shot".into());
+        } else if has(&to, "waist") || has(&to, "hip") || has(&to, "chest") {
+            out.push("upper body".into());
+        }
+        if has(&framing, "behind") || has(&framing, "back view") || has(&framing, "from the back") {
+            out.push("from behind".into());
+        } else if has(&framing, "side") || has(&framing, "profile") {
+            out.push("from side".into());
+        } else if has(&framing, "above") {
+            out.push("from above".into());
+        } else if has(&framing, "below") {
+            out.push("from below".into());
+        }
+    }
+    let background = field("BACKGROUND");
+    if !background.is_empty() {
+        if ["plain", "solid", "simple", "blank", "no specific", "nothing", "empty"].iter().any(|w| background.contains(w)) {
+            out.push("simple background".into());
+        }
+        if let Some(c) = ["grey", "gray", "white", "black", "blue", "pink", "yellow", "green", "red", "purple", "brown", "orange"]
+            .iter()
+            .find(|c| has(&background, c))
+        {
+            let c = if *c == "gray" { "grey" } else { c };
+            out.push(format!("{c} background"));
+        }
+    }
+    let gaze = field("GAZE AND EXPRESSION");
+    if has(&gaze, "over her shoulder") || has(&gaze, "over his shoulder") || has(&gaze, "over shoulder") || has(&gaze, "looking back") {
+        out.push("looking back".into());
+    }
+    if has(&gaze, "viewer") || has(&gaze, "camera") || has(&gaze, "looking forward") {
+        out.push("looking at viewer".into());
+    }
+    if has(&gaze, "smile") || has(&gaze, "smiling") {
+        out.push("smile".into());
+    }
+    out
+}
+
+/// Phrases models write that are no tag, mapped to the tag they mean ("" = drop it).
+pub(crate) fn phrase_to_tag(tag: &str) -> Option<&'static str> {
+    Some(match tag {
+        "standing sideways" | "side view" | "side profile" | "facing sideways" | "facing left" | "facing right" => "from side",
+        "back view" | "facing away" | "facing away from viewer" | "standing away from viewer" => "from behind",
+        "looking over shoulder" | "looking over her shoulder" => "looking back",
+        "curvy hips" | "broad hips" => "wide hips",
+        "medium length hair" | "medium-length hair" | "shoulder-length hair" | "shoulder length hair" => "medium hair",
+        "smiling" | "gentle smile" | "slight smile" => "smile",
+        "hands behind back" | "hands behind her back" => "arms behind back",
+        "plain background" => "simple background",
+        "off the shoulders" | "off the shoulder" | "off-shoulder" | "off shoulders" => "off shoulder",
+        "plain grey background" | "plain gray background" => "grey background",
+        "soft shadows" | "even lighting" | "athletic build" | "slim build" | "blue trim" | "visible tail" | "tail visible" => "",
+        _ => return None,
+    })
+}
+
+/// Checks each tag against the tagger's Danbooru list (`danbooru::local`, ~10,000 common tags): a known
+/// tag stays, a near miss is corrected (`fix`), a color / material / style word in front of a known tag
+/// stays (`black leather shorts`), a known phrase is mapped (`phrase_to_tag`), anything else multi-word
+/// is dropped. Without the list everything is kept.
+pub fn validate_tags(tags: Vec<String>) -> Vec<String> {
+    let Some(list) = crate::danbooru::local() else { return tags };
+    let mut out: Vec<String> = Vec::new();
+    for t in tags {
+        let l = t.to_lowercase();
+        // weights "(tag:1.2)", LoRAs and dynamic groups pass untouched; a "Name: tags" label does not count
+        if l.contains('<') || l.contains('{') || (l.contains('(') && l.contains(')')) {
+            out.push(t);
+            continue;
+        }
+        if let Some((label, rest)) = t.split_once(':') {
+            // "Nagi: black hair ponytail" -> "black hair ponytail" (the name is a label, not a tag)
+            if !label.contains(' ') && !rest.trim().is_empty() {
+                out.extend(validate_tags(vec![rest.trim().to_string()]));
+                continue;
+            }
+        }
+        if let Some(m) = phrase_to_tag(&l) {
+            if !m.is_empty() {
+                out.push(m.to_string());
+            }
+            continue;
+        }
+        if list.get(&l).is_some() || matches!(l.as_str(), "masterpiece" | "best quality" | "score 9" | "score 8 up" | "score 7 up") {
+            out.push(t);
+            continue;
+        }
+        if let Some(fixed) = list.fix(&l) {
+            out.push(fixed.name.clone());
+            continue;
+        }
+        // Unknown multi-word tags are kept: the tag list is only the ~10,000 most common tags, and
+        // descriptive ones ("white teal bikini top") are what Anima reads best. Dropping them emptied a
+        // whole prompt in testing. Only phrases about nothing visible go.
+        const NOT_VISUAL: &[&str] = &["visible", "build", "shadows", "trim", "tone", "tones", "accents", "expression", "vibe", "aesthetic"];
+        if !l.split_whitespace().any(|w| NOT_VISUAL.contains(&w)) {
+            out.push(t);
+        }
+    }
+    out
+}
+
+/// Splits a tag the writer ran together without commas ("blue jacket open jacket off the shoulders")
+/// into the known tags it is made of ("blue jacket", "open jacket", "off shoulder"). Only when the whole
+/// phrase is not a tag itself and every word is covered by known tags (or `phrase_to_tag` phrases), using
+/// as few pieces as possible, so descriptive tags ("very short black leather shorts") stay whole.
+pub fn split_merged_tags(tag: String) -> Vec<String> {
+    let Some(list) = crate::danbooru::local() else { return vec![tag] };
+    let l = tag.to_lowercase();
+    let words: Vec<&str> = l.split_whitespace().collect();
+    if words.len() < 4 || list.get(&l).is_some() || l.contains(['(', ':', '<', '{']) {
+        return vec![tag];
+    }
+    let piece = |i: usize, j: usize| -> Option<String> {
+        let p = words[i..j].join(" ");
+        if let Some(m) = phrase_to_tag(&p) {
+            return (!m.is_empty()).then(|| m.to_string());
+        }
+        list.get(&p).map(|t| t.name.clone())
+    };
+    // fewest pieces covering every word (pieces of 1-5 words)
+    let n = words.len();
+    let mut best: Vec<Option<Vec<String>>> = vec![None; n + 1];
+    best[0] = Some(Vec::new());
+    for j in 1..=n {
+        for i in j.saturating_sub(5)..j {
+            if let (Some(prev), Some(p)) = (best[i].clone(), piece(i, j)) {
+                let mut cand = prev;
+                cand.push(p);
+                if best[j].as_ref().is_none_or(|b| cand.len() < b.len()) {
+                    best[j] = Some(cand);
+                }
+            }
+        }
+    }
+    match best[n].take() {
+        Some(parts) if parts.len() >= 2 => parts,
+        _ => vec![tag],
+    }
+}
+
+/// Hair tags that contradict a "short hair with long locks" description (twintails, long hair): the
+/// tagger reads the long locks as twintails or long hair, and the writer copies both.
+pub fn drop_contradicted_hair(tags: Vec<String>) -> Vec<String> {
+    let lower: Vec<String> = tags.iter().map(|t| t.to_lowercase()).collect();
+    let short_with_locks = lower.iter().any(|t| t == "short hair with long locks")
+        || (lower.iter().any(|t| t == "short hair") && lower.iter().any(|t| t.contains("sidelocks")));
+    if !short_with_locks {
+        return tags;
+    }
+    tags.into_iter()
+        .filter(|t| !matches!(t.to_lowercase().as_str(), "twintails" | "low twintails" | "long hair" | "very long hair"))
+        .collect()
+}
+
+/// One tag per body part where two can't both be true: eye color (unless heterochromia), skin tone,
+/// hair length (unless the tags say long locks / sidelocks), boot height. Of two, a tag from the
+/// Danbooru list beats an unknown one, then the first written wins.
+pub fn one_per_part(tags: Vec<String>) -> Vec<String> {
+    let list = crate::danbooru::local();
+    let known = |t: &str| list.is_some_and(|l| l.get(t).is_some());
+    let lower: Vec<String> = tags.iter().map(|t| t.to_lowercase()).collect();
+    let hetero = lower.iter().any(|t| t == "heterochromia");
+    let part = |t: &str| -> Option<&'static str> {
+        let first = t.split_whitespace().next().unwrap_or("");
+        let colorish = COLOR_WORDS.contains(&first) || first.contains('-') || first.ends_with("ish");
+        if t.ends_with(" eyes") && colorish && !hetero {
+            return Some("eye color");
+        }
+        if t.ends_with(" skin") && t != "shiny skin" && t != "oily skin" {
+            return Some("skin tone");
+        }
+        if matches!(t, "very short hair" | "short hair" | "medium hair" | "long hair" | "very long hair" | "absurdly long hair") {
+            return Some("hair length");
+        }
+        if matches!(t, "thigh boots" | "knee boots" | "ankle boots" | "knee high boots" | "knee-high boots" | "thigh-high boots" | "thigh high boots") {
+            return Some("boot height");
+        }
+        None
+    };
+    let mut chosen: std::collections::HashMap<&'static str, usize> = std::collections::HashMap::new();
+    for (i, t) in lower.iter().enumerate() {
+        if let Some(p) = part(t) {
+            match chosen.get(p) {
+                None => {
+                    chosen.insert(p, i);
+                }
+                Some(&j) if !known(&lower[j]) && known(t) => {
+                    chosen.insert(p, i);
+                }
+                _ => {}
+            }
+        }
+    }
+    tags.into_iter()
+        .enumerate()
+        .filter(|(i, t)| part(&t.to_lowercase()).is_none_or(|p| chosen.get(p) == Some(i)))
+        .map(|(_, t)| t)
+        .collect()
+}
+
+/// The last pass over an image prompt written from a checklist form: the form's framing / background /
+/// gaze tags are added, every tag is checked against the Danbooru list, one tag per body part is kept,
+/// duplicates go, and the tagger's sure tags are enforced last.
+/// `polish_image_prompt`, plus: a Danbooru character name stays only if the tagger's tags (`tagger_tags`)
+/// name that character too. Vision models invent identities (ToriiGate called an OC "Musashi from Azur
+/// Lane"); the tagger only reports characters it recognizes.
+pub fn polish_image_prompt_with(prompt: &str, form: &str, strong: &[String], tagger_tags: &str) -> String {
+    let tagger: std::collections::HashSet<String> = tagger_tags.split(',').map(crate::danbooru::key).collect();
+    let tags: Vec<String> = prompt
+        .split(',')
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .filter(|t| !crate::danbooru::is_character(t) || tagger.contains(&crate::danbooru::key(t)))
+        .collect();
+    let mut tags: Vec<String> = tags.into_iter().flat_map(split_merged_tags).collect();
+    for t in tags_from_form(form) {
+        if !tags.iter().any(|x| crate::danbooru::key(x) == crate::danbooru::key(&t)) {
+            tags.push(t);
+        }
+    }
+    let tags = drop_contradicted_hair(one_per_part(validate_tags(tags)));
+    let mut seen = std::collections::HashSet::new();
+    let tags: Vec<String> = tags.into_iter().filter(|t| seen.insert(crate::danbooru::key(t))).collect();
+    enforce_strong_tags(&tags.join(", "), strong)
+}

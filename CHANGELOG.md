@@ -8,3 +8,7 @@ History moved out of CLAUDE.md: benchmarks, and models or modes that were tried 
 - Historical benchmark of the previous lineup (Gemma 4 E2B/E4B/12B builds, 4 prompts, BC-250). E2B: 1.8 GB, 8–18 s, decent but softened the explicit prompt. E4B: 3.3 GB, 10–30 s, faithful but adds little. 12B Q4: 8.1 GB, 27–49 s, best overall. 12B Q6: 10.2 GB, 35–60 s, same quality as Q4 but slower. All four are uncensored (no refusals).
 - Higher precision was removed. A Gemma 4 12B Q6 tier ("Maximum Detailed") gave no visible quality gain over Q4 in the benchmark, only ~25–40% slower scans, so it was dropped. **Q8 OOM-crashed the BC-250** (three hard reboots) once Ollama's `OLLAMA_GPU_OVERHEAD` reserve had been lowered. Keep that reserve at 2 GB on shared-memory GPUs.
 - Thinking mode (`AiScanRequest.think`, off in the app) was tested and doesn't work: Ollama rejects `think: true` for the Gemma 4 GGUF ("does not support thinking"), and the retry then silently runs it as a normal scan. Qwen3 (the only other candidate) was removed for poor results.
+
+## Image reads
+
+- Local test set baseline (2026-11-09, 6 images in tests/eval_local, default chain tagger → ToriiGate → E4B → polish, `tools/eval_images.sh`): average F1 41% (gym girl 59, raccoon girl 47, pencil sketch 43, two gym girls 39, Rouge 35, two-panel schoolgirl 26), ~30 s per image. Weak spots: the sketch was called a "humanoid robot" with black hair; two-panel images are read as one girl.
