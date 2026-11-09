@@ -18,3 +18,5 @@ __pycache__/
 /packaging/arch/PROGRAM RESULT
 /Untitled Document
 /prompt_condenser.rs
+# local image test set (images + answer files, never pushed)
+/tests/eval_local/
