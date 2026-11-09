@@ -64,7 +64,7 @@ struct AppState {
     scan_after_image: bool,
     /// Set by an image read's hand-off to the Deep Scan: the image was just read, don't read it again.
     scan_image_done: bool,
-    /// One counter per image slot, bumped when that image is loaded, removed or re-read, so a
+    /// One counter per image slot, bumped when that image is loaded or removed (Redo Vision bumps all), so a
     /// read that finishes afterwards knows its result is for an old image. Separate per slot:
     /// loading a character image must not throw away a read of the main image.
     image_gens: ImageGens,
@@ -1832,13 +1832,14 @@ fn clear_scene_ref(ui: &AppWindow, state: &State) {
     analyze(ui, state);
 }
 
-/// The default target text model for writing prompts (from dropdown or default tier).
 /// A model name short enough for the status line: `huihui_ai/gemma-4-abliterated:12b` -> `gemma-4-abliterated:12b`.
 fn short_model_name(name: &str) -> &str {
     let n = name.rsplit('/').next().unwrap_or(name);
     n.strip_suffix(":latest").unwrap_or(n)
 }
 
+/// The text model that writes image prompts: E4B (Good) when installed, else the dropdown's model
+/// (always the dropdown's model when the 2nd Pass Visual Check is on and that model can see).
 fn default_text_model(ui: &AppWindow, state: &State) -> String {
     let st = state.borrow();
     let selected = st.model_choices.get(ui.get_model_index().max(0) as usize).filter(|c| c.installed);
@@ -2067,7 +2068,7 @@ fn run_ai_image(ui: &AppWindow, state: &State) {
                         }
                         if std::mem::take(&mut state.borrow_mut().scan_after_image) {
                             state.borrow_mut().scan_image_done = true; // the scan must not read it again
-                        ui.invoke_run_ai_scan_requested();
+                            ui.invoke_run_ai_scan_requested();
                         }
                     }
                     Err(e) => {
@@ -2201,14 +2202,20 @@ enum ImageSlots {
 /// image it read changed since it started, which also cancels a Deep Scan waiting for it.
 fn image_changed_since(ui: &AppWindow, started: (ImageGens, ImageSlots)) -> bool {
     let mut changed = false;
+    let mut scan_waiting = false;
     with_state(|state| {
         if started.0.changed(&state.borrow().image_gens, started.1) {
             changed = true;
-            state.borrow_mut().scan_after_image = false;
+            scan_waiting = std::mem::take(&mut state.borrow_mut().scan_after_image);
         }
     });
     if changed {
         ui.set_image_status("The image changed while it was being read; that result was discarded.".into());
+        // a Deep Scan pressed for the new image was waiting on this (old) read: start it now, which
+        // reads the current image first (it used to be cancelled together with the old result)
+        if scan_waiting {
+            ui.invoke_run_ai_scan_requested();
+        }
     }
     changed
 }
@@ -3570,7 +3577,7 @@ fn main() -> Result<(), slint::PlatformError> {
                                     let tokens = ai_engine::request_tokens(&req);
                                     let rules: Vec<PromptChange> =
                                         st.changes.iter().chain(st.others.iter().flat_map(|o| o.changes.iter())).cloned().collect();
-                                    let cards = ai_engine::convert_ai_changes(&ai_out.changes, &tokens, &rules);
+                                    let cards = ai_engine::convert_ai_changes_for(&ai_out.changes, &tokens, &rules, req.config.two_char);
                                     // on the 2 Characters tab, a card about character 2's tags goes with character 2
                                     let norms = |p: &str| parser::parse_prompt(p).into_iter().map(|t| t.normalized).collect::<Vec<_>>();
                                     // on the multi-character tabs, a card about one character's tags goes with that character

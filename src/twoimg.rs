@@ -505,7 +505,6 @@ mod tests {
         assert_eq!(s.chars, vec!["1girl, red hair, dress, hat", "1girl, blue hair, armor, sword", "1boy, green hair, cape, staff"]);
     }
 
-    /// Where the time goes: `TIMING_TEST=a.png cargo test live_timing -- --ignored --nocapture`
     /// `TIMING_TEST=a.png cargo test live_tag_scores -- --ignored --nocapture`: the tagger's score for every tag >= 0.3.
     #[test]
     #[ignore]
@@ -542,6 +541,7 @@ mod tests {
         }
     }
 
+    /// Where the time goes: `TIMING_TEST=a.png cargo test live_timing -- --ignored --nocapture`
     #[test]
     #[ignore]
     fn live_timing() {

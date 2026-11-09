@@ -1118,18 +1118,33 @@ pub fn is_layout_tag(normalized: &str, checkpoint: CheckpointProfile) -> bool {
     )
 }
 
-/// `is_layout_tag` for any checkpoint (quality tags of every profile count): used where the
-/// checkpoint isn't known, so an "add masterpiece" never becomes a card, since
-/// `ensure_quality_tags` writes the right quality tags itself.
-pub fn is_layout_tag_any(normalized: &str) -> bool {
-    use CheckpointProfile::*;
-    [Anima, PonyV6, Illustrious, Sdxl, Sd15].iter().any(|c| is_layout_tag(normalized, *c))
-}
-
+#[cfg(test)]
 pub fn convert_ai_changes(
     ai_items: &[AiChangeItem],
     prompt_tokens: &[crate::parser::PromptToken],
     rule_changes: &[PromptChange],
+) -> Vec<PromptChange> {
+    convert_ai_changes_for(ai_items, prompt_tokens, rule_changes, false)
+}
+
+/// A quality tag of any checkpoint (`ensure_quality_tags` writes the right ones, so an AI card
+/// offering one is never needed).
+fn is_quality_tag_any(normalized: &str) -> bool {
+    use CheckpointProfile::*;
+    [Anima, PonyV6, Illustrious, Sdxl, Sd15].iter().any(|c| {
+        let t = normalized.trim().to_lowercase().replace('_', " ");
+        c.canonical_quality_tags().iter().any(|q| q.replace('_', " ") == t)
+    })
+}
+
+/// `convert_ai_changes`; `multi` = a 2-4 Characters tab, where group counts, positions and BREAK are
+/// written by the app's own layout. On the 1 Character tab they are content (`2girls` there is a real
+/// change the user should see as a card).
+pub fn convert_ai_changes_for(
+    ai_items: &[AiChangeItem],
+    prompt_tokens: &[crate::parser::PromptToken],
+    rule_changes: &[PromptChange],
+    multi: bool,
 ) -> Vec<PromptChange> {
     use crate::parser::parse_prompt;
     use std::collections::HashSet;
@@ -1161,7 +1176,8 @@ pub fn convert_ai_changes(
             named
         };
         // Group count and position tags are written by the multi-character layout: not a card.
-        if targets.is_empty() && !suggestion.is_empty() && suggestion.iter().all(|t| is_layout_tag_any(t)) {
+        let layout = |t: &String| is_quality_tag_any(t) || (multi && is_layout_tag(t, CheckpointProfile::Flux));
+        if targets.is_empty() && !suggestion.is_empty() && suggestion.iter().all(layout) {
             continue;
         }
 
@@ -1217,7 +1233,9 @@ pub fn convert_ai_changes(
         };
         out.push(PromptChange {
             id: AI_CARD_ID_BASE + out.len(),
-            original: item.original.trim().to_string(),
+            // an addition names no tag of the prompt; a misfiled one ("seashells" -> "seashells") would
+            // otherwise be applied as a replace of a tag that isn't there and do nothing
+            original: if targets.is_empty() { String::new() } else { item.original.trim().to_string() },
             action: ChangeAction::AiRewrite,
             reason,
             suggested_alternative: if is_remove {
@@ -1895,19 +1913,26 @@ pub fn extract_visual_description_with_hints(
 
         let upper_only = count >= 3;
         let mut zone_calls = 0usize;
-        for (i, b) in chars.iter().enumerate() {
-            let label = pos_labels.get(i).copied().unwrap_or("Character");
-            let zones = crate::detector::three_zone_crops(&img, b);
-            let mut zone_lines = Vec::new();
-
-            for (z_name, z_img) in &zones {
-                if upper_only && !z_name.contains("Upper") {
-                    continue; // 3+ people: one call each (head, hair, upper outfit)
-                }
+        // Zone by zone across all people (every head first, then every torso, then legs), so when the
+        // time budget runs out each person has their most useful zone; going person by person used to
+        // give the leftmost all three zones and the others nothing.
+        let people: Vec<(&str, Vec<(&'static str, image::DynamicImage)>)> = chars
+            .iter()
+            .enumerate()
+            .map(|(i, b)| (pos_labels.get(i).copied().unwrap_or("Character"), crate::detector::three_zone_crops(&img, b)))
+            .collect();
+        let mut lines: Vec<Vec<String>> = vec![Vec::new(); people.len()];
+        'zones: for zone in 0..3 {
+            if upper_only && zone > 0 {
+                break; // 3+ people: one call each (head, hair, upper outfit)
+            }
+            for (pi, (label, zones)) in people.iter().enumerate() {
+                let Some((z_name, z_img)) = zones.get(zone) else { continue };
                 if zone_calls >= MULTIZONE_MAX_ZONE_CALLS || budget.spent() {
-                    break;
+                    break 'zones;
                 }
                 zone_calls += 1;
+                let label = *label;
                 if let Ok(z_b64) = encode_dynamic_image_b64(z_img) {
                     let ask = if z_name.contains("Upper") {
                     format!(
@@ -1930,11 +1955,12 @@ pub fn extract_visual_description_with_hints(
                 };
                     let desc = ask_vision_encoder(&base, mode, encoder, z_b64, &ask).unwrap_or_default();
                     if !desc.trim().is_empty() {
-                        zone_lines.push(format!("- **{}**: {}", z_name, desc.trim()));
+                        lines[pi].push(format!("- **{}**: {}", z_name, desc.trim()));
                     }
                 }
             }
-
+        }
+        for ((label, _), zone_lines) in people.iter().zip(lines) {
             if !zone_lines.is_empty() {
                 char_sections.push(format!("### Character: {}\n{}", label, zone_lines.join("\n")));
             }
@@ -2367,7 +2393,7 @@ pub fn one_per_part(tags: Vec<String>) -> Vec<String> {
 /// Lane"); the tagger only reports characters it recognizes.
 pub fn polish_image_prompt_with(prompt: &str, form: &str, strong: &[String], tagger_tags: &str) -> String {
     let tagger: std::collections::HashSet<String> = tagger_tags.split(',').map(crate::danbooru::key).collect();
-    let mut tags: Vec<String> = prompt
+    let tags: Vec<String> = prompt
         .split(',')
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty())
@@ -3552,7 +3578,9 @@ pub fn run_ai_scan(req: &AiScanRequest) -> Result<(AiJsonOutput, String)> {
     }
     let mut best = scan_once(req, &http, &base, &system, &prompt, &mut send_think, &mut seed)?;
     let needs_negative = !req.config.checkpoint.default_negative().is_empty();
-    if needs_negative && best.recommended_negative.trim().is_empty() && !best.improved_prompt.trim().is_empty() && !budget.spent() {
+    // the short negative follow-up always runs (a slow first scan used to come back without a negative);
+    // only the full re-scans are cut by the time limit
+    if needs_negative && best.recommended_negative.trim().is_empty() && !best.improved_prompt.trim().is_empty() {
         // The model sometimes skips the negative; a short follow-up asks for just that.
         best.recommended_negative = generate_negative(req, &best.improved_prompt).unwrap_or_default();
     }
@@ -3605,6 +3633,21 @@ pub fn strip_placeholders(text: &str) -> String {
         let l = inner.trim().to_lowercase();
         l.is_empty() || PLACEHOLDER_WORDS.contains(&l.as_str()) || l.contains("placeholder") || l.contains("_flag")
     };
+    // "[UNANCHORED_LIMBS_FLAG resolved: hands in lap, legs crossed]" spans commas: resolve whole
+    // brackets first (ASCII lowercasing keeps byte offsets valid in `text`)
+    let mut text = text.to_string();
+    while let Some(at) = text.to_ascii_lowercase().find("_flag resolved:") {
+        let open = text[..at].rfind('[');
+        let close = text[at..].find(']').map(|c| at + c);
+        match (open, close) {
+            (Some(o), Some(c)) => {
+                let inner = text[at + "_flag resolved:".len()..c].trim().to_string();
+                text.replace_range(o..=c, &inner);
+            }
+            _ => break, // no brackets around it: the per-tag rule below handles it
+        }
+    }
+    let text = text.as_str();
     let mut kept: Vec<String> = Vec::new();
     for seg in text.split(',') {
         let lead: String = seg.chars().take_while(|c| c.is_whitespace()).collect();
@@ -3621,7 +3664,9 @@ pub fn strip_placeholders(text: &str) -> String {
                 continue;
             }
         }
-        if tag.ends_with("_FLAG") && !tag.contains(' ') {
+        // a bare flag in any spelling: "MISSING_BOTTOMS_FLAG", "missing_bottoms_flag", "(MISSING_BOTTOMS_FLAG:1.1)"
+        let bare = tag.trim_matches(['(', ')', '[', ']']).split(':').next().unwrap_or("").trim().to_ascii_lowercase();
+        if bare.ends_with("_flag") && !bare.contains(' ') {
             continue;
         }
         let bracketed = (tag.starts_with('[') && tag.ends_with(']')) || (tag.starts_with('{') && tag.ends_with('}'));
@@ -3817,12 +3862,15 @@ pub fn ensure_quality_tags(prompt: &str, checkpoint: CheckpointProfile) -> Strin
     if prompt.trim().is_empty() {
         return prompt.to_string();
     }
-    let norm = |t: &str| t.trim().trim_matches(|c| c == '(' || c == ')').split(':').next().unwrap_or("").trim().to_lowercase();
+    // "score_9", "score 9", "[score_9]" and "(score_9:1.1)" are the same tag
+    let norm = |t: &str| {
+        t.trim().trim_matches(['(', ')', '[', ']']).split(':').next().unwrap_or("").trim().to_lowercase().replace('_', " ")
+    };
     let present: Vec<String> = prompt.split(|c| c == ',' || c == '\n').map(norm).collect();
-    if present.iter().any(|t| *t == *first) {
+    if present.iter().any(|t| *t == norm(first)) {
         return prompt.to_string();
     }
-    let missing: Vec<&str> = quality.iter().copied().filter(|q| !present.iter().any(|t| t == q)).collect();
+    let missing: Vec<&str> = quality.iter().copied().filter(|q| !present.iter().any(|t| *t == norm(q))).collect();
     format!("{}, {}", missing.join(", "), prompt.trim_start())
 }
 
@@ -3915,7 +3963,8 @@ fn cards_ok(o: &AiJsonOutput, req: &AiScanRequest) -> bool {
     // A layout tag the user wrote (their own `2girls`, `left`…) is content: changing it to `3girls`
     // must still need a card. Only layout the AI added on top is ignored.
     let before: std::collections::HashSet<String> = tokens.iter().map(|t| t.normalized.clone()).collect();
-    let content = |t: &String| before.contains(t) || !is_layout_tag(t, req.config.checkpoint);
+    let multi = req.config.two_char;
+    let content = |t: &String| before.contains(t) || !(is_quality_tag_any(t) || (multi && is_layout_tag(t, CheckpointProfile::Flux)));
     let after: std::collections::HashSet<String> = crate::parser::parse_prompt(&o.improved_prompt)
         .into_iter()
         .map(|t| t.normalized)
@@ -3939,7 +3988,7 @@ fn cards_ok(o: &AiJsonOutput, req: &AiScanRequest) -> bool {
     } else {
         crate::analyzer::analyze_with_rules(&tokens, &req.config).changes
     };
-    if !convert_ai_changes(&o.changes, &tokens, &rules).is_empty() {
+    if !convert_ai_changes_for(&o.changes, &tokens, &rules, multi).is_empty() {
         return true;
     }
     // If the improved prompt has edits and all edits are already handled by existing rule cards,
@@ -4246,6 +4295,9 @@ mod tests {
         // already there (also weighted, or on the first line of an arranged prompt): untouched
         assert_eq!(ensure_quality_tags("(masterpiece:1.2), 1girl", Anima), "(masterpiece:1.2), 1girl");
         assert_eq!(ensure_quality_tags("score_9, 1girl", PonyV6), "score_9, 1girl");
+        // other spellings of the same quality tags don't get a second block
+        assert_eq!(ensure_quality_tags("score 9, score 8 up, 1girl", PonyV6), "score 9, score 8 up, 1girl");
+        assert_eq!(ensure_quality_tags("[score_9], 1girl", PonyV6).matches("score_9").count(), 1);
         assert_eq!(ensure_quality_tags("masterpiece,\n1girl", Anima), "masterpiece,\n1girl");
         // Flux has no quality tags; empty stays empty
         assert_eq!(ensure_quality_tags("a girl on a beach", Flux), "a girl on a beach");
@@ -4328,6 +4380,12 @@ mod tests {
         for keep in ["[background], 1girl", "1girl, [lighting]", "[missing tooth], smile", "[pose]"] {
             assert_eq!(strip_placeholders(keep), keep);
         }
+        // a resolved flag whose fix contains commas, and weighted / lowercase bare flags
+        assert_eq!(
+            strip_placeholders("1girl, [UNANCHORED_LIMBS_FLAG resolved: hands in lap, legs crossed], smile"),
+            "1girl, hands in lap, legs crossed, smile"
+        );
+        assert_eq!(strip_placeholders("1girl, (MISSING_BOTTOMS_FLAG:1.1), missing_bottoms_flag, skirt"), "1girl, skirt");
         // non-ASCII text before "resolved:" can't break the slicing (it used to panic)
         assert_eq!(strip_placeholders("[İK UNANCHORED_LIMBS_FLAG resolved: hands in lap]"), "hands in lap");
         assert_eq!(strip_placeholders(""), "");
@@ -4358,13 +4416,17 @@ mod tests {
         };
         assert!(cards_ok(&out, &req), "a layout-only rewrite needs no cards");
         let tokens = request_tokens(&req);
-        assert!(convert_ai_changes(&out.changes, &tokens, &[]).is_empty(), "layout and existing tags make no cards");
+        assert!(convert_ai_changes_for(&out.changes, &tokens, &[], true).is_empty(), "layout and existing tags make no cards");
         // a real new detail filed the same wrong way still becomes an add card
         out.improved_prompt.push_str(", seashells");
         out.changes.push(add("seashells", "seashells"));
-        let cards = convert_ai_changes(&out.changes, &tokens, &[]);
+        let cards = convert_ai_changes_for(&out.changes, &tokens, &[], true);
         assert_eq!(cards.len(), 1);
         assert_eq!(cards[0].suggested_alternative, "seashells");
+        assert_eq!(cards[0].original, "", "an addition carries no original, so accepting it adds the tag");
+        // on the 1 Character tab a count tag is content: "2girls" becomes a card there
+        assert_eq!(convert_ai_changes_for(&[add("", "2girls")], &tokens, &[], false).len(), 1);
+        assert!(convert_ai_changes_for(&[add("", "2girls")], &tokens, &[], true).is_empty());
         assert!(cards_ok(&out, &req));
         // an "add masterpiece" is no card either: the app writes the quality tags itself
         assert!(convert_ai_changes(&[add("masterpiece", "masterpiece"), add("", "score_9")], &tokens, &[]).is_empty());
