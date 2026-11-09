@@ -7,6 +7,8 @@ cd "$(dirname "$0")/.."
 dir="${1:-tests/eval_local}"
 images=$(find "$dir" -maxdepth 1 -type f \( -iname '*.png' -o -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.webp' \) | sort | paste -sd:)
 [ -n "$images" ] || { echo "no images in $dir"; exit 1; }
+# the app's default chain: ToriiGate reads the image, E4B writes the prompt
+export VISION_ENCODER="${VISION_ENCODER:-hf.co/DraconicDragon/ToriiGate-0.5-GGUF:Q4_K_M}"
 out="target/eval_images_$(date +%Y%m%d_%H%M%S).txt"
 IMAGE_TEST="$images" cargo test --release live_image -- --ignored --nocapture --test-threads=1 | tee "$out"
 python3 tools/score_image_prompts.py "$out" "${IMAGE_MODEL:-default}"
