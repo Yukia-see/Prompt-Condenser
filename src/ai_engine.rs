@@ -2085,20 +2085,9 @@ pub fn is_toriigate(model: &str) -> bool {
 /// framing correctly in 14 s, where the general models failed; its weakness is inventing character names.
 pub fn observe_with_toriigate(path: &std::path::Path, host: &str, mode: AiMode, model: &str, booru_tags: &str) -> Result<String> {
     const SYSTEM: &str = "You are image captioning expert. Describe user's picture according to requested format and instructions.";
-    const FORMAT: &str = "Your answer must contain 3 parts:\n<format>\n# 1. Thoughts about characters\n\
-You need to think here and compare peoples/creatures that you see on the picture  with given popular tags, or descriptions, or your memories for each characters to determine who is who.\n\
-If no characters are listed in input - just write here \"No named characters\"\n# 2. Key details\n\
-Here you need to write about the key details on image, prefere using regular text.\n# 3. Structured description\n## General\n\
-Write about general composition, content of image, background and all things that are not related to characters directly.\n\
-## Character name 1 (put here the name if any)\nWrite about datails and content related to specific character, including features, poses, look, used objects, interactions, and other things.\n\
-## Character name 2 (put here the name if any)\nSame for each character.\n## Image effects\nMention image effect, style, camera angle\n</format>\nIn general stick to shorter descriptions.\n";
     let base = base_url(host)?;
     let img = image::open(path).with_context(|| format!("Couldn't open {}", path.display()))?;
-    let mut prompt = format!("# Captioning format:\n{FORMAT}\n");
-    if !booru_tags.trim().is_empty() {
-        prompt.push_str(&format!("# Booru tags for the image\n[{}]\n\n", booru_tags.trim()));
-    }
-    prompt.push_str("# Characters on picture:\nAvoid to guess names for characters.\n");
+    let prompt = toriigate_request_text(booru_tags);
     let body = json!({
         "model": model,
         "system": SYSTEM,
@@ -2121,6 +2110,38 @@ Write about general composition, content of image, background and all things tha
         .map_err(|e| anyhow!("Couldn't reach Ollama at {base}: {e}"))?;
     let gen: GenerateResponse = check(resp, "ToriiGate")?.json()?;
     Ok(gen.response.trim().to_string())
+}
+
+/// The user message ToriiGate expects (its `make_user_query` with the "min_structured_md" format):
+/// the format, the image's booru tags, and the recognized character names or "avoid to guess names".
+fn toriigate_request_text(booru_tags: &str) -> String {
+    const FORMAT: &str = "Your answer must contain 3 parts:\n<format>\n# 1. Thoughts about characters\n\
+You need to think here and compare peoples/creatures that you see on the picture  with given popular tags, or descriptions, or your memories for each characters to determine who is who.\n\
+If no characters are listed in input - just write here \"No named characters\"\n# 2. Key details\n\
+Here you need to write about the key details on image, prefere using regular text.\n# 3. Structured description\n## General\n\
+Write about general composition, content of image, background and all things that are not related to characters directly.\n\
+## Character name 1 (put here the name if any)\nWrite about datails and content related to specific character, including features, poses, look, used objects, interactions, and other things.\n\
+## Character name 2 (put here the name if any)\nSame for each character.\n## Image effects\nMention image effect, style, camera angle\n</format>\nIn general stick to shorter descriptions.\n";
+    let mut prompt = format!("# Captioning format:\n{FORMAT}\n");
+    if !booru_tags.trim().is_empty() {
+        prompt.push_str(&format!("# Booru tags for the image\n[{}]\n\n", booru_tags.trim()));
+    }
+    // Named characters the tagger recognized (it lists one only at >= 0.85): ToriiGate is trained to
+    // use them ("make sure to use them"); without any it is told not to guess (it invents names).
+    let names: Vec<String> = booru_tags
+        .split(',')
+        .map(|t| t.trim().replace("\\(", "(").replace("\\)", ")"))
+        .filter(|t| !t.is_empty() && crate::danbooru::is_character(t))
+        .collect();
+    if names.is_empty() {
+        prompt.push_str("# Characters on picture:\nAvoid to guess names for characters.\n");
+    } else {
+        prompt.push_str(&format!(
+            "# Characters on picture:\nHere are names/tags for characters from the picture, make sure to use them: [{}].\n\n",
+            names.join(", ")
+        ));
+    }
+    prompt
 }
 
 /// The vision step for Combined mode: ToriiGate's own format when it is the vision model, else the
@@ -4473,6 +4494,16 @@ mod tests {
             // descriptive tags the list doesn't have are kept; names as labels are not tags
             let v2 = validate_tags(["white teal bikini top", "Nagi: black hair", "light skin tones"].iter().map(|x| x.to_string()).collect());
             assert_eq!(v2, vec!["white teal bikini top", "black hair"], "{v2:?}");
+        }
+    }
+
+    #[test]
+    fn toriigate_gets_recognized_names_or_is_told_not_to_guess() {
+        let none = toriigate_request_text("1girl, raccoon ears, dark skin");
+        assert!(none.contains("Avoid to guess names") && none.contains("[1girl, raccoon ears, dark skin]"), "{none}");
+        if crate::danbooru::local().is_some() {
+            let named = toriigate_request_text("1girl, hatsune miku, twintails");
+            assert!(named.contains("make sure to use them: [hatsune miku]") && !named.contains("Avoid to guess"), "{named}");
         }
     }
 
