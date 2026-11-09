@@ -744,7 +744,10 @@ pub fn combine_section_blocks(texts: &[String], config: &ScanConfig, strip_confl
         && config.checkpoint.supports_natural_language()
         && !blocks.is_empty()
     {
-        let mut combined_tokens = footer.clone();
+        // the count tags (1girl, solo) were moved to the header above; without them the sentence had no
+        // subject and read "A scene with cat ears, cat tail, white hair…"
+        let mut combined_tokens = count_tokens.clone();
+        combined_tokens.extend(footer.clone());
         combined_tokens.extend(blocks[0].clone());
         let p = crate::scene::synthesize_natural_prose(&combined_tokens);
         if p.is_empty() { None } else { Some(p) }
@@ -1308,4 +1311,20 @@ masterpiece, 2girls, indoors, gym, polished floor
         assert!(res[1].contains("midnight blue hair"), "Char 2 got: {}", res[1]);
         assert!(!res[1].contains("ruby red hair"), "Char 2 contaminated: {}", res[1]);
     }
+    #[test]
+    fn the_scene_sentence_names_who_is_in_it() {
+        // the user's raccoon-girl prompt, shown in the section layout with natural-language bits on
+        let mut c = cfg();
+        c.checkpoint = CheckpointProfile::Anima;
+        c.natural = true;
+        let out = combine_section_blocks(
+            &["1girl, solo, cat ears, cat tail, white hair, glasses, yellow crop top, black shorts".to_string()],
+            &c,
+            true,
+            None,
+        );
+        assert!(!out.contains("A scene with"), "{out}");
+        assert!(out.contains("A lone girl with") || out.contains("A girl with"), "{out}");
+    }
+
 }
