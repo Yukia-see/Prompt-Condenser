@@ -1004,6 +1004,7 @@ fn run_two_image(ui: &AppWindow, state: &State) {
     // a cached reading for another number of characters doesn't count
     let cached = state.borrow().two_tags.clone().filter(|t| t.wanted == n);
     let gen = (state.borrow().image_gens, ImageSlots::Main);
+    ai_engine::reset_cancel();
     ui.set_tagger_busy(true);
     ui.set_image_status(format!("Finding the {n} characters…").into());
     let weak = ui.as_weak();
@@ -1380,6 +1381,7 @@ fn run_scene_fast_scan(ui: &AppWindow, state: &State) {
     ctx.vision_encoder = None; // FORCE FAST SCAN (Skips slow AI LLM/VLM)
     let n = tab_chars(ui);
     let gen = (state.borrow().image_gens, ImageSlots::Scene);
+    ai_engine::reset_cancel();
     ui.set_tagger_busy(true);
     let weak = ui.as_weak();
     std::thread::spawn(move || {
@@ -1429,6 +1431,7 @@ fn run_read_queue(ui: &AppWindow, state: &State) {
     let ctx = read_ctx(ui, state);
     let n = tab_chars(ui);
     let gen = (state.borrow().image_gens, ImageSlots::Refs);
+    ai_engine::reset_cancel();
     ui.set_tagger_busy(true);
     let weak = ui.as_weak();
     std::thread::spawn(move || {
@@ -1441,6 +1444,9 @@ fn run_read_queue(ui: &AppWindow, state: &State) {
         let char_results: Vec<(usize, anyhow::Result<(String, &'static str, Vec<String>)>)> = chars
             .into_iter()
             .map(|(k, p)| {
+                if ai_engine::cancelled() {
+                    return (k, Err(anyhow::anyhow!("Cancelled")));
+                }
                 say(format!("Reading character {}…", k + 1));
                 (k, read_char_blocking(&p, &ctx, &say))
             })
@@ -1944,6 +1950,7 @@ fn run_ai_image(ui: &AppWindow, state: &State) {
         None
     };
     let gen = (state.borrow().image_gens, ImageSlots::Main);
+    ai_engine::reset_cancel();
     ui.set_tagger_busy(true);
     let status_name = if enable_dual_pass {
         let mode_name = if ui.get_dual_pass_mode_index() == 0 { "Shape" } else { "Pose" };
@@ -2038,6 +2045,9 @@ fn run_ai_image(ui: &AppWindow, state: &State) {
         // In Combined mode the tagger runs first: its sure skin / species / count tags are handed to the
         // vision model to check (it used to guess them, running at the same time), and the final prompt
         // may not drop them.
+        if cached_tags.is_none() {
+            status_sender(&weak)("Step 1/3 • tagging the image…".to_string());
+        }
         let tags = cached_tags.or_else(|| {
             tagger::is_installed().then(|| twoimg::tag_one_fast(&path, &status_sender(&weak)).ok()).flatten()
         });
@@ -2046,9 +2056,13 @@ fn run_ai_image(ui: &AppWindow, state: &State) {
             req.tag_hints = tagger::build_prompt(t, threshold).prompt;
             req.strong_tags = ai_engine::strong_tags(t);
         }
+        let say = status_sender(&weak);
         let vision_desc_res = (!ai_engine::same_model(&encoder, &text_model)).then(|| {
+            say(format!("Step 2/3 • reading the image with {}…", short_model_name(&encoder)));
+            ai_engine::check_cancel()?;
             ai_engine::observe_image(&path, &req.host, req.mode, &encoder, &req.tag_hints, &req.strong_tags)
         });
+        say(format!("Step 3/3 • writing the prompt with {}…", short_model_name(&text_model)));
         let result = match vision_desc_res {
             Some(Ok(desc)) => ai_engine::describe_image_with_desc(&req, &desc, &encoder),
             Some(Err(e)) => Err(e),
@@ -2118,6 +2132,7 @@ fn apply_ai_image(ui: &AppWindow, state: &State, res: &ai_engine::ImageAiResult,
 fn run_tagger(ui: &AppWindow, state: &State) {
     let Some(path) = state.borrow().image_path.clone() else { return };
     let gen = (state.borrow().image_gens, ImageSlots::Main);
+    ai_engine::reset_cancel();
     ui.set_tagger_busy(true);
     ui.set_image_status("Extracting Danbooru tags… (the first run loads the model)".into());
     let weak = ui.as_weak();
@@ -3368,7 +3383,8 @@ fn main() -> Result<(), slint::PlatformError> {
         let weak = ui.as_weak();
         ui.on_download_tagger_requested(move || {
             let Some(ui) = weak.upgrade() else { return };
-            ui.set_tagger_busy(true);
+            ai_engine::reset_cancel();
+    ui.set_tagger_busy(true);
             let (tx, rx) = mpsc::channel::<String>();
             let progress_weak = weak.clone();
             std::thread::spawn(move || {
@@ -3507,6 +3523,19 @@ fn main() -> Result<(), slint::PlatformError> {
         });
     }
 
+    // --- Cancel (Deep Scan / image read): stops after the current step ---
+    {
+        let weak = ui.as_weak();
+        ui.on_cancel_requested(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            ai_engine::request_cancel();
+            ui.set_status_message("Cancelling: stopping after the current step…".into());
+            if ui.get_tagger_busy() {
+                ui.set_image_status("Cancelling: stopping after the current step…".into());
+            }
+        });
+    }
+
     // --- Deep AI scan ---
     {
         let weak = ui.as_weak();
@@ -3569,6 +3598,7 @@ fn main() -> Result<(), slint::PlatformError> {
                 think: false,
             };
 
+            ai_engine::reset_cancel();
             ui.set_ai_busy(true);
             ui.set_status_message(
                 format!(

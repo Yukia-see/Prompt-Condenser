@@ -1821,6 +1821,7 @@ pub fn describe_image_with_desc(
     };
     // The words found in the description are already in the hints the model saw; adding them again
     // after it answered overrode its choices (and brought back what it rightly left out).
+    check_cancel()?;
     let mut res = match describe_with_text_model(req, &system, &user_prompt) {
         Ok(r) => r,
         Err(_) => tag_merge(),
@@ -1928,7 +1929,7 @@ pub fn extract_visual_description_with_hints(
             }
             for (pi, (label, zones)) in people.iter().enumerate() {
                 let Some((z_name, z_img)) = zones.get(zone) else { continue };
-                if zone_calls >= MULTIZONE_MAX_ZONE_CALLS || budget.spent() {
+                if zone_calls >= MULTIZONE_MAX_ZONE_CALLS || budget.spent() || cancelled() {
                     break 'zones;
                 }
                 zone_calls += 1;
@@ -1971,8 +1972,8 @@ pub fn extract_visual_description_with_hints(
     let quads = crate::detector::quadrant_crops(&img);
     let mut quad_parts = Vec::new();
     for (name, q_img) in &quads {
-        if budget.spent() {
-            break; // out of time: the people above matter more than the decor
+        if budget.spent() || cancelled() {
+            break; // out of time (or cancelled): the people above matter more than the decor
         }
         if let Ok(q_tags) = crate::tagger::tag_dynamic(q_img) {
             let triggers = crate::tagger::extract_zone_triggers(&q_tags, 0.40);
@@ -2430,6 +2431,28 @@ pub fn polish_image_prompt_with(prompt: &str, form: &str, strong: &[String], tag
     let mut seen = std::collections::HashSet::new();
     let tags: Vec<String> = tags.into_iter().filter(|t| seen.insert(crate::danbooru::key(t))).collect();
     enforce_strong_tags(&tags.join(", "), strong)
+}
+
+static CANCEL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The Cancel button: the running Deep Scan / image read stops after its current step (a request
+/// already sent to Ollama can't be interrupted, so that step finishes and its result is dropped).
+pub fn request_cancel() {
+    CANCEL.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Cleared when a new Deep Scan or image read starts.
+pub fn reset_cancel() {
+    CANCEL.store(false, std::sync::atomic::Ordering::SeqCst);
+}
+
+pub fn cancelled() -> bool {
+    CANCEL.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// `Err("Cancelled")` once Cancel was pressed: put between the steps of a long job.
+pub fn check_cancel() -> Result<()> {
+    if cancelled() { Err(anyhow!("Cancelled")) } else { Ok(()) }
 }
 
 /// Which vision model reads which pass: the mode's pass-1 prompt goes to the spatial /
@@ -3603,10 +3626,12 @@ pub fn run_ai_scan(req: &AiScanRequest) -> Result<(AiJsonOutput, String)> {
     // only the full re-scans are cut by the time limit
     if needs_negative && best.recommended_negative.trim().is_empty() && !best.improved_prompt.trim().is_empty() {
         // The model sometimes skips the negative; a short follow-up asks for just that.
-        best.recommended_negative = generate_negative(req, &best.improved_prompt).unwrap_or_default();
+        if !cancelled() {
+            best.recommended_negative = generate_negative(req, &best.improved_prompt).unwrap_or_default();
+        }
     }
     let mut rescans = 0;
-    while !scan_problems(&best, req).is_empty() && rescans < 2 && !budget.spent() {
+    while !scan_problems(&best, req).is_empty() && rescans < 2 && !budget.spent() && !cancelled() {
         rescans += 1;
         let Ok(next) = scan_once(req, &http, &base, &system, &prompt, &mut send_think, &mut seed) else { continue };
         merge_scan(&mut best, next, req);
@@ -3906,6 +3931,7 @@ fn scan_once(
     seed: &mut u32,
 ) -> Result<AiJsonOutput> {
     for _attempt in 0..3 {
+        check_cancel()?;
         let mut body = generate_body(req, system, prompt, *seed);
         *seed += 1;
         if !*send_think {
@@ -4255,6 +4281,34 @@ mod tests {
     }
 
     /// Minimal fake Ollama: answers by path, records each request's path and body.
+    /// Tests that run scans or image reads take turns: the Cancel flag is process-wide, and the
+    /// cancel test sets it.
+    static SCAN_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn scan_lock() -> std::sync::MutexGuard<'static, ()> {
+        SCAN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A plain Anima Deep Scan request against `host`.
+    fn test_request(host: &str) -> AiScanRequest {
+        AiScanRequest {
+            raw_prompt: "1girl, upper body".into(),
+            config: ScanConfig {
+                checkpoint: CheckpointProfile::Anima, target_view: crate::profiles::TargetView::None, pinned_emphasis_raw: String::new(),
+                emphasis_weight: 1.25, cleanup_enabled: true, resolve_conflicts_enabled: true, clamp_weights_enabled: true,
+                camera_angle: 0, pose: 0, proportion: 0, dynamic: false, lora_tags_raw: String::new(), arranged: false,
+                natural: false, two_char: false, char2_prompt_raw: String::new(), char2_lora_tags_raw: String::new(),
+                char_break: false, scene_prompt_raw: String::new(), more_chars: Vec::new(),
+                detail: crate::profiles::DetailLevel::Balanced,
+            },
+            mode: AiMode::Gpu,
+            host: host.to_string(),
+            model: "prompt-condenser-low".into(),
+            keep_alive: "30m".into(),
+            think: false,
+        }
+    }
+
     fn fake_ollama() -> (String, std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>) {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -4498,6 +4552,19 @@ mod tests {
     }
 
     #[test]
+    fn cancel_stops_a_scan_before_its_next_request() {
+        let _turn = scan_lock();
+        let (host, log) = fake_ollama();
+        request_cancel();
+        assert!(check_cancel().is_err());
+        let err = run_ai_scan(&test_request(&host)).unwrap_err().to_string();
+        assert!(err.contains("Cancelled"), "{err}");
+        assert!(log.lock().unwrap().iter().all(|(p, _)| p != "/api/generate"), "no model call after Cancel");
+        reset_cancel();
+        assert!(check_cancel().is_ok());
+    }
+
+    #[test]
     fn toriigate_gets_recognized_names_or_is_told_not_to_guess() {
         let none = toriigate_request_text("1girl, raccoon ears, dark skin");
         assert!(none.contains("Avoid to guess names") && none.contains("[1girl, raccoon ears, dark skin]"), "{none}");
@@ -4588,6 +4655,7 @@ mod tests {
 
     #[test]
     fn combined_mode_always_asks_the_text_model() {
+        let _turn = scan_lock();
         use crate::profiles::{CheckpointProfile, DetailLevel, TargetView};
         let (host, log) = fake_ollama();
         let config = ScanConfig {
@@ -4670,6 +4738,7 @@ mod tests {
 
     #[test]
     fn dual_pass_honors_the_selected_mode() {
+        let _turn = scan_lock();
         use crate::prompt_condenser::{Mode, PipelineOptions};
         let (host, log) = fake_ollama();
         let dir = std::env::temp_dir().join(format!("pc-mode-test-{}", std::process::id()));
@@ -4701,6 +4770,7 @@ mod tests {
 
     #[test]
     fn talks_to_ollama_api() {
+        let _turn = scan_lock();
         use crate::profiles::{CheckpointProfile, TargetView};
         let (host, log) = fake_ollama();
 

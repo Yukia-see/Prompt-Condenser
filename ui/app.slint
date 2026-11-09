@@ -1301,6 +1301,7 @@ export component AppWindow inherits Window {
     callback analyze_requested();
     callback ai_settings_changed();
     callback run_ai_scan_requested();
+    callback cancel_requested();   // stop a Deep Scan / image read after its current step
     callback download_model_requested();
     callback connect_ollama_requested();
     callback load_image_requested();
@@ -1399,6 +1400,10 @@ export component AppWindow inherits Window {
                     primary: true;
                     enabled: !root.ai_busy && root.ai_mode_index != 2 && root.ollama_connected && !root.model_needs_download;
                     clicked => { root.run_ai_scan_requested(); }
+                }
+                if root.ai_busy || root.tagger_busy : PillButton {
+                    text: "✕ Cancel";
+                    clicked => { root.cancel_requested(); }
                 }
                 if root.model_needs_download && root.ai_mode_index != 2 : PillButton {
                     text: "Download Model";
