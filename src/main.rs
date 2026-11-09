@@ -68,6 +68,8 @@ struct AppState {
     /// read that finishes afterwards knows its result is for an old image. Separate per slot:
     /// loading a character image must not throw away a read of the main image.
     image_gens: ImageGens,
+    /// The model picked last time (settings.json): selected once Ollama lists it.
+    preferred_model: Option<String>,
     /// 2 Characters tab: the detector + tagger reading of the image, and the AI's split.
     two_tags: Option<twoimg::TagSplit>,
     two_ai: Option<twoimg::SplitPrompt>,
@@ -782,8 +784,11 @@ fn set_model_choices(ui: &AppWindow, state: &State, choices: Vec<ModelChoice>) {
     // Keep the user's pick only if it was a real, installed model (not the
     // placeholder shown before Ollama answered).
     let previous = selected_choice(ui, state).filter(|c| c.installed).map(|c| c.name);
+    let saved = state.borrow().preferred_model.clone();
     let index = previous
         .and_then(|p| choices.iter().position(|c| ai_engine::same_model(&c.name, &p)))
+        // the model picked last time (it used to come back as the last installed tier, the 12B)
+        .or_else(|| saved.and_then(|m| choices.iter().position(|c| c.installed && ai_engine::same_model(&c.name, &m))))
         .or_else(|| choices.iter().rposition(|c| c.installed && c.tier.is_some()))
         .or_else(|| choices.iter().position(|c| c.installed))
         .unwrap_or(0);
@@ -2271,6 +2276,9 @@ struct Settings {
     char_break: bool,
     scene_prompt: String,
     image_identity_only: bool,
+    /// The AI model picked in the dropdown (its Ollama name), restored at startup.
+    #[serde(default)]
+    ai_model: String,
     image_second_pass: bool,
     scene_body_shape: bool,
     enable_dual_pass: bool,
@@ -2317,6 +2325,7 @@ impl Default for Settings {
             char_break: true,
             scene_prompt: String::new(),
             image_identity_only: false,
+            ai_model: String::new(),
             image_second_pass: true,
             scene_body_shape: false,
             enable_dual_pass: true,
@@ -2336,6 +2345,15 @@ fn settings_path() -> Option<std::path::PathBuf> {
         .map(std::path::PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))?;
     Some(base.join("prompt-condenser").join("settings.json"))
+}
+
+/// The AI model saved in settings.json, if any.
+fn saved_ai_model() -> Option<String> {
+    settings_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|t| serde_json::from_str::<Settings>(&t).ok())
+        .map(|st| st.ai_model)
+        .filter(|m| !m.is_empty())
 }
 
 fn load_settings(ui: &AppWindow) {
@@ -2417,6 +2435,11 @@ fn save_settings(ui: &AppWindow) {
         char_break: ui.get_char_break_enabled(),
         scene_prompt: ui.get_scene_prompt().to_string(),
         image_identity_only: ui.get_image_identity_only(),
+        ai_model: {
+            let mut picked = None;
+            with_state(|state| picked = selected_choice(ui, state).filter(|c| c.installed).map(|c| c.name));
+            picked.or_else(saved_ai_model).unwrap_or_default()
+        },
         image_second_pass: ui.get_image_second_pass(),
         scene_body_shape: ui.get_scene_body_shape(),
         enable_dual_pass: ui.get_enable_dual_pass(),
@@ -2519,6 +2542,7 @@ fn main() -> Result<(), slint::PlatformError> {
         set(&ui, ModelRc::new(VecModel::from(labels)));
     }
     let state: State = Rc::new(RefCell::new(AppState::default()));
+    state.borrow_mut().preferred_model = saved_ai_model();
 
     ui.set_change_cards(ModelRc::from(state.borrow().cards_model.clone()));
 
@@ -2547,6 +2571,7 @@ fn main() -> Result<(), slint::PlatformError> {
         let state = state.clone();
         ui.on_ai_settings_changed(move || {
             let Some(ui) = weak.upgrade() else { return };
+            save_settings(&ui); // remember the AI model / mode right away, not only on close
             clear_ai_cards(&state);
             analyze(&ui, &state);
             update_download_flag(&ui, &state);
