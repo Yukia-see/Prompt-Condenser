@@ -190,12 +190,10 @@ pub fn strong_tags(tags: &[crate::tagger::ScoredTag]) -> Vec<String> {
         .collect()
 }
 
-/// The tagger's breast-size tags at >= 0.5, with their scores: a sure size beats the writer's.
-pub fn confident_size_tags(tags: &[crate::tagger::ScoredTag]) -> Vec<(String, f32)> {
-    tags.iter()
-        .map(|t| (t.name.replace('_', " "), t.score))
-        .filter(|(n, s)| *s >= 0.5 && BREAST_SIZES.contains(&n.as_str()))
-        .collect()
+/// Every tagger tag with its score (prompt spelling): `restore_tagger_tags` only brings back sure ones,
+/// and a sure breast size beats the writer's.
+pub fn tag_scores(tags: &[crate::tagger::ScoredTag]) -> Vec<(String, f32)> {
+    tags.iter().map(|t| (t.name.replace('_', " "), t.score)).collect()
 }
 
 /// Puts the tagger's sure tags back when the writer dropped or contradicted them: a different animal on

@@ -16,8 +16,8 @@ pub struct ImageAiRequest {
     /// The tagger's high-confidence skin / species / count tags (`strong_tags`): the vision model is
     /// asked to check them, and the final prompt may not drop or contradict them.
     pub strong_tags: Vec<String>,
-    /// The tagger's breast-size tags at >= 0.5 with their scores (`confident_size_tags`): they win over the writer's size.
-    pub size_tags: Vec<(String, f32)>,
+    /// Every tagger tag with its score (`tag_scores`): recovery and size authority use only sure ones.
+    pub tagger_scores: Vec<(String, f32)>,
     /// If true and the target text model has vision capability, directly attach image pixels for a 2nd pass visual check.
     pub second_pass_vision: bool,
     /// If true, extract body shape/build from the scene reference for the character.
@@ -491,6 +491,9 @@ pub fn run_dual_pass_asymmetric_pipeline(
 /// Asks a vision model to write a prompt for the image. If a separate vision encoder is set
 /// (such as moondream), it reads the image pixels first and pipes the description into `model`.
 pub fn describe_image(req: &ImageAiRequest) -> Result<ImageAiResult> {
+    // a colorful picture is never treated as monochrome (idempotent; main.rs already does it)
+    let checked = ImageAiRequest { tag_hints: color_checked_hints(&req.tag_hints, &req.image_path), ..req.clone() };
+    let req = &checked;
     if let Some(ref encoder) = req.vision_encoder {
         if !same_model(encoder, &req.model) {
             let vision_desc = observe_image(&req.image_path, &req.host, req.mode, encoder, &req.tag_hints, &req.strong_tags)?;
@@ -502,7 +505,7 @@ pub fn describe_image(req: &ImageAiRequest) -> Result<ImageAiResult> {
     let ask = format!("Write the prompt for this image.{}", image_style_note(&req.tag_hints, panels));
     let mut out = describe_image_with(req, &image_system_prompt(&req.config, &req.tag_hints), &ask)?;
     if std::env::var_os("PC_NO_POLISH").is_none() {
-        out.prompt = polish_image_prompt_with(&out.prompt, "", &req.strong_tags, &req.tag_hints, &req.size_tags);
+        out.prompt = polish_image_prompt_with(&out.prompt, "", &req.strong_tags, &req.tag_hints, &req.tagger_scores);
         out.prompt = apply_image_style(&out.prompt, &req.tag_hints, panels);
     }
     Ok(out)
@@ -578,7 +581,7 @@ pub fn describe_image_with_desc(
     };
     // PC_NO_POLISH=1 turns the last pass off, to measure what it adds (testing only)
     if std::env::var_os("PC_NO_POLISH").is_none() {
-        res.prompt = polish_image_prompt_with(&res.prompt, vision_desc, &req.strong_tags, &req.tag_hints, &req.size_tags);
+        res.prompt = polish_image_prompt_with(&res.prompt, vision_desc, &req.strong_tags, &req.tag_hints, &req.tagger_scores);
         res.prompt = apply_image_style(&res.prompt, &req.tag_hints, panels);
     }
     Ok(res)

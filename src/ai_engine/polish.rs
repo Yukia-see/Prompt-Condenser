@@ -242,6 +242,21 @@ pub fn split_merged_tags(tag: String) -> Vec<String> {
     }
 }
 
+/// `barefoot` / `bare feet` next to footwear can't both be true. Legwear (thighhighs, socks, pantyhose) can
+/// go with bare feet on Danbooru, so only shoes count.
+pub fn drop_contradicted_feet(tags: Vec<String>) -> Vec<String> {
+    let shod = tags.iter().any(|t| {
+        let l = t.to_lowercase();
+        ["shoes", "sneakers", "boots", "sandals", "heels", "loafers", "mary janes", "uwabaki", "footwear", "slippers", "geta"]
+            .iter()
+            .any(|f| l == *f || l.ends_with(&format!(" {f}")))
+    });
+    if !shod {
+        return tags;
+    }
+    tags.into_iter().filter(|t| !matches!(t.to_lowercase().as_str(), "barefoot" | "bare feet" | "bare foot")).collect()
+}
+
 /// Hair tags that contradict a "short hair with long locks" description (twintails, long hair): the
 /// tagger reads the long locks as twintails or long hair, and the writer copies both.
 pub fn drop_contradicted_hair(tags: Vec<String>) -> Vec<String> {
@@ -263,12 +278,27 @@ pub fn one_per_part(tags: Vec<String>) -> Vec<String> {
     let list = crate::danbooru::local();
     let known = |t: &str| list.is_some_and(|l| l.get(t).is_some());
     let lower: Vec<String> = tags.iter().map(|t| t.to_lowercase()).collect();
+    // Two or more characters can each have their own eyes, hair, skin and size (the eye rule had dropped
+    // Aoba's purple eyes next to Lillie's green ones), so nothing is reduced then.
+    let group = lower.iter().any(|t| {
+        crate::two::count_tag(t).is_some_and(|(n, _)| n >= 2) || matches!(t.as_str(), "multiple girls" | "multiple boys")
+    });
+    if group {
+        return tags;
+    }
     let hetero = lower.iter().any(|t| t == "heterochromia");
+    let colorish_word = |w: &str| COLOR_WORDS.contains(&w) || w.contains('-') || w.ends_with("ish");
     let part = |t: &str| -> Option<&'static str> {
         let first = t.split_whitespace().next().unwrap_or("");
-        let colorish = COLOR_WORDS.contains(&first) || first.contains('-') || first.ends_with("ish");
+        let colorish = colorish_word(first);
         if t.ends_with(" eyes") && colorish && !hetero {
             return Some("eye color");
+        }
+        // "pink hair", "light brown hair", "pinkish-orange hair"; not multicolored / two-tone / streaked
+        if let Some(color) = t.strip_suffix(" hair") {
+            if !color.is_empty() && color.split_whitespace().all(|w| colorish_word(w)) {
+                return Some("hair color");
+            }
         }
         if t.ends_with(" skin") && t != "shiny skin" && t != "oily skin" {
             return Some("skin tone");
@@ -316,7 +346,7 @@ pub fn polish_image_prompt_with(
     form: &str,
     strong: &[String],
     tagger_tags: &str,
-    size_tags: &[(String, f32)],
+    tagger_scores: &[(String, f32)],
 ) -> String {
     let tagger: std::collections::HashSet<String> = tagger_tags.split(',').map(crate::danbooru::key).collect();
     let tags: Vec<String> = prompt
@@ -337,9 +367,9 @@ pub fn polish_image_prompt_with(
     let tags = if std::env::var_os("PC_NO_RECONCILE").is_some() {
         validate_tags(tags)
     } else {
-        restore_tagger_tags(validate_tags(tags), tagger_tags, form, size_tags)
+        restore_tagger_tags(validate_tags(tags), tagger_tags, form, tagger_scores)
     };
-    let tags = drop_contradicted_hair(one_per_part(tags));
+    let tags = drop_contradicted_feet(drop_contradicted_hair(one_per_part(tags)));
     let mut seen = std::collections::HashSet::new();
     let tags: Vec<String> = tags.into_iter().filter(|t| seen.insert(crate::danbooru::key(t))).collect();
     let tags = crate::danbooru::dedup_color_parents(&tags.join(", "));
@@ -351,12 +381,20 @@ const UNBACKED_DEFAULTS: &[&str] =
     &["looking at viewer", "full body", "thigh gap", "kemonomimi", "taut clothes", "impossible clothes"];
 /// How many of the tagger's tags may come back after the writer (measured offline: ~18-20 is the best F1).
 const MAX_RECOVERED: usize = 18;
+/// The lowest tagger score a recovered tag needs (when scores are known). `PC_RECOVERY_MIN` overrides it
+/// for measuring (testing only).
+const RECOVERY_MIN: f32 = 0.5;
+
+fn recovery_min() -> f32 {
+    std::env::var("PC_RECOVERY_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(RECOVERY_MIN)
+}
 /// Tagger tags that say nothing on their own (a specific tag says it better) or aren't visible content.
 const RECOVERY_SKIP: &[&str] = &[
     "breasts", "shirt", "skirt", "socks", "shoes", "jewelry", "underwear", "tail", "animal ears", "multiple girls",
     "multiple boys", "thighs", "legs", "ribbon", "bag", "food", "plaid", "clothes", "bow", "gloves", "wings", "jacket",
     "belt", "boots", "dress", "pants", "shorts", "sleeves", "virtual youtuber", "alternate breast size",
     "character name", "copyright name", "artist name", "twitter username", "signature", "watermark",
+    "parody", "style parody", "retro artstyle", "alternate costume", "adapted costume",
 ];
 
 /// Breast sizes, smallest first (for `one_per_part` and the tagger's size authority).
@@ -367,7 +405,7 @@ pub(crate) const BREAST_SIZES: &[&str] =
 /// tagger had right): unbacked defaults go; a breast size the tagger is >= 0.5 sure of replaces the writer's;
 /// then up to `MAX_RECOVERED` of the tagger's tags, in its order, are appended (not ones already there,
 /// quality / count / solo, or `RECOVERY_SKIP`). Conflicts are left to `one_per_part`, which keeps the first.
-pub fn restore_tagger_tags(mut tags: Vec<String>, tagger_tags: &str, form: &str, size_tags: &[(String, f32)]) -> Vec<String> {
+pub fn restore_tagger_tags(mut tags: Vec<String>, tagger_tags: &str, form: &str, tagger_scores: &[(String, f32)]) -> Vec<String> {
     let key = crate::danbooru::key;
     let tagger: Vec<String> = tagger_tags.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect();
     let tagger_keys: std::collections::HashSet<String> = tagger.iter().map(|t| key(t)).collect();
@@ -380,7 +418,7 @@ pub fn restore_tagger_tags(mut tags: Vec<String>, tagger_tags: &str, form: &str,
     });
     // size authority (breasts only: the tagger's hair length is often wrong, e.g. "long hair" for short
     // hair with long locks)
-    if let Some((size, _)) = size_tags
+    if let Some((size, _)) = tagger_scores
         .iter()
         .filter(|(t, s)| *s >= 0.5 && BREAST_SIZES.contains(&key(t).as_str()))
         .max_by(|a, b| a.1.total_cmp(&b.1))
@@ -391,6 +429,8 @@ pub fn restore_tagger_tags(mut tags: Vec<String>, tagger_tags: &str, form: &str,
         }
     }
     let mut present: std::collections::HashSet<String> = tags.iter().map(|t| key(t)).collect();
+    let scores: std::collections::HashMap<String, f32> = tagger_scores.iter().map(|(t, s)| (key(t), *s)).collect();
+    let min = recovery_min();
     let mut added = 0;
     for t in &tagger {
         if added >= MAX_RECOVERED {
@@ -402,6 +442,8 @@ pub fn restore_tagger_tags(mut tags: Vec<String>, tagger_tags: &str, form: &str,
             || k == "solo"
             || crate::two::count_tag(&k).is_some()
             || RECOVERY_SKIP.contains(&k.as_str())
+            // only tags the tagger is sure enough of (unknown score: no scores were passed, keep the old behavior)
+            || scores.get(&k).is_some_and(|s| *s < min)
         {
             continue;
         }
@@ -417,6 +459,41 @@ const MONOCHROME_TAGS: &[&str] = &["monochrome", "greyscale", "sketch", "lineart
 /// What the tagger (and then the writer) see in a sketch's construction lines and joints.
 const SKETCH_ARTIFACTS: &[&str] =
     &["robot", "humanoid robot", "android", "joints", "doll joints", "robot joints", "mechanical parts", "no humans", "mannequin"];
+
+/// True when at least 1.5% of the pixels are clearly colored (saturation > 0.35, neither near black
+/// nor near white). Measured on the test images: pencil sketches on warm paper 0.0%, a peach lineart
+/// chart 0.4%, every color picture 2.8% or more. (A mean color difference fails here: warm photographed
+/// paper scores like a color picture.)
+pub fn is_colorful(img: &image::DynamicImage) -> bool {
+    let small = img.resize(400, 400, image::imageops::FilterType::Triangle).to_rgb8();
+    let total = (small.width() * small.height()).max(1) as f32;
+    let strong = small
+        .pixels()
+        .filter(|p| {
+            let (r, g, b) = (p[0] as f32, p[1] as f32, p[2] as f32);
+            let max = r.max(g).max(b);
+            let min = r.min(g).min(b);
+            max > 40.0 && max < 250.0 && (max - min) / max > 0.35
+        })
+        .count() as f32;
+    strong / total >= 0.015
+}
+
+/// The tagger's tags with `monochrome` / `greyscale` removed when the picture is clearly colorful: the
+/// tagger says monochrome for a color painting with small grey insets, ToriiGate then repeats it, and
+/// the sketch cleanup strips every color. Unchanged when the image can't be read.
+pub fn color_checked_hints(tag_hints: &str, path: &std::path::Path) -> String {
+    let colorful = image::open(path).is_ok_and(|img| is_colorful(&img));
+    if !colorful {
+        return tag_hints.to_string();
+    }
+    tag_hints
+        .split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty() && !matches!(crate::danbooru::key(t).as_str(), "monochrome" | "greyscale"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 
 /// True when the tagger says the picture is a monochrome sketch / line drawing.
 pub fn is_monochrome(tagger_tags: &str) -> bool {
