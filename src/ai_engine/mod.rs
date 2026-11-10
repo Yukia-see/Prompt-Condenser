@@ -544,6 +544,38 @@ mod tests {
     }
 
     #[test]
+    fn colorful_pictures_are_not_monochrome_and_rivals_are_resolved() {
+        // warm paper with grey lines is not colorful; a few strong colors are
+        let mut paper = image::RgbImage::from_pixel(400, 400, image::Rgb([240, 228, 205]));
+        for x in 0..400 {
+            paper.put_pixel(x, 200, image::Rgb([60, 60, 60]));
+        }
+        assert!(!is_colorful(&image::DynamicImage::ImageRgb8(paper.clone())));
+        let mut painting = paper;
+        for x in 0..80 {
+            for y in 0..40 {
+                painting.put_pixel(x, y, image::Rgb([30, 170, 90])); // 2% emerald
+            }
+        }
+        assert!(is_colorful(&image::DynamicImage::ImageRgb8(painting.clone())));
+        let file = std::env::temp_dir().join(format!("pc_colorful_{}.png", std::process::id()));
+        painting.save(&file).unwrap();
+        assert_eq!(color_checked_hints("1girl, monochrome, greyscale, armor", &file), "1girl, armor");
+        let _ = std::fs::remove_file(&file);
+        // recovery only brings back tags the tagger is sure of
+        let v = |s: &str| s.split(", ").map(str::to_string).collect::<Vec<String>>();
+        let scores = vec![("white shirt".to_string(), 0.9), ("ooarai military uniform".to_string(), 0.38)];
+        let out = restore_tagger_tags(v("1girl"), "white shirt, ooarai military uniform, style parody", "", &scores);
+        assert_eq!(out, v("1girl, white shirt"));
+        // one hair color for one character; a group keeps every color
+        assert_eq!(one_per_part(v("1girl, pink hair, orange hair, blonde hair, multicolored hair")), v("1girl, pink hair, multicolored hair"));
+        assert_eq!(one_per_part(v("2girls, purple hair, blonde hair, purple eyes, green eyes")), v("2girls, purple hair, blonde hair, purple eyes, green eyes"));
+        // barefoot goes next to shoes, stays next to thighhighs
+        assert_eq!(drop_contradicted_feet(v("barefoot, mary janes, white socks")), v("mary janes, white socks"));
+        assert_eq!(drop_contradicted_feet(v("barefoot, black thighhighs")), v("barefoot, black thighhighs"));
+    }
+
+    #[test]
     fn the_writers_dropped_tagger_tags_come_back_with_the_same_checks() {
         let v = |s: &str| s.split(", ").map(str::to_string).collect::<Vec<String>>();
         // unbacked defaults go; backed ones (tagger or description) stay
@@ -747,7 +779,7 @@ mod tests {
         let req = ImageAiRequest {
             host, model: "prompt-condenser-gemma4-e4b".into(), vision_encoder: Some("huihui_ai/qwen2.5-vl-abliterated:3b".into()),
             mode: AiMode::Gpu, image_path: std::path::PathBuf::from("/nonexistent.png"), config,
-            tag_hints: "1girl, green hair, thighhighs".into(), strong_tags: Vec::new(), size_tags: Vec::new(), second_pass_vision: false, scene_body_shape: false,
+            tag_hints: "1girl, green hair, thighhighs".into(), strong_tags: Vec::new(), tagger_scores: Vec::new(), second_pass_vision: false, scene_body_shape: false,
         };
         let out = describe_image_with_desc(&req, "A girl with green hair wearing black thigh-highs.", "qwen").unwrap();
         let calls: Vec<String> = log.lock().unwrap().iter().filter(|(p, _)| p == "/api/generate").map(|(_, b)| b.clone()).collect();
@@ -1066,7 +1098,7 @@ mod tests {
                 config,
                 tag_hints: hints.clone(),
                 strong_tags: strong.clone(),
-                size_tags: confident_size_tags(&scored),
+                tagger_scores: tag_scores(&scored),
                 second_pass_vision: false,
                 scene_body_shape: false,
             };
