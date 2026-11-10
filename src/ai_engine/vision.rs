@@ -110,8 +110,7 @@ pub(crate) fn image_system_prompt(config: &ScanConfig, tag_hints: &str) -> Strin
          contradicts it, and use the description for what the tagger can't name (garment details, poses, held items).\n\
          - When multiple characters are present (e.g. 2girls, 3girls):\n\
            * NEVER assign them all the same generic pose or shared body size in the main tag list.\n\
-           * Include contrast meta-tags in the scene header when they differ: 'alternate breast size', 'different hair colors', 'contrasting poses', 'same height, equal height'.\n\
-           * Lock vertical stature: include 'same height, equal height' and 'standing upright' on upright figures to prevent leaning or proportion distortion from squishing characters vertically.\n\
+           * Include contrast meta-tags in the scene header only when they really differ: 'different hair colors', 'contrasting poses'.\n\
            * Isolate characters using BREAK chunk fencing by default: [quality, count, scene header, contrast tags], BREAK, 1girl, on the left, [traits, outfit, pose], BREAK, 1girl, in the middle, [traits, outfit, pose], BREAK, 1girl, on the right, [traits, outfit, pose].\n\
            * Modifier isolation: never use leaky adjectives like 'giant' near chest areas; use 'flat chest' or 'petite bust' to strictly enforce small upper profiles and prevent attribute bleed, and use 'large ass, wide hips' for lower curves.\n\
          - Never write the checkpoint's name in the prompt.\n\
@@ -546,6 +545,8 @@ pub fn describe_image_with_desc(
          (locks, sidelocks, bangs, how it is tied), hair ornaments and their shape, how each garment is worn (open, off the \
          shoulders, unbuttoned), garment colors and materials, footwear type and color, where the arms and hands are, the \
          framing and the background. Do not summarize or drop details. Leave out character names, scores and notes.";
+    let panels = image::open(&req.image_path).map(|i| panel_count(&i)).unwrap_or(1);
+    let keep_details = format!("{keep_details}{}", image_style_note(&req.tag_hints, panels));
     let user_prompt = if enriched_hints.trim().is_empty() {
         format!(
             "## Visual description from vision encoder ({encoder_name}):\n{vision_desc}{candidates}{second_pass_note}{keep_details}\n\nWrite the prompt for this image."
@@ -567,6 +568,7 @@ pub fn describe_image_with_desc(
     // PC_NO_POLISH=1 turns the last pass off, to measure what it adds (testing only)
     if std::env::var_os("PC_NO_POLISH").is_none() {
         res.prompt = polish_image_prompt_with(&res.prompt, vision_desc, &req.strong_tags, &req.tag_hints);
+        res.prompt = apply_image_style(&res.prompt, &req.tag_hints, panels);
     }
     Ok(res)
 }

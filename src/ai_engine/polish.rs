@@ -125,6 +125,13 @@ pub fn validate_tags(tags: Vec<String>) -> Vec<String> {
             out.push(fixed.name.clone());
             continue;
         }
+        // An unknown phrase made of known tags plus filler ("from behind looking back at viewer",
+        // "tight white shirt", "parted lips showing upper teeth") becomes those tags. Kept whole when the
+        // only extra words are colors ("teal bikini top"): that is a description worth keeping.
+        if let Some(pieces) = known_pieces(&l, list) {
+            out.extend(pieces);
+            continue;
+        }
         // Unknown multi-word tags are kept: the tag list is only the ~10,000 most common tags, and
         // descriptive ones ("white teal bikini top") are what Anima reads best. Dropping them emptied a
         // whole prompt in testing. Only phrases about nothing visible go.
@@ -134,6 +141,49 @@ pub fn validate_tags(tags: Vec<String>) -> Vec<String> {
         }
     }
     out
+}
+
+/// The known tags inside an unknown phrase, longest match first, left to right. `None` when there are
+/// none, or when the words left over are only colors (then the phrase stays as a description).
+fn known_pieces(phrase: &str, list: &crate::danbooru::TagList) -> Option<Vec<String>> {
+    let words: Vec<&str> = phrase.split_whitespace().collect();
+    if words.len() < 2 {
+        return None;
+    }
+    let mut pieces = Vec::new();
+    let mut leftover = Vec::new();
+    let mut i = 0;
+    while i < words.len() {
+        let found = (i + 1..=words.len()).rev().find(|&j| {
+            let cand = words[i..j].join(" ");
+            // single words only when they are tags on their own and not a bare color or size
+            (j - i > 1 || !(COLOR_WORDS.contains(&words[i]) || matches!(words[i], "large" | "small" | "long" | "short" | "medium")))
+                && list.get(&cand).is_some()
+        });
+        match found {
+            Some(j) => {
+                pieces.push(words[i..j].join(" "));
+                i = j;
+            }
+            None => {
+                leftover.push(words[i]);
+                i += 1;
+            }
+        }
+    }
+    // "looking back at viewer": the gaze tag is split by the matcher, so it is put back
+    if words.contains(&"looking") && phrase.contains("at viewer") && !pieces.iter().any(|p| p == "looking at viewer") {
+        pieces.push("looking at viewer".to_string());
+        leftover.retain(|w| !matches!(*w, "at" | "viewer"));
+    }
+    // Kept whole when only colors are left over, or when the last word (the thing described, as in
+    // "teal bikini top") is not part of a known tag.
+    let head_covered = !leftover.last().is_some_and(|w| Some(w) == words.last());
+    let only_colors_left = !leftover.is_empty() && leftover.iter().all(|w| COLOR_WORDS.contains(w));
+    if pieces.is_empty() || only_colors_left || !head_covered {
+        return None;
+    }
+    Some(pieces)
 }
 
 /// Splits a tag the writer ran together without commas ("blue jacket open jacket off the shoulders")
@@ -260,3 +310,123 @@ pub fn polish_image_prompt_with(prompt: &str, form: &str, strong: &[String], tag
     let tags: Vec<String> = tags.into_iter().filter(|t| seen.insert(crate::danbooru::key(t))).collect();
     enforce_strong_tags(&tags.join(", "), strong)
 }
+
+/// The tagger's style tags that mean "no colors in this picture".
+const MONOCHROME_TAGS: &[&str] = &["monochrome", "greyscale", "sketch", "lineart"];
+/// What the tagger (and then the writer) see in a sketch's construction lines and joints.
+const SKETCH_ARTIFACTS: &[&str] =
+    &["robot", "humanoid robot", "android", "joints", "doll joints", "robot joints", "mechanical parts", "no humans", "mannequin"];
+
+/// True when the tagger says the picture is a monochrome sketch / line drawing.
+pub fn is_monochrome(tagger_tags: &str) -> bool {
+    tagger_tags.split(',').map(crate::danbooru::key).any(|t| MONOCHROME_TAGS.contains(&t.as_str()))
+}
+
+/// Finds full-height vertical divider lines (a dark line splitting the picture into panels, like a
+/// two-panel comparison) and returns the number of panels: 1 when there is none. Only lines in the
+/// middle half count, so a frame border isn't one.
+pub fn panel_count(img: &image::DynamicImage) -> usize {
+    let small = img.resize(400, 400, image::imageops::FilterType::Triangle).to_luma8();
+    let (w, h) = small.dimensions();
+    if w < 40 || h < 40 {
+        return 1;
+    }
+    let dark_share = |x: u32| (0..h).filter(|&y| small.get_pixel(x, y)[0] < 70).count() as f32 / h as f32;
+    let shares: Vec<f32> = (0..w).map(dark_share).collect();
+    let mut dividers = 0;
+    let mut x = w / 4;
+    while x < w * 3 / 4 {
+        if shares[x as usize] >= 0.92 {
+            // a run of dark columns is one line; it must be thin and stand out from both sides
+            let start = x;
+            while x < w && shares[x as usize] >= 0.92 {
+                x += 1;
+            }
+            let thin = x - start <= w / 25 + 1;
+            let left = shares[start.saturating_sub(6) as usize];
+            let right = shares[(x + 5).min(w - 1) as usize];
+            if thin && left < 0.5 && right < 0.5 {
+                dividers += 1;
+            }
+        }
+        x += 1;
+    }
+    dividers + 1
+}
+
+/// The writer's extra instructions for a sketch or a picture split into panels.
+pub fn image_style_note(tagger_tags: &str, panels: usize) -> String {
+    let mut note = String::new();
+    if is_monochrome(tagger_tags) {
+        note.push_str(
+            "\n\n## Style: monochrome sketch\nThis picture is a monochrome sketch / line drawing. It has no colors, so write \
+             no color tags (hair, eyes, clothes). Construction lines, circles and joints are drawing guides, not robot or doll \
+             parts. Keep the style tags (monochrome, sketch, lineart, traditional media).",
+        );
+    }
+    if panels > 1 {
+        note.push_str(&format!(
+            "\n\n## Panels\nThe picture is split into {panels} panels that show the same character in different poses or \
+             outfits. Write `multiple views`, count the character once (1girl, not 2girls), and tag what each panel shows: \
+             every pose, outfit and held item."
+        ));
+    }
+    note
+}
+
+/// Last fixes on an image prompt: a sketch loses color tags and robot / joint tags and keeps its style
+/// tags; a picture with panels gets `multiple views`; character names the tagger recognized (>= 0.85)
+/// are put back if the writer dropped them.
+pub fn apply_image_style(prompt: &str, tagger_tags: &str, panels: usize) -> String {
+    let tagger: Vec<String> = tagger_tags.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect();
+    let mut tags: Vec<String> = prompt.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect();
+    let has = |tags: &[String], t: &str| tags.iter().any(|x| crate::danbooru::key(x) == crate::danbooru::key(t));
+    if is_monochrome(tagger_tags) {
+        tags.retain(|t| {
+            let k = crate::danbooru::key(t);
+            if SKETCH_ARTIFACTS.contains(&k.as_str()) {
+                return false;
+            }
+            let first = k.split_whitespace().next().unwrap_or("");
+            // "white background" is still right for a sketch on paper
+            !(COLOR_WORDS.contains(&first) && k.split_whitespace().count() > 1 && !k.ends_with("background"))
+        });
+        for style in ["monochrome", "greyscale", "sketch", "lineart", "traditional media"] {
+            if tagger.iter().any(|t| crate::danbooru::key(t) == style) && !has(&tags, style) {
+                tags.push(style.to_string());
+            }
+        }
+    }
+    // The tagger saw no people (a logo, scenery): the writer may not invent a girl. Not for sketches,
+    // where "no humans" comes from the construction lines.
+    if !is_monochrome(tagger_tags) && tagger.iter().any(|t| crate::danbooru::key(t) == "no humans") {
+        tags.retain(|t| {
+            let k = crate::danbooru::key(t);
+            crate::two::count_tag(&k).is_none() && !matches!(k.as_str(), "solo" | "multiple girls" | "multiple boys")
+        });
+        if !has(&tags, "no humans") {
+            let at = tags.iter().position(|t| !is_quality_tag_any(&crate::danbooru::key(t))).unwrap_or(tags.len());
+            tags.insert(at, "no humans".to_string());
+        }
+    }
+    if panels > 1 && !has(&tags, "multiple views") {
+        tags.push("multiple views".to_string());
+    }
+    // recognized characters go right after the quality / count tags
+    let names: Vec<String> =
+        tagger.iter().filter(|t| crate::danbooru::is_character(t) && !has(&tags, t)).cloned().collect();
+    if !names.is_empty() {
+        let at = tags
+            .iter()
+            .position(|t| {
+                let k = crate::danbooru::key(t);
+                !(is_quality_tag_any(&k) || crate::two::count_tag(&k).is_some() || k == "solo")
+            })
+            .unwrap_or(tags.len());
+        for (i, n) in names.into_iter().enumerate() {
+            tags.insert(at + i, n);
+        }
+    }
+    tags.join(", ")
+}
+

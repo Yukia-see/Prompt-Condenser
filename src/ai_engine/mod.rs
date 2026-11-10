@@ -533,6 +533,50 @@ mod tests {
         }
     }
 
+    /// `IMAGE_TEST=a.png:b.png cargo test live_panels -- --ignored --nocapture`: panels found per image.
+    #[test]
+    #[ignore]
+    fn live_panels() {
+        for path in std::env::var("IMAGE_TEST").unwrap().split(':') {
+            let img = image::open(path).unwrap();
+            println!("PANELS {} {}", panel_count(&img), path);
+        }
+    }
+
+    #[test]
+    fn sketches_panels_and_names_are_fixed_up() {
+        // a sketch: no colors, no robot parts, style tags kept
+        let out = apply_image_style(
+            "1girl, black hair, aqua eyes, humanoid robot, joints, serafuku, white background",
+            "1girl, monochrome, sketch, robot, traditional media",
+            1,
+        );
+        assert_eq!(out, "1girl, serafuku, white background, monochrome, sketch, traditional media");
+        // filler phrases become the tags inside them; color descriptions stay whole
+        if crate::danbooru::local().is_some() {
+            let v = validate_tags(vec!["from behind looking back at viewer".into(), "tight white shirt".into(), "teal bikini top".into()]);
+            assert_eq!(v, vec!["from behind", "looking back", "looking at viewer", "white shirt", "teal bikini top"], "{v:?}");
+        }
+        // no humans: the invented girl goes
+        assert_eq!(apply_image_style("masterpiece, solo, 1girl, logo, paw print", "no humans, paw print", 1), "masterpiece, no humans, logo, paw print");
+        // panels add multiple views
+        assert!(apply_image_style("1girl, smile", "1girl", 2).ends_with("multiple views"));
+        // a character name the tagger recognized comes back after the count tags
+        if crate::danbooru::local().is_some() {
+            let out = apply_image_style("masterpiece, 1girl, solo, bat wings", "rouge the bat, furry, bat wings", 1);
+            assert_eq!(out, "masterpiece, 1girl, solo, rouge the bat, bat wings");
+        }
+        // a dark full-height line in the middle splits the picture into two panels; a plain one has none
+        let mut img = image::RgbImage::from_pixel(800, 600, image::Rgb([240, 200, 220]));
+        assert_eq!(panel_count(&image::DynamicImage::ImageRgb8(img.clone())), 1);
+        for x in 398..404 {
+            for y in 0..600 {
+                img.put_pixel(x, y, image::Rgb([10, 10, 10]));
+            }
+        }
+        assert_eq!(panel_count(&image::DynamicImage::ImageRgb8(img)), 2);
+    }
+
     #[test]
     fn cancel_stops_a_scan_before_its_next_request() {
         let _turn = scan_lock();

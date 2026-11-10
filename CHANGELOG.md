@@ -12,3 +12,5 @@ History moved out of CLAUDE.md: benchmarks, and models or modes that were tried 
 ## Image reads
 
 - Local test set baseline (2026-11-09, 6 images in tests/eval_local, default chain tagger → ToriiGate → E4B → polish, `tools/eval_images.sh`): average F1 41% (gym girl 59, raccoon girl 47, pencil sketch 43, two gym girls 39, Rouge 35, two-panel schoolgirl 26), ~30 s per image. Weak spots: the sketch was called a "humanoid robot" with black hair; two-panel images are read as one girl.
+- Bigger local test set (19 images, 2026-11-09): baseline 31% average F1 (recall 33, precision 30). Sketch / panel / name / filler fixes: 39% (recall 41, precision 38); biggest gains on the three schoolgirls (8 → 32), two-panel schoolgirl (21 → 43), office pair (28 → 49), Rouge (27 → 46), raccoon girl (42 → 59). One image swings about ±5 points between runs. The logo fell 26 → 11 in that run because the writer invented a girl; the `no humans` guard was added after.
+- MiniCPM-V 2.6 (8B) as the vision model, raccoon image: 38% vs ToriiGate 42-47%, same speed (37 s); long hair, cat ears and thighhighs were wrong, glasses and red eyes missing. Removed.
