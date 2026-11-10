@@ -15,7 +15,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Generic (non-Arch) installer bundle: `scripts/build_installer.sh` → `dist/prompt-condenser-installer{,.tar.gz}` (binary plus `install.sh`; no bundled models). Builds with `-C target-cpu=x86-64-v3` (override via `TARGET_CPU`).
 - Install for current user: `./install.sh` (also works from the bundle). It installs and starts Ollama (with an `OLLAMA_VULKAN=1` systemd drop-in), installs the app into `~/.local`, and offers to pull the recommended model (`richardyoung/llama-3.1-8b-instruct-abliterated`) through Ollama. `./install.sh --uninstall` removes the app.
 
-Measurements and the history of removed models/modes are in `CHANGELOG.md`; image-read quality is measured with `tools/eval_images.sh` (local images + answer files in the gitignored `tests/eval_local/`, scored by `tools/score_image_prompts.py`).
+Measurements and the history of removed models/modes are in `CHANGELOG.md`; image-read quality is measured with `tools/eval_images.sh` (local images + answer files in the gitignored `tests/eval_local/`, scored by `tools/score_image_prompts.py`; AI-generated test images live in `tests/eval_local/ai_generated/` and are skipped unless `--all`).
 
 ## Architecture
 

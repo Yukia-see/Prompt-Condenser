@@ -6,7 +6,10 @@ from a file or stdin. Each image needs an answer file next to it with the same n
 the Danbooru tags a good prompt should contain. Prints recall, precision and F1 per image and the
 average F1. Quality tags and `solo` are ignored on both sides.
 
-Usage: tools/score_image_prompts.py results.txt [label]
+Images in an `ai_generated/` folder are skipped (AI-made pictures could flatter the scores); pass --all
+to include them.
+
+Usage: tools/score_image_prompts.py results.txt [label] [--all]
 """
 import re
 import sys
@@ -37,10 +40,14 @@ def parse(text: str):
 
 
 def main():
-    text = open(sys.argv[1]).read() if len(sys.argv) > 1 and sys.argv[1] != "-" else sys.stdin.read()
-    label = sys.argv[2] if len(sys.argv) > 2 else ""
+    args = [a for a in sys.argv[1:] if a != "--all"]
+    include_ai = "--all" in sys.argv[1:]
+    text = open(args[0]).read() if args and args[0] != "-" else sys.stdin.read()
+    label = args[1] if len(args) > 1 else ""
     rows = []
     for image, prompt in parse(text):
+        if "/ai_generated/" in image and not include_ai:
+            continue
         answer = Path(image).with_suffix(".txt")
         if not answer.exists():
             print(f"(no answer file for {image})", file=sys.stderr)
