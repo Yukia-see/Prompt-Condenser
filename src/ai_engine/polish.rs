@@ -333,7 +333,12 @@ pub fn polish_image_prompt_with(
     }
     // The tagger's tags come back before the one-per-part checks, so they get the same checks as the
     // writer's, and the writer's (listed first) wins a conflict.
-    let tags = restore_tagger_tags(validate_tags(tags), tagger_tags, form, size_tags);
+    // PC_NO_RECONCILE=1 skips it, to measure what it adds (testing only)
+    let tags = if std::env::var_os("PC_NO_RECONCILE").is_some() {
+        validate_tags(tags)
+    } else {
+        restore_tagger_tags(validate_tags(tags), tagger_tags, form, size_tags)
+    };
     let tags = drop_contradicted_hair(one_per_part(tags));
     let mut seen = std::collections::HashSet::new();
     let tags: Vec<String> = tags.into_iter().filter(|t| seen.insert(crate::danbooru::key(t))).collect();
