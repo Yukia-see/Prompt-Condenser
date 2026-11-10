@@ -544,6 +544,37 @@ mod tests {
     }
 
     #[test]
+    fn the_writers_dropped_tagger_tags_come_back_with_the_same_checks() {
+        let v = |s: &str| s.split(", ").map(str::to_string).collect::<Vec<String>>();
+        // unbacked defaults go; backed ones (tagger or description) stay
+        let out = restore_tagger_tags(v("1girl, smile, looking at viewer, full body, thigh gap"), "", "she stands, full body visible", &[]);
+        assert_eq!(out, v("1girl, smile, full body"));
+        let out = restore_tagger_tags(v("1girl, looking at viewer"), "looking at viewer", "", &[]);
+        assert_eq!(out, v("1girl, looking at viewer"));
+        // a sure tagger size replaces the writer's, in place
+        let out = restore_tagger_tags(v("1girl, large breasts, smile"), "gigantic breasts", "", &[("gigantic breasts".into(), 0.93)]);
+        assert_eq!(out, v("1girl, gigantic breasts, smile"));
+        // recovery: tagger order, nothing present / generic / noise / count, at most 18
+        let tagger = "1girl, solo, breasts, virtual youtuber, white shirt, smile, shirt, loose socks";
+        let out = restore_tagger_tags(v("1girl, smile"), tagger, "", &[]);
+        assert_eq!(out, v("1girl, smile, white shirt, loose socks"));
+        let many: Vec<String> = (0..30).map(|i| format!("tag{i}")).collect();
+        assert_eq!(restore_tagger_tags(v("1girl"), &many.join(", "), "", &[]).len(), 1 + 18);
+        // through the whole polish: the writer's size and hair win over recovered rivals
+        let out = polish_image_prompt_with(
+            "1girl, short hair, long sidelocks, huge breasts, crop top",
+            "",
+            &[],
+            "1girl, long hair, large breasts, shirt, crop top, navel",
+            &[],
+        );
+        assert!(!out.split(", ").any(|t| t == "long hair" || t == "large breasts" || t == "shirt"), "{out}");
+        assert!(out.contains("huge breasts") && out.contains("navel"), "{out}");
+        // bare parents go next to a specific version
+        assert_eq!(crate::danbooru::dedup_color_parents("raccoon tail, tail, large breasts, breasts"), "raccoon tail, large breasts");
+    }
+
+    #[test]
     fn sketches_panels_and_names_are_fixed_up() {
         // a sketch: no colors, no robot parts, style tags kept
         let out = apply_image_style(
@@ -716,7 +747,7 @@ mod tests {
         let req = ImageAiRequest {
             host, model: "prompt-condenser-gemma4-e4b".into(), vision_encoder: Some("huihui_ai/qwen2.5-vl-abliterated:3b".into()),
             mode: AiMode::Gpu, image_path: std::path::PathBuf::from("/nonexistent.png"), config,
-            tag_hints: "1girl, green hair, thighhighs".into(), strong_tags: Vec::new(), second_pass_vision: false, scene_body_shape: false,
+            tag_hints: "1girl, green hair, thighhighs".into(), strong_tags: Vec::new(), size_tags: Vec::new(), second_pass_vision: false, scene_body_shape: false,
         };
         let out = describe_image_with_desc(&req, "A girl with green hair wearing black thigh-highs.", "qwen").unwrap();
         let calls: Vec<String> = log.lock().unwrap().iter().filter(|(p, _)| p == "/api/generate").map(|(_, b)| b.clone()).collect();
@@ -1035,6 +1066,7 @@ mod tests {
                 config,
                 tag_hints: hints.clone(),
                 strong_tags: strong.clone(),
+                size_tags: confident_size_tags(&scored),
                 second_pass_vision: false,
                 scene_body_shape: false,
             };

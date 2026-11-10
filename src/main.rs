@@ -1217,6 +1217,7 @@ fn read_char_blocking(path: &std::path::Path, ctx: &ReadCtx, progress: &(dyn Fn(
         config: ctx.config.clone(),
         tag_hints: hints.clone(),
         strong_tags: ai_engine::strong_tags(&tags),
+        size_tags: ai_engine::confident_size_tags(&tags),
         second_pass_vision: ctx.second_pass,
         scene_body_shape: ctx.scene_body_shape,
     };
@@ -1297,6 +1298,7 @@ fn read_scene_blocking(
         config: ctx.config.clone(),
         tag_hints: hints.clone(),
         strong_tags: Vec::new(),
+        size_tags: Vec::new(),
         second_pass_vision: ctx.second_pass,
         scene_body_shape: ctx.scene_body_shape,
     };
@@ -1936,6 +1938,7 @@ fn run_ai_image(ui: &AppWindow, state: &State) {
         config: scan_config(ui),
         tag_hints: String::new(),
         strong_tags: Vec::new(),
+        size_tags: Vec::new(),
         second_pass_vision: second_pass,
         scene_body_shape: ui.get_scene_body_shape(),
     };
@@ -2063,6 +2066,7 @@ fn run_ai_image(ui: &AppWindow, state: &State) {
         if let Some(t) = &tags {
             req.tag_hints = tagger::build_prompt(t, threshold).prompt;
             req.strong_tags = ai_engine::strong_tags(t);
+            req.size_tags = ai_engine::confident_size_tags(t);
         }
         let say = status_sender(&weak);
         let vision_desc_res = (!ai_engine::same_model(&encoder, &text_model)).then(|| {

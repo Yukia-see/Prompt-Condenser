@@ -279,6 +279,9 @@ pub fn one_per_part(tags: Vec<String>) -> Vec<String> {
         if matches!(t, "thigh boots" | "knee boots" | "ankle boots" | "knee high boots" | "knee-high boots" | "thigh-high boots" | "thigh high boots") {
             return Some("boot height");
         }
+        if BREAST_SIZES.contains(&t) {
+            return Some("breast size");
+        }
         None
     };
     let mut chosen: std::collections::HashMap<&'static str, usize> = std::collections::HashMap::new();
@@ -308,7 +311,13 @@ pub fn one_per_part(tags: Vec<String>) -> Vec<String> {
 /// `polish_image_prompt`, plus: a Danbooru character name stays only if the tagger's tags (`tagger_tags`)
 /// name that character too. Vision models invent identities (ToriiGate called an OC "Musashi from Azur
 /// Lane"); the tagger only reports characters it recognizes.
-pub fn polish_image_prompt_with(prompt: &str, form: &str, strong: &[String], tagger_tags: &str) -> String {
+pub fn polish_image_prompt_with(
+    prompt: &str,
+    form: &str,
+    strong: &[String],
+    tagger_tags: &str,
+    size_tags: &[(String, f32)],
+) -> String {
     let tagger: std::collections::HashSet<String> = tagger_tags.split(',').map(crate::danbooru::key).collect();
     let tags: Vec<String> = prompt
         .split(',')
@@ -322,10 +331,80 @@ pub fn polish_image_prompt_with(prompt: &str, form: &str, strong: &[String], tag
             tags.push(t);
         }
     }
-    let tags = drop_contradicted_hair(one_per_part(validate_tags(tags)));
+    // The tagger's tags come back before the one-per-part checks, so they get the same checks as the
+    // writer's, and the writer's (listed first) wins a conflict.
+    let tags = restore_tagger_tags(validate_tags(tags), tagger_tags, form, size_tags);
+    let tags = drop_contradicted_hair(one_per_part(tags));
     let mut seen = std::collections::HashSet::new();
     let tags: Vec<String> = tags.into_iter().filter(|t| seen.insert(crate::danbooru::key(t))).collect();
-    enforce_strong_tags(&tags.join(", "), strong)
+    let tags = crate::danbooru::dedup_color_parents(&tags.join(", "));
+    enforce_strong_tags(&tags, strong)
+}
+
+/// Defaults a small writer adds without looking: kept only when the tagger or the description backs them.
+const UNBACKED_DEFAULTS: &[&str] =
+    &["looking at viewer", "full body", "thigh gap", "kemonomimi", "taut clothes", "impossible clothes"];
+/// How many of the tagger's tags may come back after the writer (measured offline: ~18-20 is the best F1).
+const MAX_RECOVERED: usize = 18;
+/// Tagger tags that say nothing on their own (a specific tag says it better) or aren't visible content.
+const RECOVERY_SKIP: &[&str] = &[
+    "breasts", "shirt", "skirt", "socks", "shoes", "jewelry", "underwear", "tail", "animal ears", "multiple girls",
+    "multiple boys", "thighs", "legs", "ribbon", "bag", "food", "plaid", "clothes", "bow", "gloves", "wings", "jacket",
+    "belt", "boots", "dress", "pants", "shorts", "sleeves", "virtual youtuber", "alternate breast size",
+    "character name", "copyright name", "artist name", "twitter username", "signature", "watermark",
+];
+
+/// Breast sizes, smallest first (for `one_per_part` and the tagger's size authority).
+pub(crate) const BREAST_SIZES: &[&str] =
+    &["flat chest", "small breasts", "medium breasts", "large breasts", "huge breasts", "gigantic breasts"];
+
+/// Reconciles the writer's tags with the tagger's (the writer dropped 202 of 314 missed answer tags that the
+/// tagger had right): unbacked defaults go; a breast size the tagger is >= 0.5 sure of replaces the writer's;
+/// then up to `MAX_RECOVERED` of the tagger's tags, in its order, are appended (not ones already there,
+/// quality / count / solo, or `RECOVERY_SKIP`). Conflicts are left to `one_per_part`, which keeps the first.
+pub fn restore_tagger_tags(mut tags: Vec<String>, tagger_tags: &str, form: &str, size_tags: &[(String, f32)]) -> Vec<String> {
+    let key = crate::danbooru::key;
+    let tagger: Vec<String> = tagger_tags.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect();
+    let tagger_keys: std::collections::HashSet<String> = tagger.iter().map(|t| key(t)).collect();
+    let form_lower = form.to_lowercase();
+    tags.retain(|t| {
+        let k = key(t);
+        !UNBACKED_DEFAULTS.contains(&k.as_str())
+            || tagger_keys.contains(&k)
+            || crate::danbooru::prose_has_pub(&form_lower, &k)
+    });
+    // size authority (breasts only: the tagger's hair length is often wrong, e.g. "long hair" for short
+    // hair with long locks)
+    if let Some((size, _)) = size_tags
+        .iter()
+        .filter(|(t, s)| *s >= 0.5 && BREAST_SIZES.contains(&key(t).as_str()))
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+    {
+        if let Some(at) = tags.iter().position(|t| BREAST_SIZES.contains(&key(t).as_str())) {
+            tags.retain(|t| !BREAST_SIZES.contains(&key(t).as_str()));
+            tags.insert(at.min(tags.len()), size.clone());
+        }
+    }
+    let mut present: std::collections::HashSet<String> = tags.iter().map(|t| key(t)).collect();
+    let mut added = 0;
+    for t in &tagger {
+        if added >= MAX_RECOVERED {
+            break;
+        }
+        let k = key(t);
+        if present.contains(&k)
+            || is_quality_tag_any(&k)
+            || k == "solo"
+            || crate::two::count_tag(&k).is_some()
+            || RECOVERY_SKIP.contains(&k.as_str())
+        {
+            continue;
+        }
+        present.insert(k);
+        tags.push(t.clone());
+        added += 1;
+    }
+    tags
 }
 
 /// The tagger's style tags that mean "no colors in this picture".

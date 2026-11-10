@@ -793,6 +793,9 @@ pub fn dedup_color_parents(prompt: &str) -> String {
         "tail",
         "ears",
         "thigh strap",
+        "breasts",
+        "underwear",
+        "food",
     ];
     let items: Vec<&str> = prompt.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
     let norms: Vec<String> = items.iter().map(|s| key(s)).collect();

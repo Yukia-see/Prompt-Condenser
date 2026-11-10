@@ -16,6 +16,8 @@ pub struct ImageAiRequest {
     /// The tagger's high-confidence skin / species / count tags (`strong_tags`): the vision model is
     /// asked to check them, and the final prompt may not drop or contradict them.
     pub strong_tags: Vec<String>,
+    /// The tagger's breast-size tags at >= 0.5 with their scores (`confident_size_tags`): they win over the writer's size.
+    pub size_tags: Vec<(String, f32)>,
     /// If true and the target text model has vision capability, directly attach image pixels for a 2nd pass visual check.
     pub second_pass_vision: bool,
     /// If true, extract body shape/build from the scene reference for the character.
@@ -500,7 +502,7 @@ pub fn describe_image(req: &ImageAiRequest) -> Result<ImageAiResult> {
     let ask = format!("Write the prompt for this image.{}", image_style_note(&req.tag_hints, panels));
     let mut out = describe_image_with(req, &image_system_prompt(&req.config, &req.tag_hints), &ask)?;
     if std::env::var_os("PC_NO_POLISH").is_none() {
-        out.prompt = polish_image_prompt_with(&out.prompt, "", &req.strong_tags, &req.tag_hints);
+        out.prompt = polish_image_prompt_with(&out.prompt, "", &req.strong_tags, &req.tag_hints, &req.size_tags);
         out.prompt = apply_image_style(&out.prompt, &req.tag_hints, panels);
     }
     Ok(out)
@@ -552,7 +554,8 @@ pub fn describe_image_with_desc(
     let keep_details = "\n\n## Keep every detail\nTurn EVERY concrete visual detail in the description into tags: hair style \
          (locks, sidelocks, bangs, how it is tied), hair ornaments and their shape, how each garment is worn (open, off the \
          shoulders, unbuttoned), garment colors and materials, footwear type and color, where the arms and hands are, the \
-         framing and the background. Do not summarize or drop details. Leave out character names, scores and notes.";
+         framing and the background. Do not summarize or drop details. Leave out character names, scores and notes. \
+         For items the tagger detected and you agree with, copy the tagger's tag spelling word for word instead of rewording it.";
     let panels = image::open(&req.image_path).map(|i| panel_count(&i)).unwrap_or(1);
     let keep_details = format!("{keep_details}{}", image_style_note(&req.tag_hints, panels));
     let user_prompt = if enriched_hints.trim().is_empty() {
@@ -575,7 +578,7 @@ pub fn describe_image_with_desc(
     };
     // PC_NO_POLISH=1 turns the last pass off, to measure what it adds (testing only)
     if std::env::var_os("PC_NO_POLISH").is_none() {
-        res.prompt = polish_image_prompt_with(&res.prompt, vision_desc, &req.strong_tags, &req.tag_hints);
+        res.prompt = polish_image_prompt_with(&res.prompt, vision_desc, &req.strong_tags, &req.tag_hints, &req.size_tags);
         res.prompt = apply_image_style(&res.prompt, &req.tag_hints, panels);
     }
     Ok(res)
