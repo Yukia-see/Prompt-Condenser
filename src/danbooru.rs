@@ -345,7 +345,14 @@ pub fn extract_tags_from_prose(prose: &str) -> Vec<&'static str> {
     }
     // Clauses that negate ("no keyhole cutout is visible", "she is not wearing garter straps") are left
     // out: vision models answer checklists item by item, and every "no X" used to become the tag X.
-    let clauses: Vec<&str> = raw
+    // "a red dress with no shoes": the negation starts a clause of its own (keeping its word), so only
+    // "no shoes" is left out, not the red dress
+    let marked = raw
+        .replace(" with no ", ". no ")
+        .replace(" but no ", ". no ")
+        .replace(" without ", ". without ")
+        .replace(" lacking ", ". lacking ");
+    let clauses: Vec<&str> = marked
         .split(|c| matches!(c, '.' | ';' | ',' | '\n' | '!' | '?' | ':'))
         .flat_map(|c| c.split(" but "))
         .filter(|c| !clause_is_negated(c))
@@ -929,6 +936,15 @@ mod tests {
         assert!(!result.contains("garter"));
         assert!(!result.contains("freckles"));
     }
+    #[test]
+    fn negation_drops_only_the_negated_part() {
+        let tags = extract_tags_from_prose("A girl with long hair with no shoes. She wears garter straps without boots.");
+        for want in ["long hair", "bare foot", "garter straps"] {
+            assert!(tags.contains(&want), "{want} missing: {tags:?}");
+        }
+        assert!(!tags.contains(&"shoes") && !tags.contains(&"boots"), "a negated item became a tag: {tags:?}");
+    }
+
     #[test]
     fn prose_keywords_match_whole_words_only() {
         // what the image tests got wrong: "reference sheet" -> bedroom, "outfit" -> athletic,

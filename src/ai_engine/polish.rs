@@ -4,7 +4,23 @@ use super::*;
 pub(crate) const COLOR_WORDS: &[&str] = &[
     "white", "black", "red", "blue", "green", "yellow", "orange", "pink", "purple", "brown", "grey", "gray", "silver",
     "gold", "golden", "light", "dark", "pale", "navy", "beige", "cream", "teal", "aqua", "violet", "magenta", "crimson",
+    "turquoise", "lavender", "maroon", "burgundy", "coral", "indigo", "cyan", "amber", "olive", "charcoal", "emerald",
+    "ruby", "bronze", "copper", "blonde", "hazel",
 ];
+
+/// Materials and patterns: a phrase like "sheer black dress" stays one descriptive tag.
+pub(crate) const MATERIAL_WORDS: &[&str] = &[
+    "sheer", "glossy", "lace", "latex", "leather", "silk", "satin", "velvet", "denim", "metallic", "striped", "plaid",
+    "checkered", "frilled", "ribbed",
+];
+
+/// Real hues (not light / dark / pale, and not black / white / grey, which greyscale can show).
+const HUE_WORDS: &[&str] = &[
+    "red", "blue", "green", "yellow", "orange", "pink", "purple", "brown", "blonde", "navy", "teal", "aqua", "violet",
+    "magenta", "crimson", "turquoise", "lavender", "maroon", "burgundy", "coral", "indigo", "cyan", "amber", "olive",
+    "emerald", "ruby", "hazel", "gold", "golden", "silver", "beige", "cream", "bronze", "copper",
+];
+const NEUTRAL_WORDS: &[&str] = &["black", "white", "grey", "gray"];
 
 /// The tags the checklist form states reliably: framing (how much of the body, from which side),
 /// background and gaze. Deterministic, so they can't be forgotten by the writer (it kept dropping
@@ -179,7 +195,8 @@ fn known_pieces(phrase: &str, list: &crate::danbooru::TagList) -> Option<Vec<Str
     // Kept whole when only colors are left over, or when the last word (the thing described, as in
     // "teal bikini top") is not part of a known tag.
     let head_covered = !leftover.last().is_some_and(|w| Some(w) == words.last());
-    let only_colors_left = !leftover.is_empty() && leftover.iter().all(|w| COLOR_WORDS.contains(w));
+    let only_colors_left =
+        !leftover.is_empty() && leftover.iter().all(|w| COLOR_WORDS.contains(w) || MATERIAL_WORDS.contains(w));
     if pieces.is_empty() || only_colors_left || !head_covered {
         return None;
     }
@@ -382,14 +399,25 @@ pub fn apply_image_style(prompt: &str, tagger_tags: &str, panels: usize) -> Stri
     let mut tags: Vec<String> = prompt.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect();
     let has = |tags: &[String], t: &str| tags.iter().any(|x| crate::danbooru::key(x) == crate::danbooru::key(t));
     if is_monochrome(tagger_tags) {
+        let line_drawing = tagger.iter().any(|t| matches!(crate::danbooru::key(t).as_str(), "sketch" | "lineart"));
         tags.retain(|t| {
             let k = crate::danbooru::key(t);
             if SKETCH_ARTIFACTS.contains(&k.as_str()) {
                 return false;
             }
-            let first = k.split_whitespace().next().unwrap_or("");
-            // "white background" is still right for a sketch on paper
-            !(COLOR_WORDS.contains(&first) && k.split_whitespace().count() > 1 && !k.ends_with("background"))
+            // Skin tone (screentone / shading shows it), backgrounds ("white background" on paper), and
+            // light / dark words that aren't colors ("light blush", "dark aura") stay. A hue on hair, eyes or
+            // clothes goes; black / white / grey ones only on an uncolored line drawing, since filled
+            // greyscale manga can show black hair.
+            if k.ends_with(" skin") || k.contains("-skinned") || k == "tan" || k.ends_with("background") {
+                return true;
+            }
+            let words: Vec<&str> = k.split_whitespace().collect();
+            let colored = words.iter().any(|w| HUE_WORDS.contains(w) || (line_drawing && NEUTRAL_WORDS.contains(w)));
+            let looks = crate::parser::parse_prompt(t).into_iter().next().is_some_and(|tok| {
+                matches!(crate::scene::slot(&tok), crate::scene::Slot::Hair | crate::scene::Slot::Eyes | crate::scene::Slot::Outfit)
+            });
+            !(colored && looks)
         });
         for style in ["monochrome", "greyscale", "sketch", "lineart", "traditional media"] {
             if tagger.iter().any(|t| crate::danbooru::key(t) == style) && !has(&tags, style) {

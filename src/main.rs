@@ -1066,6 +1066,12 @@ fn run_two_image(ui: &AppWindow, state: &State) {
             if image_changed_since(&ui, gen) {
                 return;
             }
+            // Cancelled: no fallback tagger split, no Deep Scan
+            if ai_engine::cancelled() {
+                with_state(|state| state.borrow_mut().scan_after_image = false);
+                ui.set_image_status("Cancelled.".into());
+                return;
+            }
             with_state(|state| match result {
                 Ok((tags, ai_split)) => {
                     state.borrow_mut().two_tags = Some(tags.clone());
@@ -3573,6 +3579,12 @@ fn main() -> Result<(), slint::PlatformError> {
         ui.on_cancel_requested(move || {
             let Some(ui) = weak.upgrade() else { return };
             ai_engine::request_cancel();
+            // a cancelled read must not hand over to a waiting Deep Scan (which would clear the cancel)
+            with_state(|state| {
+                let mut st = state.borrow_mut();
+                st.scan_after_image = false;
+                st.scan_image_done = false;
+            });
             ui.set_status_message("Cancelling: stopping after the current step…".into());
             if ui.get_tagger_busy() {
                 ui.set_image_status("Cancelling: stopping after the current step…".into());

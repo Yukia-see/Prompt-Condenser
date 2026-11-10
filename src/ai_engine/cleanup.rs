@@ -137,11 +137,35 @@ pub(crate) fn is_guarded_tag(name: &str) -> bool {
     let count = t.chars().next().is_some_and(|c| c.is_ascii_digit())
         && ["girl", "girls", "boy", "boys", "other", "others"].iter().any(|s| t.ends_with(s));
     let skin = t.ends_with(" skin") || t.contains("-skinned") || t == "tan" || t == "tanlines";
-    let species = (t.ends_with(" ears") || t.ends_with(" tail") || t.ends_with(" girl") || t.ends_with(" boy"))
-        && !t.starts_with("animal ")
-        && !t.starts_with("fake ")
+    // only an animal's part or an animal person: "raccoon ears", "fox girl", not "striped tail" or "magical girl"
+    let first = t.split_whitespace().next().unwrap_or("");
+    let species = ["ears", "tail", "horns", "wings", "girl", "boy"].iter().any(|p| t.ends_with(&format!(" {p}")))
+        && is_animal_word(first)
         && !count;
-    count || skin || species
+    count || skin || species || species_word_animal(&t).is_some()
+}
+
+/// Animals whose name starts a species tag (`raccoon ears`, `fox girl`). `bunny girl` counts as a rabbit, not
+/// the costume: next to a sure `cat girl` it is a conflict far more often.
+pub(crate) const ANIMAL_WORDS: &[&str] = &[
+    "cat", "dog", "fox", "wolf", "raccoon", "rabbit", "bunny", "mouse", "bear", "cow", "horse", "tiger", "lion",
+    "sheep", "goat", "squirrel", "bat", "bird", "dragon", "deer", "monkey", "pig", "snake", "shark", "lizard",
+    "tanuki", "ferret", "weasel", "otter", "panda", "hamster", "koala",
+];
+
+/// True for an animal name, or a one-word species tag (`kitsune`).
+pub(crate) fn is_animal_word(word: &str) -> bool {
+    ANIMAL_WORDS.contains(&word) || species_word_animal(word).is_some()
+}
+
+/// The animal a tag is about: `raccoon tail` → raccoon, `kitsune` → fox, `bunny girl` → rabbit.
+fn tag_animal(tag: &str) -> Option<&'static str> {
+    if let Some(a) = species_word_animal(tag) {
+        return Some(a);
+    }
+    let first = tag.split_whitespace().next()?;
+    let a = ANIMAL_WORDS.iter().find(|w| **w == first).copied()?;
+    Some(if a == "bunny" { "rabbit" } else { a })
 }
 
 /// The animal a one-word species tag stands for (`kitsune` → fox, `nekomimi` → cat …).
@@ -179,7 +203,7 @@ pub fn enforce_strong_tags(prompt: &str, strong: &[String]) -> String {
     let sure_keys: std::collections::HashSet<String> = strong.iter().map(|t| key(t)).collect();
     for sure in strong {
         let s = sure.to_lowercase();
-        let part = ["ears", "tail", "girl", "boy"].iter().find(|p| s.ends_with(&format!(" {p}")) ).copied();
+        let part = ["ears", "tail", "horns", "wings", "girl", "boy"].iter().find(|p| s.ends_with(&format!(" {p}"))).copied();
         let is_count = s.chars().next().is_some_and(|c| c.is_ascii_digit());
         let is_skin = s.ends_with(" skin") || s.contains("-skinned");
         tags.retain(|t| {
@@ -196,13 +220,15 @@ pub fn enforce_strong_tags(prompt: &str, strong: &[String]) -> String {
                 let opposite = if dark { ["pale skin", "fair skin", "white skin", "light skin"] } else { ["dark skin", "tan skin", "brown skin", "dark-skinned female"] };
                 return !opposite.contains(&l.as_str());
             }
-            if let Some(p) = part {
-                // another animal on the same part ("cat ears" vs "raccoon ears"); generic "animal ears" stays
-                let other = l.ends_with(&format!(" {p}")) && !l.starts_with("animal ") && !l.starts_with("fake ") && l.split_whitespace().count() == 2;
-                // or a one-word species tag for another animal ("kitsune" next to a sure "raccoon girl")
-                let sure_animal = s.split_whitespace().next().unwrap_or("");
-                let rival_species = species_word_animal(&l).is_some_and(|a| a != sure_animal);
-                return !other && !rival_species;
+            if let (Some(p), Some(sure_animal)) = (part, tag_animal(&s)) {
+                // Another animal on the same part ("cat ears" vs "raccoon ears"), or a species tag for another
+                // animal ("kitsune" / "fox girl" next to a sure "raccoon girl"). Only tags that name an animal:
+                // "striped tail", "fluffy tail", "magical girl", "school girl" and "animal ears" stay.
+                let animal = tag_animal(&l);
+                let same_part = l.ends_with(&format!(" {p}")) && l.split_whitespace().count() == 2;
+                let person = l.ends_with(" girl") || l.ends_with(" boy") || species_word_animal(&l).is_some();
+                let rival = animal.is_some_and(|a| a != sure_animal) && (same_part || person);
+                return !rival;
             }
             true
         });

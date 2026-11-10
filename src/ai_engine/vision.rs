@@ -495,7 +495,15 @@ pub fn describe_image(req: &ImageAiRequest) -> Result<ImageAiResult> {
             return describe_image_with_desc(req, &vision_desc, encoder);
         }
     }
-    describe_image_with(req, &image_system_prompt(&req.config, &req.tag_hints), "Write the prompt for this image.")
+    // No separate vision model: the same sketch / panel notes and cleanup as the Combined path
+    let panels = image::open(&req.image_path).map(|i| panel_count(&i)).unwrap_or(1);
+    let ask = format!("Write the prompt for this image.{}", image_style_note(&req.tag_hints, panels));
+    let mut out = describe_image_with(req, &image_system_prompt(&req.config, &req.tag_hints), &ask)?;
+    if std::env::var_os("PC_NO_POLISH").is_none() {
+        out.prompt = polish_image_prompt_with(&out.prompt, "", &req.strong_tags, &req.tag_hints);
+        out.prompt = apply_image_style(&out.prompt, &req.tag_hints, panels);
+    }
+    Ok(out)
 }
 
 /// Synthesizes a visual description and tagger hints into a Danbooru prompt using the text model.

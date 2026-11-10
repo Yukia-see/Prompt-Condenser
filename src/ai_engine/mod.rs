@@ -559,6 +559,21 @@ mod tests {
         }
         // no humans: the invented girl goes
         assert_eq!(apply_image_style("masterpiece, solo, 1girl, logo, paw print", "no humans, paw print", 1), "masterpiece, no humans, logo, paw print");
+        // a sketch loses hues (and black / white on a line drawing) on hair, eyes, clothes; keeps the rest
+        let out = apply_image_style(
+            "1girl, long black hair, white thighhighs, red serafuku, light blush, light smile, dark aura, dark skin, white background",
+            "1girl, sketch",
+            1,
+        );
+        assert_eq!(out, "1girl, light blush, light smile, dark aura, dark skin, white background, sketch");
+        // filled greyscale manga: black hair can be right, a red dress can't
+        let out = apply_image_style("1girl, black hair, red dress, smile", "1girl, greyscale, monochrome", 1);
+        assert_eq!(out, "1girl, black hair, smile, monochrome, greyscale");
+        // materials and extra colors keep a description whole
+        if crate::danbooru::local().is_some() {
+            let v = validate_tags(vec!["turquoise bikini".into(), "sheer black dress".into()]);
+            assert_eq!(v, vec!["turquoise bikini", "sheer black dress"], "{v:?}");
+        }
         // panels add multiple views
         assert!(apply_image_style("1girl, smile", "1girl", 2).ends_with("multiple views"));
         // a character name the tagger recognized comes back after the count tags
@@ -631,6 +646,13 @@ mod tests {
         // a one-word species tag for another animal goes too; generic "kemonomimi" stays
         let fixed2 = enforce_strong_tags("1girl, kitsune, kemonomimi, nekomimi, smile", &["raccoon girl".to_string()]);
         assert_eq!(fixed2, "raccoon girl, 1girl, kemonomimi, smile");
+        // archetypes and tail descriptions are not species: only other animals go
+        let fixed3 = enforce_strong_tags(
+            "1girl, magical girl, school girl, fox girl, striped tail, fluffy tail, cat tail, animal ears, fox ears",
+            &["raccoon girl".to_string(), "raccoon tail".to_string()],
+        );
+        assert_eq!(fixed3, "raccoon tail, raccoon girl, 1girl, magical girl, school girl, striped tail, fluffy tail, animal ears, fox ears");
+        assert!(!is_guarded_tag("magical girl") && !is_guarded_tag("striped tail"));
         // a wrong count is replaced, nothing changes without sure tags
         assert_eq!(enforce_strong_tags("2girls, smile", &["1girl".to_string()]), "1girl, smile");
         assert_eq!(enforce_strong_tags("2girls, smile", &[]), "2girls, smile");

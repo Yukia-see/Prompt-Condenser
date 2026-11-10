@@ -585,7 +585,8 @@ pub fn vrp_state_json(prompts: &[String], boxes: Option<&[crate::detector::Perso
                     let y0 = (b.y0 as f64 / h as f64 - pad).clamp(0.0, 1.0);
                     let x1 = (b.x1 as f64 / w as f64 + pad).clamp(0.0, 1.0);
                     let y1 = (b.y1 as f64 / h as f64 + pad).clamp(0.0, 1.0);
-                    (x0, y0, (x1 - x0).max(0.01), (y1 - y0).max(0.01))
+                    // never past the canvas edge, even for a sliver of a box at the border
+                    (x0.min(0.99), y0.min(0.99), (x1 - x0).max(0.01).min(1.0 - x0.min(0.99)), (y1 - y0).max(0.01).min(1.0 - y0.min(0.99)))
                 }
                 None => {
                     // even strips with a little overlap, so nobody's edge is cut off
@@ -1395,6 +1396,14 @@ masterpiece, 2girls, indoors, gym, polished floor
         }
         // detector boxes on an 832 x 1216 image: regions follow them, canvas stays portrait
         let b = |x0: f32, x1: f32| crate::detector::PersonBox { x0, y0: 100.0, x1, y1: 1200.0, score: 0.9 };
+        // a box hugging the right edge stays inside the canvas
+        let edge = vec![b(20.0, 400.0), b(828.0, 832.0)];
+        let v: serde_json::Value = serde_json::from_str(&vrp_state_json(&prompts, Some(&edge), Some((832, 1216)))).unwrap();
+        for region in v["regions"].as_array().unwrap() {
+            let (x, w) = (region["x"].as_f64().unwrap(), region["width"].as_f64().unwrap());
+            let (y, h) = (region["y"].as_f64().unwrap(), region["height"].as_f64().unwrap());
+            assert!(w > 0.0 && h > 0.0 && x + w <= 1.0 + 1e-9 && y + h <= 1.0 + 1e-9, "{region}");
+        }
         let boxes = vec![b(20.0, 400.0), b(430.0, 810.0)];
         let v: serde_json::Value = serde_json::from_str(&vrp_state_json(&prompts, Some(&boxes), Some((832, 1216)))).unwrap();
         let (cw, ch) = (v["canvas"]["width"].as_u64().unwrap(), v["canvas"]["height"].as_u64().unwrap());
