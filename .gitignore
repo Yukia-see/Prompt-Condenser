@@ -20,3 +20,5 @@ __pycache__/
 /prompt_condenser.rs
 # local image test set (images + answer files, never pushed)
 /tests/eval_local/
+/tests/tagger_shootout/
+*.onnx
