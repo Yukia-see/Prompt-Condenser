@@ -26,7 +26,7 @@ pub enum ChangeAction {
     StyleConflict,
     /// Recommended chain tags (clothing interactions, pose/physics, negative locks).
     Recommendation,
-    /// Body proportion set by the body dropdown.
+    /// Bust or frame set by the Bust / Frame dropdowns.
     ProportionChoice,
 }
 
@@ -79,8 +79,10 @@ pub struct ScanConfig {
     pub camera_angle: usize,
     /// Index into `profiles::POSES` (0 = none).
     pub pose: usize,
-    /// Index into `profiles::PROPORTIONS` (0 = none).
-    pub proportion: usize,
+    /// Index into `profiles::BUSTS` (0 = none).
+    pub bust: usize,
+    /// Index into `profiles::FRAMES` (0 = none).
+    pub frame: usize,
     /// Dynamic Prompts {a|b|c} variations wanted.
     pub dynamic: bool,
     /// The LoRA box: tags put into the output word for word.
@@ -2436,24 +2438,32 @@ pub fn analyze_with_rules(tokens: &[PromptToken], config: &ScanConfig) -> RuleAn
         processed_tokens.push(tok);
     }
 
-    // Camera angle / pose / proportion dropdowns: the user's explicit choice replaces the prompt's
-    // own angle / pose / proportion tags (shown as a card so it can be undone).
+    // Camera angle / pose / bust / frame dropdowns: the user's explicit choice replaces the prompt's
+    // own tags of that list (shown as a card so it can be undone). A bust choice also replaces any
+    // other breast size the prompt has ("c cup", "perky breasts").
+    let mut dropdown_body: Vec<PromptToken> = Vec::new();
     for (list, idx, action, what) in [
         (crate::profiles::CAMERA_ANGLES, config.camera_angle, ChangeAction::AngleChoice, "camera angle"),
         (crate::profiles::POSES, config.pose, ChangeAction::PoseChoice, "pose"),
-        (crate::profiles::PROPORTIONS, config.proportion, ChangeAction::ProportionChoice, "body proportion"),
+        (crate::profiles::BUSTS, config.bust, ChangeAction::ProportionChoice, "bust"),
+        (crate::profiles::FRAMES, config.frame, ChangeAction::ProportionChoice, "frame"),
     ] {
         let Some((label, tags)) = list.get(idx).filter(|_| idx > 0) else { continue };
+        let is_bust = what == "bust";
         let group = crate::profiles::group_tags(list);
+        let in_group = |n: &str| group.iter().any(|g| g == n) || (is_bust && detect_breast_tier(n).is_some());
         let chosen: Vec<PromptToken> = crate::parser::parse_prompt(tags);
         let is_chosen = |n: &str| chosen.iter().any(|c| c.normalized == n);
         let replaced: Vec<String> = processed_tokens
             .iter()
-            .filter(|t| group.contains(&t.normalized) && !is_chosen(&t.normalized))
+            .filter(|t| in_group(&t.normalized) && !is_chosen(&t.normalized))
             .map(|t| t.text.clone())
             .collect();
-        processed_tokens.retain(|t| !(group.contains(&t.normalized) && !is_chosen(&t.normalized)));
+        processed_tokens.retain(|t| !(in_group(&t.normalized) && !is_chosen(&t.normalized)));
         for mut t in chosen {
+            if action == ChangeAction::ProportionChoice {
+                dropdown_body.push(t.clone());
+            }
             if processed_tokens.iter().any(|e| e.normalized == t.normalized) {
                 continue;
             }
@@ -2477,6 +2487,11 @@ pub fn analyze_with_rules(tokens: &[PromptToken], config: &ScanConfig) -> RuleAn
         });
         next_change_id += 1;
     }
+
+    // The LoRA box beats a Bust / Frame choice too, so those aren't protected below.
+    let loras = crate::parser::parse_prompt(&config.lora_tags_raw);
+    dropdown_body.retain(|d| !loras.iter().any(|l| l.normalized == d.normalized || tags_conflict(&l.normalized, &d.normalized)));
+    let is_dropdown = |n: &str| dropdown_body.iter().any(|d| d.normalized == n);
 
     // LoRA tags (their own box) go into the output word for word (`insert_lora_block`).
     // Here the prompt's own copies are dropped, and tags that contradict one are
@@ -2749,9 +2764,14 @@ pub fn analyze_with_rules(tokens: &[PromptToken], config: &ScanConfig) -> RuleAn
         .find_map(|t| detect_breast_tier(&t.normalized).map(|tier| (tier, t.clone())));
 
     if let Some((tier, tier_tok)) = active_tier_tok {
+        let has_shortstack = processed_tokens.iter().any(|tok| tok.normalized == "shortstack")
+            || is_dropdown("shortstack");
         let mut conflicting: Vec<(PromptToken, &'static str, ChangeAction)> = Vec::new();
         for t in &processed_tokens {
-            if t.normalized == tier_tok.normalized {
+            if t.normalized == tier_tok.normalized || is_dropdown(&t.normalized) {
+                continue;
+            }
+            if has_shortstack && (t.normalized == "petite" || t.normalized == "short") {
                 continue;
             }
             if let Some((reason, action)) = breast_tier_conflicts(tier, &t.normalized) {
@@ -2844,8 +2864,16 @@ pub fn analyze_with_rules(tokens: &[PromptToken], config: &ScanConfig) -> RuleAn
     }
 
     // 8. Body Proportion Conflicts: Thick/Curvy vs Slender/Petite Lower
+    let has_shortstack_lower = processed_tokens.iter().any(|t| t.normalized == "shortstack")
+        || is_dropdown("shortstack");
     let first_thick_idx = processed_tokens.iter().position(|t| is_thick_curvy_lower_tag(&t.normalized));
-    let first_slender_idx = processed_tokens.iter().position(|t| is_slender_petite_lower_tag(&t.normalized));
+    let first_slender_idx = processed_tokens.iter().position(|t| {
+        if has_shortstack_lower && (t.normalized == "petite" || t.normalized == "short") {
+            false
+        } else {
+            is_slender_petite_lower_tag(&t.normalized)
+        }
+    });
 
     let proportion_lower_winner = match (first_thick_idx, first_slender_idx) {
         (Some(th), Some(sl)) => {
@@ -2969,6 +2997,24 @@ pub fn analyze_with_rules(tokens: &[PromptToken], config: &ScanConfig) -> RuleAn
     if config.resolve_conflicts_enabled {
         let mut kept: Vec<PromptToken> = Vec::new();
         for t in processed_tokens {
+            // a Bust / Frame choice beats a size the prompt wrote
+            if is_dropdown(&t.normalized) {
+                if let Some(pos) = kept.iter().position(|k| size_conflict(&k.normalized, &t.normalized) && !is_dropdown(&k.normalized)) {
+                    let k = kept.remove(pos);
+                    changes.push(PromptChange {
+                        id: next_change_id,
+                        original: k.text.clone(),
+                        action: ChangeAction::SizeConflict,
+                        reason: format!("'{}' contradicts your choice '{}'.", k.text, t.text),
+                        suggested_alternative: String::new(),
+                        framing_alternative: String::new(),
+                        mode: 0,
+                    });
+                    next_change_id += 1;
+                    kept.push(t);
+                    continue;
+                }
+            }
             match kept.iter().find(|k| size_conflict(&k.normalized, &t.normalized)) {
                 Some(k) => {
                     changes.push(PromptChange {
@@ -2990,10 +3036,15 @@ pub fn analyze_with_rules(tokens: &[PromptToken], config: &ScanConfig) -> RuleAn
         // A slender body type next to a big chest / hips: Danbooru's "petite" (and slim,
         // slender, skinny) comes with a small chest in training, so the model shrinks
         // "large breasts". "short" keeps a height difference without that pull.
+        // Not for a Bust / Frame choice, and "shortstack" means short and curvy, so its petite stays.
         let curvy = processed_tokens.iter().any(|t| is_big_body_tag(&t.normalized));
+        let shortstack = processed_tokens.iter().any(|t| t.normalized == "shortstack");
         if curvy {
             for t in processed_tokens.iter_mut() {
-                if !SLENDER_TAGS.contains(&t.normalized.as_str()) {
+                if !SLENDER_TAGS.contains(&t.normalized.as_str())
+                    || is_dropdown(&t.normalized)
+                    || (shortstack && t.normalized == "petite")
+                {
                     continue;
                 }
                 let original = t.text.clone();
@@ -3017,6 +3068,19 @@ pub fn analyze_with_rules(tokens: &[PromptToken], config: &ScanConfig) -> RuleAn
                 t.replaced = true;
             }
             processed_tokens.retain(|t| !t.normalized.is_empty());
+        }
+    }
+
+    // The other conflict rules (stature, breast tiers, thick vs slender, taxonomy) never remove a
+    // Bust / Frame choice: put back any they took, and drop their cards about it.
+    for t in &dropdown_body {
+        if !processed_tokens.iter().any(|e| e.normalized == t.normalized) {
+            changes.retain(|c| !(c.original == t.text && c.action != ChangeAction::ProportionChoice));
+            let mut t = t.clone();
+            t.added = true;
+            t.original_index = 940;
+            t.category = TokenCategory::FramingPose;
+            processed_tokens.push(t);
         }
     }
 
@@ -3136,10 +3200,12 @@ pub fn fix_body_type(tokens: Vec<PromptToken>) -> Vec<PromptToken> {
     if !tokens.iter().any(|t| is_big_body_tag(&t.normalized)) {
         return tokens;
     }
+    // "shortstack" means short and curvy: its petite stays
+    let shortstack = tokens.iter().any(|t| t.normalized == "shortstack");
     tokens
         .into_iter()
         .filter_map(|mut t| {
-            if !SLENDER_TAGS.contains(&t.normalized.as_str()) {
+            if !SLENDER_TAGS.contains(&t.normalized.as_str()) || (shortstack && t.normalized == "petite") {
                 return Some(t);
             }
             if t.normalized != "petite" {
@@ -3627,7 +3693,8 @@ mod tests {
             camera_angle: 0,
 
             pose: 0,
-            proportion: 0,
+            bust: 0,
+            frame: 0,
 
             dynamic: false,
 
@@ -3775,6 +3842,54 @@ mod tests {
         assert_eq!(finish_prompt("1girl, rain", &config, false, s), "1girl, rain");
         config.arranged = true;
         assert_eq!(finish_prompt("rain, 1girl", &config, false, s), "1girl,\nrain");
+    }
+
+    #[test]
+    fn bust_and_frame_choices_keep_their_tags() {
+        let tags = |out: &str| crate::parser::parse_prompt(out).into_iter().map(|t| t.normalized).collect::<Vec<_>>();
+        let size_cards = |res: &RuleAnalysisResult| res.changes.iter().filter(|c| c.action == ChangeAction::SizeConflict).map(|c| c.original.clone()).collect::<Vec<_>>();
+        // Shortstack: all six tags, no size-conflict card
+        let mut config = cfg(TargetView::None);
+        config.frame = 2;
+        let (res, out) = run("1girl, smile", &config);
+        for t in crate::profiles::FRAMES[2].1.split(", ") {
+            assert!(tags(&out).contains(&t.to_string()), "{t} missing: {out}");
+        }
+        assert!(size_cards(&res).is_empty(), "{:?}", size_cards(&res));
+        // Gigantic + Petite: both stay
+        config.bust = 6;
+        config.frame = 1;
+        let (res, out) = run("1girl, smile", &config);
+        assert!(tags(&out).contains(&"gigantic breasts".into()) && tags(&out).contains(&"petite".into()), "{out}");
+        assert!(size_cards(&res).is_empty(), "{:?}", size_cards(&res));
+        // Bust and Frame together replace only their own groups
+        config.bust = 4;
+        config.frame = 5;
+        let (res, out) = run("1girl, small breasts, c cup, thick thighs, muscular female, smile", &config);
+        let t = tags(&out);
+        for want in ["large breasts", "curvy", "wide hips", "narrow waist", "smile"] {
+            assert!(t.contains(&want.to_string()), "{want} missing: {out}");
+        }
+        for gone in ["small breasts", "c cup", "thick thighs", "muscular female"] {
+            assert!(!t.contains(&gone.to_string()), "{gone} kept: {out}");
+        }
+        assert_eq!(res.changes.iter().filter(|c| c.action == ChangeAction::ProportionChoice).count(), 2);
+        // a typed shortstack keeps its petite
+        let (res, out) = run("1girl, shortstack, petite, huge breasts, wide hips", &cfg(TargetView::None));
+        assert!(tags(&out).contains(&"petite".into()), "{out}");
+        assert!(!size_cards(&res).contains(&"petite".to_string()));
+        let ai = fix_body_type(crate::parser::parse_prompt("shortstack, petite, huge breasts"));
+        assert!(ai.iter().any(|t| t.normalized == "petite"));
+        // a typed "petite, huge breasts" still gets today's card
+        let (res, out) = run("1girl, petite, huge breasts", &cfg(TargetView::None));
+        assert!(!tags(&out).contains(&"petite".into()) && size_cards(&res).contains(&"petite".to_string()), "{out}");
+        // the old single Body dropdown's saved index
+        use crate::profiles::{bust_frame_from_old_body as old, BUSTS, FRAMES};
+        assert_eq!(old(0), (0, 0));
+        assert_eq!(BUSTS[old(6).0 as usize].1, "gigantic breasts");
+        assert_eq!(FRAMES[old(7).1 as usize].0, "Thick thighs & wide hips");
+        assert_eq!(FRAMES[old(8).1 as usize].1, "muscular female, abs, toned");
+        assert_eq!(old(1), (1, 0));
     }
 
     #[test]

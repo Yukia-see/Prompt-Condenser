@@ -1171,8 +1171,10 @@ export component AppWindow inherits Window {
     in-out property <int> angle_index: 0;      // index into profiles::CAMERA_ANGLES
     in-out property <[string]> pose_labels: [];
     in-out property <int> pose_index: 0;       // index into profiles::POSES
-    in-out property <[string]> proportion_labels: [];
-    in-out property <int> proportion_index: 0; // index into profiles::PROPORTIONS
+    in-out property <[string]> bust_labels: [];
+    in-out property <int> bust_index: 0; // index into profiles::BUSTS
+    in-out property <[string]> frame_labels: [];
+    in-out property <int> frame_index: 0; // index into profiles::FRAMES
     in-out property <bool> dynamic_enabled: false;
     in-out property <bool> arranged_enabled: false;   // After as grouped lines
     in-out property <bool> ref_adapter_mode: false;   // Anima Ref Adapter: After keeps only the scene (the adapter copies the look)
@@ -1592,11 +1594,19 @@ export component AppWindow inherits Window {
                         selected => { root.analyze_requested(); }
                     }
 
-                    SectionLabel { text: "Body:"; vertical-alignment: center; }
+                    SectionLabel { text: "Bust:"; vertical-alignment: center; }
                     ComboBox {
                         horizontal-stretch: 1;
-                        model: root.proportion_labels;
-                        current-index <=> root.proportion_index;
+                        model: root.bust_labels;
+                        current-index <=> root.bust_index;
+                        selected => { root.analyze_requested(); }
+                    }
+
+                    SectionLabel { text: "Frame:"; vertical-alignment: center; }
+                    ComboBox {
+                        horizontal-stretch: 1;
+                        model: root.frame_labels;
+                        current-index <=> root.frame_index;
                         selected => { root.analyze_requested(); }
                     }
 
@@ -1882,6 +1892,11 @@ export component AppWindow inherits Window {
                                 clicked => { root.char_image_requested(3); }
                             }
 
+                            // Zone 1 (cont.): load button + status
+                            if !root.image_loaded : PillButton {
+                                text: root.app_tab >= 1 ? "🖼 Split Image…" : "🖼 From Image…";
+                                clicked => { root.load_image_requested(); }
+                            }
                             VerticalLayout {
                                 horizontal-stretch: 1;
                                 spacing: 1px;
@@ -1894,117 +1909,159 @@ export component AppWindow inherits Window {
                                 }
                                 Text {
                                     text: root.scene_ref_loaded
-                                        ? (root.scene_ref_status != "" ? root.scene_ref_status : "Ready — click '⚡ Auto Scene (Fast)' or '🧠 Read (AI)'.")
-                                        : (root.image_status != "" ? root.image_status : "Load scene or character references to assign poses & scene.");
+                                        ? (root.scene_ref_status != "" ? root.scene_ref_status : "Reference ready: pick what it's used for, then press the main button.")
+                                        : (root.image_status != "" ? root.image_status : "Load a picture or a scene reference.");
                                     font-size: 10px;
                                     color: M3.on-surface-variant;
                                     overflow: elide;
                                 }
                             }
 
-                            if !root.image_loaded : PillButton {
-                                text: root.app_tab >= 1 ? "🖼 Split Image…" : "🖼 From Image…";
-                                clicked => { root.load_image_requested(); }
-                            }
+                            Rectangle { width: 1px; height: 26px; background: M3.outline-variant; }
 
-                            // Read button (Tagger or Combined AI Vision Analysis)
+                            // Zone 2: scan engine (+ what the reference is used for, 1 Character tab)
                             PillButton {
-                                primary: root.image_loaded || root.images_pending || root.scene_ref_loaded;
-                                text: root.tagger_busy ? "Reading…" : (root.image_use_ai ? "✨ Read (Combined)" : "⚡ Read (Tagger)");
-                                enabled: !root.tagger_busy && (root.image_loaded || root.images_pending || root.scene_ref_loaded || root.char1_image_loaded);
-                                clicked => { root.read_image_requested(); }
-                            }
-
-                            // Dedicated Redo Vision button to force re-running the Vision Encoder
-                            PillButton {
-                                text: root.tagger_busy ? "…" : "↻ Redo Vision";
-                                enabled: !root.tagger_busy && root.ollama_connected && (root.image_loaded || root.images_pending || root.scene_ref_loaded || root.char1_image_loaded);
-                                clicked => { root.redo_image_requested(); }
-                            }
-
-                            // 1-Click Auto Scene Button (Fast scan of scene & poses)
-                            PillButton {
-                                text: root.tagger_busy ? "⚡ Scanning…" : "⚡ Auto Scene (Fast)";
-                                primary: true;
-                                enabled: !root.tagger_busy;
-                                clicked => { root.auto_scene_requested(); }
-                            }
-
-                            // Reference use presets (1 Character tab): what the reference contributes
-                            if root.scene_ref_loaded && root.app_tab == 0 : ComboBox {
-                                width: 160px;
-                                model: ["Scene & pose", "Identity transfer", "Outfit transfer", "Atmosphere"];
-                                current-index <=> root.reference_use_index;
-                            }
-                            if root.scene_ref_loaded && root.app_tab == 0 && root.reference_use_index > 0 : PillButton {
-                                text: root.tagger_busy ? "⇄ …" : "⇄ Transfer";
-                                primary: true;
-                                enabled: !root.tagger_busy;
-                                clicked => { root.transfer_requested(); }
-                            }
-
-                            // Scene Panel Dropdown Toggle
-                            PillButton {
-                                text: root.scene_panel_open ? "Scene Panel ▴" : "Scene Panel ▾";
-                                primary: root.scene_panel_open;
-                                clicked => { root.scene_panel_open = !root.scene_panel_open; }
-                            }
-
-                            // Tagger / AI mode selector
-                            PillButton {
-                                text: "Tagger";
+                                text: "⚡ Fast Tagger";
                                 primary: !root.image_use_ai;
                                 enabled: !root.tagger_busy;
                                 clicked => { root.image_use_ai = false; root.image_mode_changed(); }
                             }
                             PillButton {
-                                text: "Combined AI";
+                                text: "🧠 Combined AI";
                                 primary: root.image_use_ai;
                                 enabled: !root.tagger_busy;
                                 clicked => { root.image_use_ai = true; root.image_mode_changed(); }
                             }
-                            // older image-reading options: hidden unless "Advanced" is open or one of them is on
-                            FilterChip {
-                                text: root.image_advanced ? "Advanced ▴" : "Advanced ▾";
-                                checked <=> root.image_advanced;
-                                enabled: !root.tagger_busy;
+                            if root.scene_ref_loaded && root.app_tab == 0 : ComboBox {
+                                width: 160px;
+                                model: ["Scene & pose", "Identity transfer", "Outfit transfer", "Atmosphere"];
+                                current-index <=> root.reference_use_index;
                             }
-                            if root.image_advanced || root.enable_dual_pass : FilterChip {
-                                text: "Dual-Pass Vision";
-                                checked <=> root.enable_dual_pass;
-                                enabled: !root.tagger_busy;
-                                toggled => { root.dual_pass_changed(); }
+
+                            Rectangle { width: 1px; height: 26px; background: M3.outline-variant; }
+
+                            // Zone 3: one main action, then the drawers
+                            PillButton {
+                                property <bool> transfer: root.scene_ref_loaded && root.app_tab == 0 && root.reference_use_index > 0;
+                                property <bool> auto-scene: root.scene_ref_loaded && !root.image_use_ai && !root.image_loaded && !root.images_pending && !root.char1_image_loaded;
+                                primary: true;
+                                text: root.tagger_busy ? "Scanning…" : (self.transfer ? "⇄ Transfer" : (self.auto-scene ? "⚡ Auto Scene" : "⚡ Scan Image"));
+                                enabled: !root.tagger_busy && (self.transfer || self.auto-scene || root.image_loaded || root.images_pending || root.scene_ref_loaded || root.char1_image_loaded);
+                                clicked => {
+                                    if self.transfer {
+                                        root.transfer_requested();
+                                    } else if self.auto-scene {
+                                        root.auto_scene_requested();
+                                    } else {
+                                        root.read_image_requested();
+                                    }
+                                }
                             }
-                            if root.enable_dual_pass : ComboBox {
-                                width: 175px;
-                                model: root.dual_pass_mode_labels;
-                                current-index <=> root.dual_pass_mode_index;
+                            // the fast per-character pose / scene read of the reference stays reachable when the
+                            // main button does something else
+                            if root.scene_ref_loaded && (root.image_use_ai || root.image_loaded || root.images_pending || root.char1_image_loaded || (root.app_tab == 0 && root.reference_use_index > 0)) : PillButton {
+                                text: "⚡ Auto Scene";
                                 enabled: !root.tagger_busy;
-                                selected => { root.dual_pass_mode_changed(); }
+                                clicked => { root.auto_scene_requested(); }
                             }
-                            if root.enable_dual_pass : FilterChip {
-                                text: "LLM Synthesis";
-                                checked <=> root.use_llm_synthesis;
-                                enabled: !root.tagger_busy;
-                                toggled => { root.llm_synthesis_changed(); }
+                            PillButton {
+                                property <int> on: (root.image_identity_only ? 1 : 0) + (root.scene_body_shape ? 1 : 0) + (root.image_second_pass ? 1 : 0) + (root.enable_dual_pass ? 1 : 0);
+                                text: (root.image_advanced ? "⚙ Settings ▴" : "⚙ Settings ▾") + (self.on > 0 ? " · " + self.on + " on" : "");
+                                primary: root.image_advanced;
+                                clicked => { root.image_advanced = !root.image_advanced; }
                             }
-                            FilterChip {
-                                text: "Identity Only";
-                                checked <=> root.image_identity_only;
-                                enabled: !root.tagger_busy;
-                                toggled => { root.identity_changed(); }
+                            PillButton {
+                                text: root.scene_panel_open ? "Scene Panel ▴" : "Scene Panel ▾";
+                                primary: root.scene_panel_open;
+                                clicked => { root.scene_panel_open = !root.scene_panel_open; }
                             }
-                            if root.image_advanced || root.image_second_pass : FilterChip {
-                                text: "2nd Pass Visual Check";
-                                checked <=> root.image_second_pass;
-                                enabled: !root.tagger_busy && (!root.enable_dual_pass || root.use_llm_synthesis);
-                                toggled => { root.second_pass_changed(); }
+                        }
+                    }
+
+                    // Vision settings drawer ("⚙ Settings")
+                    if root.image_advanced : Rectangle {
+                        background: M3.surface-container;
+                        border-radius: 10px;
+                        border-width: 1px;
+                        border-color: M3.outline-variant;
+                        VerticalLayout {
+                            padding: 10px;
+                            spacing: 8px;
+                            HorizontalLayout {
+                                spacing: 10px;
+                                SectionLabel { text: "SENSITIVITY (THRESHOLD):"; vertical-alignment: center; }
+                                Slider {
+                                    horizontal-stretch: 1;
+                                    minimum: 0.15;
+                                    maximum: 0.60;
+                                    value <=> root.tag_threshold;
+                                    released => { root.tag_threshold_changed(); }
+                                }
+                                Text {
+                                    text: Math.round(root.tag_threshold * 100) / 100;
+                                    font-size: 12px;
+                                    color: M3.on-surface;
+                                    vertical-alignment: center;
+                                    min-width: 32px;
+                                }
+                                Text {
+                                    text: "lower = more tags";
+                                    font-size: 10px;
+                                    color: M3.on-surface-variant;
+                                    vertical-alignment: center;
+                                }
                             }
-                            if !root.enable_dual_pass : FilterChip {
-                                text: "Scene Body Shape";
-                                checked <=> root.scene_body_shape;
-                                enabled: !root.tagger_busy;
-                                toggled => { root.scene_body_shape_changed(); }
+                            HorizontalLayout {
+                                spacing: 8px;
+                                alignment: start;
+                                SectionLabel { text: "FILTERS:"; vertical-alignment: center; }
+                                FilterChip {
+                                    text: "Identity Only";
+                                    checked <=> root.image_identity_only;
+                                    enabled: !root.tagger_busy;
+                                    toggled => { root.identity_changed(); }
+                                }
+                                if !root.enable_dual_pass : FilterChip {
+                                    text: "Scene Body Shape";
+                                    checked <=> root.scene_body_shape;
+                                    enabled: !root.tagger_busy;
+                                    toggled => { root.scene_body_shape_changed(); }
+                                }
+                                FilterChip {
+                                    text: "2nd Pass Visual Check";
+                                    checked <=> root.image_second_pass;
+                                    enabled: !root.tagger_busy && (!root.enable_dual_pass || root.use_llm_synthesis);
+                                    toggled => { root.second_pass_changed(); }
+                                }
+                                PillButton {
+                                    text: "↻ Flush Vision Cache";
+                                    enabled: !root.tagger_busy && (root.image_loaded || root.images_pending || root.scene_ref_loaded || root.char1_image_loaded);
+                                    clicked => { root.redo_image_requested(); }
+                                }
+                            }
+                            HorizontalLayout {
+                                spacing: 8px;
+                                alignment: start;
+                                SectionLabel { text: "ADVANCED:"; vertical-alignment: center; }
+                                FilterChip {
+                                    text: "Dual-Pass Vision";
+                                    checked <=> root.enable_dual_pass;
+                                    enabled: !root.tagger_busy;
+                                    toggled => { root.dual_pass_changed(); }
+                                }
+                                if root.enable_dual_pass : ComboBox {
+                                    width: 175px;
+                                    model: root.dual_pass_mode_labels;
+                                    current-index <=> root.dual_pass_mode_index;
+                                    enabled: !root.tagger_busy;
+                                    selected => { root.dual_pass_mode_changed(); }
+                                }
+                                if root.enable_dual_pass : FilterChip {
+                                    text: "LLM Synthesis";
+                                    checked <=> root.use_llm_synthesis;
+                                    enabled: !root.tagger_busy;
+                                    toggled => { root.llm_synthesis_changed(); }
+                                }
                             }
                         }
                     }

@@ -448,18 +448,40 @@ pub const POSES: &[(&str, &str)] = &[
     ("Random pose (dynamic prompt)", "{standing|sitting|leaning against wall|dynamic pose|looking back|arms up}"),
 ];
 
-/// Body proportion presets (dropdown label, tags). Index 0 = none.
-pub const PROPORTIONS: &[(&str, &str)] = &[
-    ("None (keep prompt's proportion)", ""),
-    ("Flat chest (slender, aa-cup)", "flat chest, aa cup, small underbust, slender torso"),
-    ("Small breasts (perky, a/b-cup)", "small breasts, a cup, perky breasts"),
-    ("Medium breasts (full, c/d-cup)", "medium breasts, c cup, proportionate body"),
-    ("Large breasts (curvy, e/f-cup)", "large breasts, e cup, curvy, voluptuous"),
-    ("Huge breasts (heavy, g/h-cup)", "huge breasts, g cup, heavy breasts, deep cleavage"),
-    ("Gigantic breasts (hyper, massive)", "gigantic breasts, massive breasts, voluptuous"),
-    ("Thick thighs & wide hips (curvy)", "thick thighs, wide hips, plump thighs, curvy"),
-    ("Muscular & athletic (toned, abs)", "muscular female, abs, toned, athletic, defined muscles"),
+/// Bust presets (dropdown label, tags). Index 0 = none. Every tag is a real Danbooru tag
+/// (in the tagger's `selected_tags.csv`), one size per preset.
+pub const BUSTS: &[(&str, &str)] = &[
+    ("None (keep prompt's bust)", ""),
+    ("Flat chest", "flat chest"),
+    ("Small breasts", "small breasts"),
+    ("Medium breasts", "medium breasts"),
+    ("Large breasts", "large breasts"),
+    ("Huge breasts", "huge breasts"),
+    ("Gigantic breasts", "gigantic breasts"),
 ];
+
+/// Frame (body shape below the bust) presets (dropdown label, tags). Index 0 = none. Real Danbooru
+/// tags only, and no bust tags, so a Bust and a Frame choice never replace each other's tags.
+pub const FRAMES: &[(&str, &str)] = &[
+    ("None (keep prompt's frame)", ""),
+    ("Petite (small, slight build)", "petite"),
+    ("Shortstack (short and curvy)", "shortstack, petite, wide hips, thick thighs, narrow waist, curvy"),
+    ("Thick thighs & wide hips", "thick thighs, wide hips"),
+    ("Pear-shaped (hips and thighs, slim waist)", "wide hips, thick thighs, narrow waist"),
+    ("Hourglass (curvy, slim waist)", "curvy, wide hips, narrow waist"),
+    ("Muscular (toned, abs)", "muscular female, abs, toned"),
+];
+
+/// The (bust, frame) pair for a saved index of the old single Body dropdown
+/// (0 none, 1-6 flat chest .. gigantic breasts, 7 thick thighs & wide hips, 8 muscular).
+pub fn bust_frame_from_old_body(index: i32) -> (i32, i32) {
+    match index {
+        1..=6 => (index, 0),
+        7 => (0, 3),
+        8 => (0, 6),
+        _ => (0, 0),
+    }
+}
 
 /// Every tag that belongs to a list above (lowercase), used to spot existing angle /
 /// pose tags in a prompt that a dropdown choice should replace.

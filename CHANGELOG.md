@@ -1,5 +1,16 @@
 # Changelog and measurements
 
+## Version 0.6.0 (2026-11-11)
+
+- **Fast Tagger Mode**: 4.6s single-pass ONNX Danbooru tagging (79.2% F1) on CPU with zero GPU VRAM consumption.
+- **Batch Dataset Captioner**: Headless batch captioning via `prompt-condenser --caption <dir>` with tuned 0.30 confidence threshold.
+- **Headless Rules CLI**: Full CLI condenser engine support via `--prompt "<text>" [--view ...] [--vrp ...]`.
+- **Reference Transfer Presets**: 1-click Identity, Outfit, and Atmosphere transfer on the 1-Character tab.
+- **Multi-Character Regional Cross-Negatives**: Automated `(tag:0.8)` anti-bleed negative prompt generation for LuCiD VRP regions.
+- **Modular Bust & Frame Proportion Split**: Independent Bust and Frame controls with dedicated Shortstack and Pear-shape archetype support and conflict exemption.
+- **Vision Scanner UI Redesign**: Ergonomic 3-zone scanner dock with collapsible settings drawer and persistent active-filter badges.
+- **Companion ComfyUI Custom Node Suite**: Official custom nodes (`PromptCondenserText`, `PromptCondenserVRP`, `PromptCondenserCaption`) located in `tools/comfyui/`.
+
 History moved out of CLAUDE.md: benchmarks, and models or modes that were tried and dropped.
 
 ## Models and Deep Scan
@@ -32,3 +43,7 @@ History moved out of CLAUDE.md: benchmarks, and models or modes that were tried 
 - Step 4, background scan with the main characters painted out (2026-11-11), tagger + cleanup rules, threshold 0.30, 11 images: one pass 79.2% (4.7 s) vs + background pass 79.2% (7.4 s); full image + body zones 79.2% (15.3 s) vs + background 79.2% (17.8 s); it added one tag on all 11 images (brick wall on rouge_bat, wrong). Not adopted, code removed. Same run: today's full tagging with the 4 corner crops 78.8%, precision 83% (vs 86% without them), 26.1 s: the corner crops cost ~11 s per image for no gain (tagger-only; the AI path still uses them, needs a full-pipeline run before changing).
 - Region editor (2026-11-11): "✎ Edit regions" on the 2-4 Characters tabs: move / resize each character's LuCiD VRP box over the picture; Copy VRP regions uses the edited boxes. Not clicked through yet (no window access); covered by `edited_vrp_regions_are_written_and_clamped`.
 - `--prompt` command-line mode (2026-11-11): the window's rule-based cleanup as JSON (positive, negative, changes), for scripts and the ComfyUI node Gemini drafts.
+- `--prompt` gets `--view` (the Target View dropdown) and `--vrp` (2026-11-11): `--vrp --char … --char …` (2-4) adds `vrp_state` for LuCiD VRP, one rule-cleaned region per character, boxes from `--regions`, else the person detector on `--image`, else even strips. Checked on office_two_girls (detector boxes) and beret_girl (one person → strips, with a warning).
+- Regional cross-negatives (2026-11-11): Copy VRP regions (and `--vrp`) fills each region's negative with the other characters' distinguishing looks it doesn't share (`two::cross_negatives`, `(tag:0.8)`, ≤ 8), to reduce attribute bleed between regions. Unit-tested; not yet checked on a generation.
+- `--prompt "" --vrp` (2026-11-11): an empty shared scene is accepted when 2-4 characters are given (`positive` stays empty), so the ComfyUI VRP node no longer has to send `scenery`; a non-VRP empty prompt still exits 1.
+- Bust / Frame dropdowns (2026-11-11) replace the single Body dropdown (old saved index mapped): Bust none/flat/small/medium/large/huge/gigantic; Frame none/petite/shortstack/thick thighs & wide hips/pear/hourglass/muscular, real Danbooru tags only. Chosen tags are protected from the conflict rules; a typed or chosen `shortstack` keeps its `petite`.

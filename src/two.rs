@@ -601,13 +601,108 @@ pub fn vrp_regions(n: usize, boxes: Option<&[crate::detector::PersonBox]>, image
         .collect()
 }
 
+/// Most cross-negative tags per region.
+const CROSS_NEGATIVE_MAX: usize = 8;
+/// Weight of a cross-negative tag: low, so it only steers away from the other character's look.
+const CROSS_NEGATIVE_WEIGHT: f32 = 0.8;
+/// Hair accessories: outfit, not the hair itself.
+const HAIR_ACCESSORY: &[&str] = &[
+    "ornament", "clip", "hairclip", "hairpin", "hairband", "headband", "bow", "ribbon", "scrunchie", "flower", "tie",
+];
+/// Species parts.
+const SPECIES_PART: &[&str] = &["ears", "ear", "tail", "tails", "horns", "horn", "wings", "wing", "halo"];
+/// The garments that make an outfit (not accessories, socks or shoes).
+const MAIN_GARMENT: &[&str] = &[
+    "dress", "kimono", "yukata", "uniform", "serafuku", "shirt", "skirt", "miniskirt", "bikini", "swimsuit", "armor",
+    "jacket", "coat", "hoodie", "sweater", "leotard", "bodysuit", "robe", "suit", "gown", "qipao", "cheongsam",
+    "hakama", "blouse", "blazer", "cardigan", "vest", "pants", "jeans", "shorts", "overalls", "camisole", "maid",
+];
+
+/// Which kind of distinguishing look a tag is (lower = listed first), or `None` for anything else:
+/// hair (color, length, style), eye color, species parts, skin tone, main garment (with its color).
+/// Counts, quality, LoRA, pose, camera, setting, names and accessories are never distinguishing.
+fn distinguishing_kind(t: &PromptToken) -> Option<u8> {
+    let n = t.normalized.replace('_', " ");
+    let words: Vec<&str> = n.split(|c: char| !c.is_alphanumeric() && c != '-').filter(|w| !w.is_empty()).collect();
+    let has = |list: &[&str]| words.iter().any(|w| list.contains(w));
+    // names ("kay (girls und panzer)") and anything weighted into a group
+    if n.contains('(') || n.contains('{') {
+        return None;
+    }
+    // before `slot`, which reads "dark skin" as lighting
+    if words.last() == Some(&"skin") {
+        return Some(3);
+    }
+    match slot(t) {
+        Slot::Hair if !has(HAIR_ACCESSORY) => Some(0),
+        Slot::Eyes if words.contains(&"eyes") || n.contains("heterochromia") => Some(1),
+        Slot::Traits if has(SPECIES_PART) => Some(2),
+        Slot::Outfit if words.last().is_some_and(|w| MAIN_GARMENT.contains(w)) => Some(4),
+        _ => None,
+    }
+}
+
+/// Per character, the other characters' distinguishing tags (`distinguishing_kind`) this character
+/// doesn't share, as low-weight `(tag:0.8)` entries for its region's negative prompt, at most
+/// `CROSS_NEGATIVE_MAX`. A tag that is part of one of this character's tags, or the other way round,
+/// counts as shared ("long hair" next to "very long hair", "uniform" next to "school uniform"). Weighted,
+/// because ComfyUI's prompt parser reads the weight syntax in negatives too.
+pub fn cross_negatives(prompts: &[String]) -> Vec<String> {
+    let tags: Vec<Vec<(u8, String)>> = prompts
+        .iter()
+        .map(|p| {
+            let mut v: Vec<(u8, String)> = Vec::new();
+            for t in parse_prompt(p) {
+                if let Some(k) = distinguishing_kind(&t) {
+                    let n = t.normalized.replace('_', " ");
+                    if !v.iter().any(|(_, x)| *x == n) {
+                        v.push((k, n));
+                    }
+                }
+            }
+            v
+        })
+        .collect();
+    let own_all: Vec<Vec<String>> = prompts
+        .iter()
+        .map(|p| parse_prompt(p).into_iter().map(|t| t.normalized.replace('_', " ")).collect())
+        .collect();
+    let overlaps = |a: &str, b: &str| crate::parser::has_phrase(a, b) || crate::parser::has_phrase(b, a);
+    (0..prompts.len())
+        .map(|i| {
+            let mut picked: Vec<(u8, String)> = Vec::new();
+            for (j, theirs) in tags.iter().enumerate() {
+                if j == i {
+                    continue;
+                }
+                for (k, tag) in theirs {
+                    if own_all[i].iter().any(|own| overlaps(own, tag)) || picked.iter().any(|(_, p)| p == tag) {
+                        continue;
+                    }
+                    picked.push((*k, tag.clone()));
+                }
+            }
+            // by kind, keeping the prompts' order within a kind
+            picked.sort_by_key(|(k, _)| *k);
+            picked
+                .into_iter()
+                .take(CROSS_NEGATIVE_MAX)
+                .map(|(_, t)| format!("({t}:{CROSS_NEGATIVE_WEIGHT})"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .collect()
+}
+
 /// The `vrp_state` JSON for given regions (fractions of the canvas, one per prompt; clamped to the canvas).
+/// Each region's negative prompt holds the other characters' distinguishing tags (`cross_negatives`).
 pub fn vrp_state_json_from(prompts: &[String], regions: &[[f64; 4]], image_size: Option<(u32, u32)>) -> String {
     let (w, h) = image_size.filter(|(w, h)| *w > 0 && *h > 0).unwrap_or((1216, 832));
     let scale = (1_048_576.0 / (w as f64 * h as f64)).sqrt();
     let round64 = |v: f64| (((v / 64.0).round() as u32).max(4)) * 64;
     let (cw, ch) = (round64(w as f64 * scale), round64(h as f64 * scale));
     let r4 = |v: f64| (v * 10_000.0).round() / 10_000.0;
+    let negatives = cross_negatives(prompts);
     let regions: Vec<serde_json::Value> = prompts
         .iter()
         .zip(regions)
@@ -622,7 +717,7 @@ pub fn vrp_state_json_from(prompts: &[String], regions: &[[f64; 4]], image_size:
                 "label": format!("Character {}", i + 1),
                 "x": r4(x), "y": r4(y), "width": r4(bw), "height": r4(bh),
                 "prompt": prompt.trim(),
-                "negative_prompt": "",
+                "negative_prompt": negatives[i],
                 "weight": 1.0,
             })
         })
@@ -933,7 +1028,8 @@ mod tests {
             clamp_weights_enabled: true,
             camera_angle: 0,
             pose: 0,
-            proportion: 0,
+            bust: 0,
+            frame: 0,
             dynamic: false,
             lora_tags_raw: String::new(),
             arranged: false,
@@ -1397,6 +1493,40 @@ masterpiece, 2girls, indoors, gym, polished floor
     }
 
     #[test]
+    fn cross_negatives_hold_only_the_others_distinguishing_tags() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let neg = cross_negatives(&s(&[
+            "<lora:a:1>, 1girl, red hair, long hair, green eyes, cat ears, school uniform, smile, standing",
+            "1girl, blue hair, very long hair, twintails, yellow eyes, school uniform, dark skin, hair ribbon, classroom",
+        ]));
+        assert_eq!(neg[0], "(blue hair:0.8), (twintails:0.8), (yellow eyes:0.8), (dark skin:0.8)");
+        // "long hair" is part of "very long hair": shared, so not negated
+        assert_eq!(neg[1], "(red hair:0.8), (green eyes:0.8), (cat ears:0.8)");
+        for n in &neg {
+            for never in ["uniform", "smile", "standing", "classroom", "1girl", "lora", "ribbon"] {
+                assert!(!n.contains(never), "{never} in {n}");
+            }
+        }
+        // three characters: each gets both others' looks, the garment counts with its color
+        let neg = cross_negatives(&s(&[
+            "1girl, black hair, red dress",
+            "1girl, blonde hair, maid",
+            "1boy, black hair, fox tail, armor, kay (girls und panzer)",
+        ]));
+        assert_eq!(neg[0], "(blonde hair:0.8), (fox tail:0.8), (maid:0.8), (armor:0.8)");
+        assert_eq!(neg[1], "(black hair:0.8), (fox tail:0.8), (red dress:0.8), (armor:0.8)");
+        assert_eq!(neg[2], "(blonde hair:0.8), (red dress:0.8), (maid:0.8)");
+        // capped
+        let neg = cross_negatives(&s(&[
+            "1girl",
+            "1girl, red hair, short hair, ponytail, ahoge, blue eyes, cat ears, cat tail, horns, wings, pale skin, dress",
+        ]));
+        assert_eq!(neg[0].matches(':').count(), CROSS_NEGATIVE_MAX, "{}", neg[0]);
+        assert!(neg[0].starts_with("(red hair:0.8)") && !neg[0].contains("dress"), "{}", neg[0]);
+        assert_eq!(neg[1], "");
+    }
+
+    #[test]
     fn edited_vrp_regions_are_written_and_clamped() {
         let prompts = vec!["1girl, red hair".to_string(), "1girl, blue hair".to_string()];
         // even strips by default, one per prompt
@@ -1423,6 +1553,7 @@ masterpiece, 2girls, indoors, gym, polished floor
         let r = v["regions"].as_array().unwrap();
         assert_eq!(r.len(), 2);
         assert_eq!(r[1]["prompt"], "1girl, blue hair");
+        assert_eq!(r[0]["negative_prompt"], "(blue hair:0.8)");
         for region in r {
             // exactly the fields the node accepts
             let mut keys: Vec<&str> = region.as_object().unwrap().keys().map(|k| k.as_str()).collect();

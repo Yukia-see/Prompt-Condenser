@@ -227,7 +227,7 @@ mod tests {
                 camera_angle: 0,
 
                 pose: 0,
-                proportion: 0,
+                bust: 0, frame: 0,
 
                 dynamic: false,
 
@@ -278,7 +278,7 @@ mod tests {
             config: ScanConfig {
                 checkpoint: CheckpointProfile::Anima, target_view: crate::profiles::TargetView::None, pinned_emphasis_raw: String::new(),
                 emphasis_weight: 1.25, cleanup_enabled: true, resolve_conflicts_enabled: true, clamp_weights_enabled: true,
-                camera_angle: 0, pose: 0, proportion: 0, dynamic: false, lora_tags_raw: String::new(), arranged: false,
+                camera_angle: 0, pose: 0, bust: 0, frame: 0, dynamic: false, lora_tags_raw: String::new(), arranged: false,
                 natural: false, two_char: false, char2_prompt_raw: String::new(), char2_lora_tags_raw: String::new(),
                 char_break: false, scene_prompt_raw: String::new(), more_chars: Vec::new(),
                 detail: crate::profiles::DetailLevel::Balanced,
@@ -454,7 +454,7 @@ mod tests {
         let config = ScanConfig {
             checkpoint: CheckpointProfile::Anima, target_view: TargetView::None, pinned_emphasis_raw: String::new(),
             emphasis_weight: 1.25, cleanup_enabled: true, resolve_conflicts_enabled: true, clamp_weights_enabled: true,
-            camera_angle: 0, pose: 0, proportion: 0, dynamic: false, lora_tags_raw: String::new(), arranged: false, natural: true,
+            camera_angle: 0, pose: 0, bust: 0, frame: 0, dynamic: false, lora_tags_raw: String::new(), arranged: false, natural: true,
             two_char: true, char2_prompt_raw: "1girl, blue hair, bob cut, sailor uniform".into(), char2_lora_tags_raw: String::new(),
             char_break: false, scene_prompt_raw: "beach, sunset, standing in a row, wide shot".into(),
             more_chars: vec![("1girl, green hair, twintails, hoodie".into(), String::new()), ("1girl, pink hair, braid, white sundress".into(), String::new())],
@@ -839,7 +839,7 @@ mod tests {
         let config = ScanConfig {
             checkpoint: CheckpointProfile::Anima, target_view: TargetView::None, pinned_emphasis_raw: String::new(),
             emphasis_weight: 1.25, cleanup_enabled: true, resolve_conflicts_enabled: true, clamp_weights_enabled: true,
-            camera_angle: 0, pose: 0, proportion: 0, dynamic: false, lora_tags_raw: String::new(), arranged: false, natural: false,
+            camera_angle: 0, pose: 0, bust: 0, frame: 0, dynamic: false, lora_tags_raw: String::new(), arranged: false, natural: false,
             two_char: false, char2_prompt_raw: String::new(), char2_lora_tags_raw: String::new(), char_break: false,
             scene_prompt_raw: String::new(), more_chars: Vec::new(), detail: DetailLevel::Balanced,
         };
@@ -971,7 +971,7 @@ mod tests {
                 camera_angle: 0,
 
                 pose: 0,
-                proportion: 0,
+                bust: 0, frame: 0,
 
                 dynamic: false,
 
@@ -1031,7 +1031,7 @@ mod tests {
                 camera_angle: 0,
 
                 pose: 0,
-                proportion: 0,
+                bust: 0, frame: 0,
 
                 dynamic: false,
 
@@ -1086,7 +1086,7 @@ mod tests {
             config: ScanConfig {
                 checkpoint: crate::profiles::CheckpointProfile::PonyV6, target_view: crate::profiles::TargetView::None, pinned_emphasis_raw: String::new(),
                 emphasis_weight: 1.25, cleanup_enabled: true, resolve_conflicts_enabled: true, clamp_weights_enabled: true,
-                camera_angle: 0, pose: 0, proportion: 0, dynamic: false, lora_tags_raw: String::new(), arranged: false, natural: false, two_char: false, char2_prompt_raw: String::new(), char2_lora_tags_raw: String::new(), char_break: false, scene_prompt_raw: String::new(), more_chars: Vec::new(),
+                camera_angle: 0, pose: 0, bust: 0, frame: 0, dynamic: false, lora_tags_raw: String::new(), arranged: false, natural: false, two_char: false, char2_prompt_raw: String::new(), char2_lora_tags_raw: String::new(), char_break: false, scene_prompt_raw: String::new(), more_chars: Vec::new(),
                 detail: crate::profiles::DetailLevel::Balanced,
             },
             mode: AiMode::Gpu, host: String::new(), model: String::new(), keep_alive: "30m".into(), think: false,
@@ -1154,7 +1154,7 @@ mod tests {
             let config = ScanConfig {
                 checkpoint: crate::profiles::CheckpointProfile::Anima, target_view: crate::profiles::TargetView::None, pinned_emphasis_raw: String::new(),
                 emphasis_weight: 1.25, cleanup_enabled: true, resolve_conflicts_enabled: true, clamp_weights_enabled: true,
-                camera_angle: 0, pose: 0, proportion: 0, dynamic: false, lora_tags_raw: String::new(), arranged: false, natural: false, two_char: false, char2_prompt_raw: String::new(), char2_lora_tags_raw: String::new(), char_break: false, scene_prompt_raw: String::new(), more_chars: Vec::new(), detail: crate::profiles::DetailLevel::Balanced,
+                camera_angle: 0, pose: 0, bust: 0, frame: 0, dynamic: false, lora_tags_raw: String::new(), arranged: false, natural: false, two_char: false, char2_prompt_raw: String::new(), char2_lora_tags_raw: String::new(), char_break: false, scene_prompt_raw: String::new(), more_chars: Vec::new(), detail: crate::profiles::DetailLevel::Balanced,
             };
             let req = ImageAiRequest {
                 host: "localhost:11434".into(),
@@ -1251,7 +1251,7 @@ mod tests {
                         cleanup_enabled: true, resolve_conflicts_enabled: true, clamp_weights_enabled: true,
                         camera_angle: std::env::var("COMPARE_ANGLE").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
                         pose: 0,
-                proportion: 0,
+                bust: 0, frame: 0,
                         dynamic: std::env::var("COMPARE_DYNAMIC").is_ok(),
                         lora_tags_raw: std::env::var("COMPARE_LORA").unwrap_or_default(), arranged: false, natural: std::env::var("COMPARE_NATURAL").is_ok(), two_char: false, char2_prompt_raw: String::new(), char2_lora_tags_raw: String::new(), char_break: false, scene_prompt_raw: String::new(), more_chars: Vec::new(),
                         detail: match std::env::var("COMPARE_DETAIL").as_deref() { Ok("rich") => crate::profiles::DetailLevel::Rich, Ok("faithful") => crate::profiles::DetailLevel::Faithful, _ => crate::profiles::DetailLevel::Balanced },
@@ -1311,7 +1311,7 @@ mod tests {
         let base = || ScanConfig {
             checkpoint: CheckpointProfile::PonyV6, target_view: TargetView::None, pinned_emphasis_raw: String::new(),
             emphasis_weight: 1.25, cleanup_enabled: true, resolve_conflicts_enabled: true, clamp_weights_enabled: true,
-            camera_angle: 0, pose: 0, proportion: 0, dynamic: false, lora_tags_raw: String::new(), arranged: false, natural: false,
+            camera_angle: 0, pose: 0, bust: 0, frame: 0, dynamic: false, lora_tags_raw: String::new(), arranged: false, natural: false,
             two_char: false, char2_prompt_raw: String::new(), char2_lora_tags_raw: String::new(), char_break: false,
             scene_prompt_raw: String::new(), more_chars: Vec::new(), detail: DetailLevel::Balanced,
         };
@@ -1413,7 +1413,7 @@ mod tests {
             emphasis_weight: 1.25, cleanup_enabled: true, resolve_conflicts_enabled: true, clamp_weights_enabled: true,
  camera_angle: 0,
  pose: 0,
- proportion: 0,
+ bust: 0, frame: 0,
  dynamic: false,
  lora_tags_raw: String::new(), arranged: false, natural: false, two_char: false, char2_prompt_raw: String::new(), char2_lora_tags_raw: String::new(), char_break: false, scene_prompt_raw: String::new(), more_chars: Vec::new(),
  detail: crate::profiles::DetailLevel::Balanced,
@@ -1453,7 +1453,7 @@ mod tests {
         let mut cfg = ScanConfig {
             checkpoint: CheckpointProfile::Anima, target_view: TargetView::None, pinned_emphasis_raw: String::new(),
             emphasis_weight: 1.25, cleanup_enabled: true, resolve_conflicts_enabled: true, clamp_weights_enabled: true,
-            camera_angle: 6, pose: 0, proportion: 0, dynamic: true, lora_tags_raw: String::new(), arranged: false, natural: false, two_char: false, char2_prompt_raw: String::new(), char2_lora_tags_raw: String::new(), char_break: false, scene_prompt_raw: String::new(), more_chars: Vec::new(), detail: crate::profiles::DetailLevel::Rich,
+            camera_angle: 6, pose: 0, bust: 0, frame: 0, dynamic: true, lora_tags_raw: String::new(), arranged: false, natural: false, two_char: false, char2_prompt_raw: String::new(), char2_lora_tags_raw: String::new(), char_break: false, scene_prompt_raw: String::new(), more_chars: Vec::new(), detail: crate::profiles::DetailLevel::Rich,
         };
         let p = "1girl, solo, smile, kimono, shrine, night";
         let (g, gu) = build_ai_system_and_user_prompt_for(p, &cfg, ModelFamily::Gemma);

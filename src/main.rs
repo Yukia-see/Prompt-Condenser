@@ -30,7 +30,7 @@ use std::sync::mpsc;
 slint::include_modules!();
 
 /// What an AI scan was run against; its cards are dropped once any of these change.
-type AiKey = (String, i32, i32, i32, i32, i32); // (prompt, checkpoint, view, camera angle, pose, proportion)
+type AiKey = (String, i32, i32, i32, i32, i32, i32); // (prompt, checkpoint, view, camera angle, pose, bust, frame)
 
 /// UI-thread-only state behind the Slint properties.
 #[derive(Default)]
@@ -255,7 +255,8 @@ fn scan_config(ui: &AppWindow) -> ScanConfig {
         clamp_weights_enabled: ui.get_clamp_weights_enabled(),
         camera_angle: ui.get_angle_index().max(0) as usize,
         pose: ui.get_pose_index().max(0) as usize,
-        proportion: ui.get_proportion_index().max(0) as usize,
+        bust: ui.get_bust_index().max(0) as usize,
+        frame: ui.get_frame_index().max(0) as usize,
         dynamic: ui.get_dynamic_enabled(),
         lora_tags_raw: lora_lines(&ui.get_lora_tags()), arranged: ui.get_arranged_enabled(), natural: ui.get_natural_enabled(), two_char: ui.get_app_tab() >= 1, char2_prompt_raw: ui.get_char2_prompt().to_string(), char2_lora_tags_raw: lora_lines(&ui.get_char2_lora_tags()), char_break: ui.get_char_break_enabled(), scene_prompt_raw: ui.get_scene_prompt().to_string(), more_chars: more_chars(ui),
         detail: crate::profiles::DetailLevel::from_index(ui.get_detail_index()),
@@ -278,7 +279,8 @@ fn ai_key(ui: &AppWindow) -> AiKey {
         ui.get_target_view_index(),
         ui.get_angle_index(),
         ui.get_pose_index(),
-        ui.get_proportion_index(),
+        ui.get_bust_index(),
+        ui.get_frame_index(),
     )
 }
 
@@ -2361,8 +2363,14 @@ struct Settings {
     angle_index: i32,
     /// Pose (0 None, 1 Standing, etc.).
     pose_index: i32,
-    /// Body proportion (0 None, 1 Flat chest, etc.).
+    /// The old single Body dropdown (0 None, 1 Flat chest … 8 Muscular): only read, to fill
+    /// `bust_index` / `frame_index` from an older settings file.
+    #[serde(skip_serializing)]
     proportion_index: i32,
+    /// Bust dropdown (`profiles::BUSTS`; -1 = not saved yet).
+    bust_index: i32,
+    /// Frame dropdown (`profiles::FRAMES`; -1 = not saved yet).
+    frame_index: i32,
     /// AI detail level (0 Faithful, 1 Balanced, 2 Rich).
     detail_index: i32,
     /// Image reading: false = Danbooru tagger, true = AI.
@@ -2419,6 +2427,8 @@ impl Default for Settings {
             angle_index: 0,
             pose_index: 0,
             proportion_index: 0,
+            bust_index: -1,
+            frame_index: -1,
             detail_index: 1,
             image_use_ai: false,
             raw_prompt: String::new(),
@@ -2484,7 +2494,13 @@ fn load_settings(ui: &AppWindow) {
     ui.set_target_view_index(st.target_view_index.clamp(0, 7));
     ui.set_angle_index(st.angle_index.max(0));
     ui.set_pose_index(st.pose_index.max(0));
-    ui.set_proportion_index(st.proportion_index.max(0));
+    let (bust, frame) = if st.bust_index < 0 && st.frame_index < 0 {
+        profiles::bust_frame_from_old_body(st.proportion_index)
+    } else {
+        (st.bust_index, st.frame_index)
+    };
+    ui.set_bust_index(bust.clamp(0, profiles::BUSTS.len() as i32 - 1));
+    ui.set_frame_index(frame.clamp(0, profiles::FRAMES.len() as i32 - 1));
     ui.set_detail_index(st.detail_index.clamp(0, 2));
     ui.set_image_use_ai(st.image_use_ai);
     ui.set_raw_prompt(st.raw_prompt.into());
@@ -2532,7 +2548,9 @@ fn save_settings(ui: &AppWindow) {
         target_view_index: ui.get_target_view_index(),
         angle_index: ui.get_angle_index(),
         pose_index: ui.get_pose_index(),
-        proportion_index: ui.get_proportion_index(),
+        proportion_index: 0,
+        bust_index: ui.get_bust_index(),
+        frame_index: ui.get_frame_index(),
         detail_index: ui.get_detail_index(),
         image_use_ai: ui.get_image_use_ai(),
         raw_prompt: ui.get_raw_prompt().to_string(),
@@ -2650,8 +2668,11 @@ fn main() -> Result<(), slint::PlatformError> {
     ui.set_pose_labels(ModelRc::new(VecModel::from(
         profiles::POSES.iter().map(|(l, _)| SharedString::from(*l)).collect::<Vec<_>>(),
     )));
-    ui.set_proportion_labels(ModelRc::new(VecModel::from(
-        profiles::PROPORTIONS.iter().map(|(l, _)| SharedString::from(*l)).collect::<Vec<_>>(),
+    ui.set_bust_labels(ModelRc::new(VecModel::from(
+        profiles::BUSTS.iter().map(|(l, _)| SharedString::from(*l)).collect::<Vec<_>>(),
+    )));
+    ui.set_frame_labels(ModelRc::new(VecModel::from(
+        profiles::FRAMES.iter().map(|(l, _)| SharedString::from(*l)).collect::<Vec<_>>(),
     )));
     let mut scene_poses = vec![
         SharedString::from("+ Add Pose ▾"),
