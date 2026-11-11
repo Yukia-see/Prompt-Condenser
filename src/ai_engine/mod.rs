@@ -544,6 +544,28 @@ mod tests {
     }
 
     #[test]
+    fn writer_filler_and_unbacked_named_uniforms_go() {
+        let v = |s: &str| s.split(", ").map(str::to_string).collect::<Vec<String>>();
+        // named uniforms need the description to name them; generic ones always stay
+        let desc = "Kinomoto Sakura in a navy sailor top with red trim and a white pleated skirt.";
+        let out = drop_unbacked_named_uniforms(
+            v("1girl, tomoeda elementary school uniform, ooarai military uniform, school uniform, sailor collar"),
+            desc,
+        );
+        assert_eq!(out, v("1girl, school uniform, sailor collar"));
+        let backed = drop_unbacked_named_uniforms(v("1girl, anzio school uniform"), "She wears the Anzio school uniform.");
+        assert_eq!(backed, v("1girl, anzio school uniform"));
+        assert_eq!(drop_unbacked_named_uniforms(v("1girl, ooarai military uniform"), ""), v("1girl, ooarai military uniform"));
+        // filler about the drawing goes; a known tag inside it stays; descriptions stay
+        if crate::danbooru::local().is_some() {
+            let out = validate_tags(v("anime style, soft shading, clenched hand in foreground, pink heart chest piece"));
+            assert!(!out.iter().any(|t| t.contains("style") || t.contains("shading") || t.contains("foreground")), "{out:?}");
+            assert!(out.iter().any(|t| t == "clenched hand"), "{out:?}");
+            assert!(out.iter().any(|t| t == "pink heart chest piece"), "{out:?}");
+        }
+    }
+
+    #[test]
     fn colorful_pictures_are_not_monochrome_and_rivals_are_resolved() {
         // warm paper with grey lines is not colorful; a few strong colors are
         let mut paper = image::RgbImage::from_pixel(400, 400, image::Rgb([240, 228, 205]));

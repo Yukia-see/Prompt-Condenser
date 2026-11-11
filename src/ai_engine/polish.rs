@@ -148,6 +148,15 @@ pub fn validate_tags(tags: Vec<String>) -> Vec<String> {
             out.extend(pieces);
             continue;
         }
+        // Writer filler about the drawing rather than the picture ("anime style", "soft shading", "japanese text
+        // decoration", "clenched hand in foreground"): the meta words go; what's left stays only if it's a known
+        // tag ("japanese text", "clenched hand"). Known tags with these words (`backlighting`) never get here.
+        if let Some(rest) = strip_meta_words(&l) {
+            if list.get(&rest).is_some() || list.fix(&rest).is_some() {
+                out.push(list.get(&rest).map(|t| t.name.clone()).or_else(|| list.fix(&rest).map(|t| t.name.clone())).unwrap_or(rest));
+            }
+            continue;
+        }
         // Unknown multi-word tags are kept: the tag list is only the ~10,000 most common tags, and
         // descriptive ones ("white teal bikini top") are what Anima reads best. Dropping them emptied a
         // whole prompt in testing. Only phrases about nothing visible go.
@@ -157,6 +166,57 @@ pub fn validate_tags(tags: Vec<String>) -> Vec<String> {
         }
     }
     out
+}
+
+/// Words that describe the drawing, not what's in it.
+const META_WORDS: &[&str] = &[
+    "style", "styled", "shading", "shaded", "decoration", "decorations", "decorative", "foreground", "rendering",
+    "rendered", "drawn", "artstyle",
+];
+
+/// `Some(the phrase without its meta words and the little words left dangling)` when the phrase has a meta
+/// word; `None` otherwise.
+fn strip_meta_words(phrase: &str) -> Option<String> {
+    let words: Vec<&str> = phrase.split_whitespace().collect();
+    if !words.iter().any(|w| META_WORDS.contains(w)) {
+        return None;
+    }
+    let mut kept: Vec<&str> = words.into_iter().filter(|w| !META_WORDS.contains(w)).collect();
+    const DANGLING: &[&str] = &["in", "on", "the", "a", "with", "of", "and"];
+    while kept.last().is_some_and(|w| DANGLING.contains(w)) {
+        kept.pop();
+    }
+    while kept.first().is_some_and(|w| DANGLING.contains(w)) {
+        kept.remove(0);
+    }
+    Some(kept.join(" "))
+}
+
+/// Words of a named uniform tag that say nothing about which school or army (`tomoeda` and `ooarai` are names).
+const GENERIC_UNIFORM_WORDS: &[&str] = &[
+    "school", "elementary", "middle", "high", "military", "sailor", "gym", "maid", "nurse", "police", "waitress",
+    "chef", "baseball", "soccer", "track", "sports", "office", "japanese", "naval", "navy", "army", "kindergarten",
+    "cheerleader", "basketball", "volleyball", "tennis", "band", "marching", "summer", "winter", "uniform", "shrine",
+];
+
+/// Named uniforms (`tomoeda elementary school uniform`, `ooarai military uniform`) are dropped when the vision
+/// model's description doesn't name that school / army: the tagger is very sure of them on look-alike
+/// outfits (0.96 and 0.89 on a magical-girl costume). Without a description (`form` empty) nothing changes.
+pub fn drop_unbacked_named_uniforms(tags: Vec<String>, form: &str) -> Vec<String> {
+    if form.trim().is_empty() {
+        return tags;
+    }
+    let desc = form.to_lowercase();
+    tags.into_iter()
+        .filter(|t| {
+            let k = crate::danbooru::key(t);
+            if !k.ends_with(" uniform") {
+                return true;
+            }
+            let names: Vec<&str> = k.split_whitespace().filter(|w| !GENERIC_UNIFORM_WORDS.contains(w)).collect();
+            names.is_empty() || names.iter().any(|n| crate::danbooru::prose_has_pub(&desc, n))
+        })
+        .collect()
 }
 
 /// The known tags inside an unknown phrase, longest match first, left to right. `None` when there are
@@ -369,7 +429,7 @@ pub fn polish_image_prompt_with(
     } else {
         restore_tagger_tags(validate_tags(tags), tagger_tags, form, tagger_scores)
     };
-    let tags = drop_contradicted_feet(drop_contradicted_hair(one_per_part(tags)));
+    let tags = drop_unbacked_named_uniforms(drop_contradicted_feet(drop_contradicted_hair(one_per_part(tags))), form);
     let mut seen = std::collections::HashSet::new();
     let tags: Vec<String> = tags.into_iter().filter(|t| seen.insert(crate::danbooru::key(t))).collect();
     let tags = crate::danbooru::dedup_color_parents(&tags.join(", "));
