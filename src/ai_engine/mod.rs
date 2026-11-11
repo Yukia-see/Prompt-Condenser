@@ -544,6 +544,33 @@ mod tests {
     }
 
     #[test]
+    fn writer_spellings_and_drawing_words_are_cleaned() {
+        if crate::danbooru::local().is_none() {
+            return;
+        }
+        let v = |s: &str| s.split(", ").map(str::to_string).collect::<Vec<String>>();
+        let out = validate_tags(v("clenched fists, twin tails, knee-highs, fisheye lens effect, figure study, detailed anatomy diagram in background, green trim"));
+        for want in ["clenched hands", "twintails", "kneehighs", "fisheye", "green trim"] {
+            assert!(out.iter().any(|t| t == want), "{want} missing: {out:?}");
+        }
+        assert!(!out.iter().any(|t| t.contains("study") || t.contains("diagram")), "{out:?}");
+    }
+
+    /// Zone-fitting tags from a zone crop need less confidence; others still need `DETAIL_CROP_MIN`.
+    #[test]
+    fn zone_crops_add_fitting_tags_at_a_lower_bar() {
+        let t = |name: &str, score| crate::tagger::ScoredTag { name: name.into(), kind: crate::tagger::TagKind::General, score };
+        let base = vec![t("1girl", 0.99)];
+        let zone = vec![t("hair_flower", 0.46), t("thighs", 0.6), t("white_wings", 0.47), t("upper_body", 0.9)];
+        let m = crate::tagger::merge_zone_crop(&base, &zone, "Upper (Head, Hair & Face)");
+        let has = |n: &str| m.iter().any(|x| x.name == n);
+        assert!(has("hair_flower") && has("white_wings"), "{m:?}");
+        assert!(!has("thighs") && !has("upper_body"), "{m:?}");
+        let m = crate::tagger::merge_zone_crop(&base, &[t("thighs", 0.6), t("hair_flower", 0.6)], "Lower (Hips, Legs & Footwear)");
+        assert!(m.iter().any(|x| x.name == "thighs") && !m.iter().any(|x| x.name == "hair_flower"), "{m:?}");
+    }
+
+    #[test]
     fn plainly_described_body_and_pose_details_come_back() {
         let desc = "She wears a navy top with a visible navel showing midriff exposure; one arm is extended forward \
                     toward the viewer. Her shoes are not visible.";

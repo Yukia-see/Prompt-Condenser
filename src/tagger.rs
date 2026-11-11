@@ -257,6 +257,66 @@ pub fn merge_detail_crop(base: &[ScoredTag], detail: &[ScoredTag]) -> Vec<Scored
     restore_kinds(base, merged)
 }
 
+/// Words that place a tag in a body zone: a zone crop may add a fitting tag at a lower bar than `DETAIL_CROP_MIN`
+/// (the head crop can't really show thighs, so a head tag from it is trustworthy at 0.45). Measured on the upper
+/// zone alone: fox_vtuber `hair flower` 0.46, sakura_wings `white wings` 0.46, both correct and both lost at 0.75.
+const UPPER_ZONE_WORDS: &[&str] = &[
+    "hair", "eyes", "ears", "ear", "earrings", "hat", "beret", "cap", "headwear", "hairband", "hairclip", "headband",
+    "horns", "horn", "halo", "wings", "choker", "collar", "necklace", "glasses", "eyewear", "mouth", "smile", "blush",
+    "teeth", "tongue", "fang", "eyebrows", "eyelashes", "lips", "makeup", "freckles", "mole", "face", "ahoge",
+    "bangs", "sidelocks", "ponytail", "twintails", "braid", "bun", "bobbles", "flower", "ornament", "veil", "mask",
+    "headdress", "tiara", "crown", "neckerchief", "necktie", "bowtie", "scrunchie", "pupils", "eyeshadow",
+];
+const MIDDLE_ZONE_WORDS: &[&str] = &[
+    "shirt", "jacket", "top", "dress", "sleeves", "gloves", "navel", "midriff", "cleavage", "bikini", "bra", "sweater",
+    "cardigan", "vest", "apron", "belt", "holding", "arm", "arms", "hand", "hands", "fingers", "nails", "bag", "blazer",
+    "coat", "hoodie", "uniform", "serafuku", "leotard", "bodysuit", "armor", "cape", "cloak", "corset", "stomach",
+    "shoulders", "shoulder", "underboob", "sideboob", "collarbone", "bracelet", "wristband", "cuffs", "sash", "obi",
+];
+const LOWER_ZONE_WORDS: &[&str] = &[
+    "skirt", "shorts", "pants", "panties", "thighhighs", "socks", "kneehighs", "pantyhose", "legwear", "boots", "shoes",
+    "footwear", "sneakers", "sandals", "heels", "loafers", "uwabaki", "barefoot", "feet", "legs", "thighs", "knees",
+    "garter", "buruma", "bloomers", "thigh", "strap", "leggings", "stockings",
+];
+
+/// The bar a zone-fitting tag needs (`PC_ZONE_BAR` overrides it, testing only).
+fn zone_bar(upper: bool) -> f32 {
+    std::env::var("PC_ZONE_BAR").ok().and_then(|v| v.parse().ok()).unwrap_or(if upper { 0.45 } else { 0.50 })
+}
+
+/// `merge_detail_crop` for one of `detector::three_zone_crops` (label "Upper…", "Middle…", "Lower…"): tags that
+/// fit the zone need only `zone_bar`, all others still `DETAIL_CROP_MIN`. Framing, size and artifact tags are
+/// still rejected by `merge_crop_tags`.
+pub fn merge_zone_crop(base: &[ScoredTag], detail: &[ScoredTag], zone_label: &str) -> Vec<ScoredTag> {
+    let words: &[&str] = if zone_label.starts_with("Upper") {
+        UPPER_ZONE_WORDS
+    } else if zone_label.starts_with("Middle") {
+        MIDDLE_ZONE_WORDS
+    } else if zone_label.starts_with("Lower") {
+        LOWER_ZONE_WORDS
+    } else {
+        return merge_detail_crop(base, detail);
+    };
+    let bar = zone_bar(zone_label.starts_with("Upper"));
+    let fits = |name: &str| name.split(['_', ' ']).any(|w| words.contains(&w));
+    let kept: Vec<ScoredTag> = detail
+        .iter()
+        .filter(|t| t.kind == TagKind::General && t.score >= if fits(&t.name) { bar } else { DETAIL_CROP_MIN })
+        .cloned()
+        .collect();
+    let base_tuples: Vec<(String, f32)> = base.iter().map(|t| (t.name.clone(), t.score)).collect();
+    let kept_tuples: Vec<(String, f32)> = kept.iter().map(|t| (t.name.clone(), t.score)).collect();
+    let merged = crate::prompt_condenser::merge_crop_tags(
+        &base_tuples,
+        &kept_tuples,
+        crate::prompt_condenser::CropType::CharacterZone,
+        &[],
+        bar.min(DETAIL_CROP_MIN),
+        bar.min(DETAIL_CROP_MIN),
+    );
+    restore_kinds(base, merged)
+}
+
 /// Gives merged (name, score) pairs back their tag kind from `base` (General for new ones).
 /// The tagger scores all ~10,000 tags, so this uses one lookup table: searching `base` for
 /// every tag made each merge ~100 million string comparisons (minutes per image read).

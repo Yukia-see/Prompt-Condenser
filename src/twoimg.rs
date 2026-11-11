@@ -231,9 +231,9 @@ pub fn tag_one_fast(path: &Path, progress: &(dyn Fn(String) + Sync)) -> Result<V
     for b in &chars {
         let is_tall = (b.y1 - b.y0) / (image.height() as f32).max(1.0) >= 0.25;
         if is_tall {
-            for (_, zone_img) in detector::three_zone_crops(&image, b) {
+            for (label, zone_img) in detector::three_zone_crops(&image, b) {
                 if let Ok(z_tags) = tagger::tag_dynamic(&zone_img) {
-                    merged = tagger::merge_detail_crop(&merged, &z_tags);
+                    merged = tagger::merge_zone_crop(&merged, &z_tags, label);
                 }
             }
         } else {

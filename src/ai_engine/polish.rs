@@ -101,7 +101,21 @@ pub(crate) fn phrase_to_tag(tag: &str) -> Option<&'static str> {
         "plain background" => "simple background",
         "off the shoulders" | "off the shoulder" | "off-shoulder" | "off shoulders" => "off shoulder",
         "plain grey background" | "plain gray background" => "grey background",
-        "soft shadows" | "even lighting" | "athletic build" | "slim build" | "blue trim" | "visible tail" | "tail visible" => "",
+        // the writer's spelling of common tags
+        "clenched fists" => "clenched hands",
+        "clenched fist" => "clenched hand",
+        "twin tails" => "twintails",
+        "knee-highs" | "knee highs" | "knee high socks" | "knee-high socks" => "kneehighs",
+        "white angel wings" => "white wings",
+        "floral pattern" => "floral print",
+        "triangle top" | "triangle bikini top" => "triangle bikini",
+        "thick outlines" | "thick outline" => "outline",
+        "hands resting at sides" | "hands at sides" | "arms resting at sides" => "arms at sides",
+        "fisheye lens effect" | "fisheye lens" | "fisheye effect" => "fisheye",
+        "black letterboxing" | "letterboxing" | "black letterbox bars" => "letterboxed",
+        "tutorial image" | "tutorial" => "how to",
+        "soft shadows" | "even lighting" | "athletic build" | "slim build" | "visible tail" | "tail visible" | "figure study"
+        | "detailed anatomy" => "",
         _ => return None,
     })
 }
@@ -172,7 +186,8 @@ pub fn validate_tags(tags: Vec<String>) -> Vec<String> {
 /// Words that describe the drawing, not what's in it.
 const META_WORDS: &[&str] = &[
     "style", "styled", "shading", "shaded", "decoration", "decorations", "decorative", "foreground", "rendering",
-    "rendered", "drawn", "artstyle",
+    "rendered", "drawn", "artstyle", "diagram", "diagrams", "tutorial", "study", "anatomy", "anatomical", "effect",
+    "lens", "letterboxing",
 ];
 
 /// `Some(the phrase without its meta words and the little words left dangling)` when the phrase has a meta
