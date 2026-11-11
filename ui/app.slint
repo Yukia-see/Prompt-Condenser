@@ -1190,6 +1190,9 @@ export component AppWindow inherits Window {
     in-out property <image> scene_ref_thumb;
     in-out property <string> scene_ref_status: "";
     callback load_scene_ref_requested();
+    // "Reference use": 0 = Scene & pose (classic), 1 = Identity transfer, 2 = Outfit transfer, 3 = Atmosphere
+    in-out property <int> reference_use_index: 0;
+    callback transfer_requested();
     callback remove_scene_ref_requested();
 
     // Scene Inspector dropdown panel & character actions
@@ -1904,6 +1907,19 @@ export component AppWindow inherits Window {
                                 primary: true;
                                 enabled: !root.tagger_busy;
                                 clicked => { root.auto_scene_requested(); }
+                            }
+
+                            // Reference use presets (1 Character tab): what the reference contributes
+                            if root.scene_ref_loaded && root.app_tab == 0 : ComboBox {
+                                width: 160px;
+                                model: ["Scene & pose", "Identity transfer", "Outfit transfer", "Atmosphere"];
+                                current-index <=> root.reference_use_index;
+                            }
+                            if root.scene_ref_loaded && root.app_tab == 0 && root.reference_use_index > 0 : PillButton {
+                                text: root.tagger_busy ? "⇄ …" : "⇄ Transfer";
+                                primary: true;
+                                enabled: !root.tagger_busy;
+                                clicked => { root.transfer_requested(); }
                             }
 
                             // Scene Panel Dropdown Toggle

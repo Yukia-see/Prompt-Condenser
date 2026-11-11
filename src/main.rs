@@ -2739,6 +2739,69 @@ fn main() -> Result<(), slint::PlatformError> {
         });
     }
 
+    // --- Reference use presets: Identity / Outfit / Atmosphere transfer (1 Character tab) ---
+    {
+        let weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_transfer_requested(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            let Some(preset) = scene::Transfer::from_index(ui.get_reference_use_index()) else { return };
+            let Some(path) = state.borrow().scene_ref_path.clone() else {
+                ui.set_scene_ref_status("Load a reference image first.".into());
+                return;
+            };
+            if ui.get_raw_prompt().trim().is_empty() {
+                ui.set_scene_ref_status("Read or type your character first (Before), then transfer.".into());
+                return;
+            }
+            let gen = (state.borrow().image_gens, ImageSlots::Scene);
+            ai_engine::reset_cancel();
+            ui.set_tagger_busy(true);
+            ui.set_scene_ref_status("Reading the reference with the fast tagger…".into());
+            let weak = ui.as_weak();
+            std::thread::spawn(move || {
+                let started = std::time::Instant::now();
+                // the fast Tagger mode reading (one pass + cleanup rules + picture checks), ~5 s
+                let read = twoimg::tag_one_passes(&path, &|_| (), false, false)
+                    .map(|scores| ai_engine::clean_tagger_prompt(&tagger::build_prompt(&scores, 0.30).prompt, &path));
+                let secs = started.elapsed().as_secs_f32();
+                let _ = weak.upgrade_in_event_loop(move |ui| {
+                    ui.set_tagger_busy(false);
+                    if image_changed_since(&ui, gen) {
+                        return;
+                    }
+                    match read {
+                        Ok(reference) => with_state(|state| {
+                            let before = ui.get_raw_prompt().to_string();
+                            let merged = scene::transfer(&before, &reference, preset);
+                            // Undo goes back to Before as it was right before this transfer
+                            state.borrow_mut().prompt_before_image = Some(before);
+                            ui.set_image_can_undo(true);
+                            ui.set_raw_prompt(merged.into());
+                            analyze(&ui, state);
+                            let what = match preset {
+                                scene::Transfer::Identity => "body, outfit, pose and scene",
+                                scene::Transfer::Outfit => "outfit",
+                                scene::Transfer::Atmosphere => "setting, light and style",
+                            };
+                            // a reference with several people mixes their outfits / bodies
+                            let group = reference.split(',').map(danbooru::key).any(|k| {
+                                two::count_tag(&k).is_some_and(|(n, _)| n >= 2) || k == "multiple girls" || k == "multiple boys"
+                            });
+                            let note = if group && preset != scene::Transfer::Atmosphere {
+                                " • the reference shows several people, so their tags are combined"
+                            } else {
+                                ""
+                            };
+                            ui.set_scene_ref_status(format!("Took the reference's {what} • {secs:.1} s (Undo restores Before){note}").into());
+                        }),
+                        Err(e) => ui.set_scene_ref_status(format!("Reading the reference failed: {e:#}").into()),
+                    }
+                });
+            });
+        });
+    }
+
     // --- Clipboard ---
     {
         let weak = ui.as_weak();

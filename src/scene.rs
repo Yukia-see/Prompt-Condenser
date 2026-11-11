@@ -79,6 +79,7 @@ const SETTING: &[&str] = &[
     "whiteboard", "chalkboard", "blackboard", "gym", "gymnasium", "dojo", "stadium", "arena", "living room",
 ];
 const OUTFIT: &[&str] = &[
+    "buruma", "bloomers",
     "dress", "kimono", "yukata", "uniform", "shirt", "skirt", "bikini", "swimsuit", "armor", "jacket", "coat",
     "hoodie", "sweater", "hat", "gloves", "boots", "shoes", "thighhighs", "stockings", "pantyhose", "socks", "shorts",
     "pants", "jeans", "leotard", "bodysuit", "apron", "maid", "lingerie", "underwear", "panties", "bra", "nude",
@@ -405,6 +406,75 @@ pub fn filter_for_ref_adapter(text: &str) -> String {
         }
     }
     lines.join("\n")
+}
+
+/// What a reference image contributes when merged into a character's prompt (the "Reference use" choice).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Transfer {
+    /// The character keeps who they are (face, hair, eyes, expression, headwear); the reference gives body,
+    /// outfit, pose, camera, setting, light and style.
+    Identity,
+    /// The character keeps everything but the outfit; the reference gives the clothing and accessories.
+    Outfit,
+    /// The character keeps everything but setting, light and style; the reference gives those.
+    Atmosphere,
+}
+
+impl Transfer {
+    /// The "Reference use" dropdown: 0 = Scene & pose (the classic reference, not a transfer), 1-3 = these.
+    pub fn from_index(i: i32) -> Option<Transfer> {
+        match i {
+            1 => Some(Transfer::Identity),
+            2 => Some(Transfer::Outfit),
+            3 => Some(Transfer::Atmosphere),
+            _ => None,
+        }
+    }
+
+    fn from_reference(self, s: Slot) -> bool {
+        match self {
+            Transfer::Identity => matches!(s, Slot::Body | Slot::Outfit | Slot::Pose | Slot::Camera | Slot::Setting | Slot::Light | Slot::Style),
+            Transfer::Outfit => s == Slot::Outfit,
+            Transfer::Atmosphere => matches!(s, Slot::Setting | Slot::Light | Slot::Style),
+        }
+    }
+}
+
+/// Headwear stays with the character's identity in an identity transfer (it's part of how they look).
+fn is_headwear(n: &str) -> bool {
+    has_word(n, &["hat", "beret", "cap", "headwear", "hood", "helmet", "crown", "tiara", "headband", "hairband", "veil", "headdress", "halo"])
+}
+
+/// Merges a reference image's tags into a character's prompt: the groups the preset takes from the reference
+/// replace the character's own tags of those groups; everything else stays as the character had it. The
+/// reference never brings names, group counts or quality / LoRA tags; with Identity, the character's unknown
+/// words go too (they could be clothing or a scene). Order: the character's kept tags, then the reference's.
+pub fn transfer(character: &str, reference: &str, preset: Transfer) -> String {
+    let from_ref = |t: &PromptToken| {
+        let s = slot(t);
+        preset.from_reference(s) && !(preset == Transfer::Identity && s == Slot::Outfit && is_headwear(&t.normalized))
+    };
+    let mut out: Vec<String> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for t in crate::parser::parse_prompt(character) {
+        // a character's own name is part of who they are, even though the keyword lists don't know it
+        let unknown = slot(&t) == Slot::Other && !crate::danbooru::is_character(&t.normalized);
+        let keep = !from_ref(&t) && !(preset == Transfer::Identity && unknown);
+        if keep && seen.insert(t.normalized.clone()) {
+            out.push(t.raw.trim().to_string());
+        }
+    }
+    for t in crate::parser::parse_prompt(reference) {
+        let n = t.normalized.as_str();
+        let foreign = crate::danbooru::is_character(n)
+            || crate::two::count_tag(n).is_some()
+            || matches!(n, "solo" | "multiple girls" | "multiple boys")
+            || matches!(slot(&t), Slot::Quality | Slot::Lora | Slot::Subject);
+        if from_ref(&t) && !foreign && seen.insert(t.normalized.clone()) {
+            out.push(t.raw.trim().to_string());
+        }
+    }
+    out.into_iter().filter(|t| !t.is_empty()).collect::<Vec<_>>().join(", ")
 }
 
 pub(crate) fn slot(t: &PromptToken) -> Slot {
@@ -1319,6 +1389,46 @@ mod tests {
         // section headers and line layout survive
         let blocks = filter_for_ref_adapter("[Scene / Environment & Shared Framing]:\nmasterpiece, 2girls, beach\n\n[Character 1]:\nred hair, smile");
         assert!(blocks.starts_with("[Scene / Environment & Shared Framing]:\nmasterpiece, 2girls, beach") && blocks.contains("[Character 1]:\nsmile"), "{blocks}");
+    }
+
+    #[test]
+    fn transfers_take_the_right_groups_from_each_image() {
+        let character = "masterpiece, 1girl, solo, hatsune miku, aqua hair, twintails, aqua eyes, smile, beret, \
+                         school uniform, pleated skirt, standing, classroom, day";
+        let reference = "1girl, solo, rouge the bat, red dress, black thighhighs, sitting, crossed legs, from below, \
+                         beach, sunset, watercolor";
+        let ident = transfer(character, reference, Transfer::Identity);
+        for keep in ["masterpiece", "1girl", "hatsune miku", "aqua hair", "twintails", "aqua eyes", "smile", "beret",
+                     "red dress", "black thighhighs", "sitting", "crossed legs", "from below", "beach", "sunset"] {
+            assert!(ident.split(", ").any(|t| t == keep), "identity: {keep} missing: {ident}");
+        }
+        for gone in ["school uniform", "pleated skirt", "standing", "classroom", "rouge the bat"] {
+            assert!(!ident.split(", ").any(|t| t == gone), "identity: {gone} kept: {ident}");
+        }
+        let outfit = transfer(character, reference, Transfer::Outfit);
+        assert!(outfit.contains("red dress") && outfit.contains("standing") && outfit.contains("classroom"), "{outfit}");
+        assert!(!outfit.contains("school uniform") && !outfit.contains("sitting") && !outfit.contains("beach"), "{outfit}");
+        let atmo = transfer(character, reference, Transfer::Atmosphere);
+        assert!(atmo.contains("school uniform") && atmo.contains("standing") && atmo.contains("beach") && atmo.contains("sunset"), "{atmo}");
+        assert!(!atmo.contains("classroom") && !atmo.contains("red dress"), "{atmo}");
+        assert_eq!(Transfer::from_index(0), None);
+    }
+
+    /// `CHAR_IMG=a.png REF_IMG=b.png cargo test live_transfer -- --ignored --nocapture`: the three presets on real
+    /// fast-mode readings.
+    #[test]
+    #[ignore]
+    fn live_transfer() {
+        let read = |p: &str| {
+            let path = std::path::Path::new(p);
+            let scores = crate::twoimg::tag_one_passes(path, &|_| (), false, false).unwrap();
+            crate::ai_engine::clean_tagger_prompt(&crate::tagger::build_prompt(&scores, 0.30).prompt, path)
+        };
+        let (c, r) = (read(&std::env::var("CHAR_IMG").unwrap()), read(&std::env::var("REF_IMG").unwrap()));
+        println!("CHARACTER : {c}\nREFERENCE : {r}");
+        for p in [Transfer::Identity, Transfer::Outfit, Transfer::Atmosphere] {
+            println!("{p:?} : {}", transfer(&c, &r, p));
+        }
     }
 
 }
