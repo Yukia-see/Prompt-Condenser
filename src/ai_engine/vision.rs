@@ -507,6 +507,9 @@ pub fn describe_image(req: &ImageAiRequest) -> Result<ImageAiResult> {
     if std::env::var_os("PC_NO_POLISH").is_none() {
         out.prompt = polish_image_prompt_with(&out.prompt, "", &req.strong_tags, &req.tag_hints, &req.tagger_scores);
         out.prompt = apply_image_style(&out.prompt, &req.tag_hints, panels);
+        if let Some(checked) = crate::twoimg::figure_checks(&req.image_path, &out.prompt) {
+            out.prompt = checked;
+        }
     }
     Ok(out)
 }
@@ -583,6 +586,12 @@ pub fn describe_image_with_desc(
     if std::env::var_os("PC_NO_POLISH").is_none() {
         res.prompt = polish_image_prompt_with(&res.prompt, vision_desc, &req.strong_tags, &req.tag_hints, &req.tagger_scores);
         res.prompt = apply_image_style(&res.prompt, &req.tag_hints, panels);
+        // PC_NO_FIGURE_CHECKS=1 skips the picture checks (testing only)
+        if std::env::var_os("PC_NO_FIGURE_CHECKS").is_none() {
+            if let Some(checked) = crate::twoimg::figure_checks(&req.image_path, &res.prompt) {
+                res.prompt = checked;
+            }
+        }
     }
     Ok(res)
 }

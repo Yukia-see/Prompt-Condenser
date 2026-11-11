@@ -160,7 +160,8 @@ pub fn validate_tags(tags: Vec<String>) -> Vec<String> {
         // Unknown multi-word tags are kept: the tag list is only the ~10,000 most common tags, and
         // descriptive ones ("white teal bikini top") are what Anima reads best. Dropping them emptied a
         // whole prompt in testing. Only phrases about nothing visible go.
-        const NOT_VISUAL: &[&str] = &["visible", "build", "shadows", "trim", "tone", "tones", "accents", "expression", "vibe", "aesthetic"];
+        // ("trim" was here too and deleted real details like "green trim")
+        const NOT_VISUAL: &[&str] = &["visible", "build", "shadows", "tone", "tones", "accents", "expression", "vibe", "aesthetic"];
         if !l.split_whitespace().any(|w| NOT_VISUAL.contains(&w)) {
             out.push(t);
         }
@@ -429,7 +430,16 @@ pub fn polish_image_prompt_with(
     } else {
         restore_tagger_tags(validate_tags(tags), tagger_tags, form, tagger_scores)
     };
-    let tags = drop_unbacked_named_uniforms(drop_contradicted_feet(drop_contradicted_hair(one_per_part(tags))), form);
+    let mut tags = drop_unbacked_named_uniforms(drop_contradicted_feet(drop_contradicted_hair(one_per_part(tags))), form);
+    // `invisible` is a tagger artifact on headless / cropped figures, unless the description says so
+    if !crate::danbooru::prose_has_pub(&form.to_lowercase(), "invisible") {
+        tags.retain(|t| crate::danbooru::key(t) != "invisible");
+    }
+    for t in crate::danbooru::extract_tags_from_prose(form) {
+        if DESCRIPTION_TAGS.contains(&t) && !tags.iter().any(|x| crate::danbooru::key(x) == t) {
+            tags.push(t.to_string());
+        }
+    }
     let mut seen = std::collections::HashSet::new();
     let tags: Vec<String> = tags.into_iter().filter(|t| seen.insert(crate::danbooru::key(t))).collect();
     let tags = crate::danbooru::dedup_color_parents(&tags.join(", "));
@@ -465,8 +475,13 @@ const RECOVERY_SKIP: &[&str] = &[
     "multiple boys", "thighs", "legs", "ribbon", "bag", "food", "plaid", "clothes", "bow", "gloves", "wings", "jacket",
     "belt", "boots", "dress", "pants", "shorts", "sleeves", "virtual youtuber", "alternate breast size",
     "character name", "copyright name", "artist name", "twitter username", "signature", "watermark",
-    "parody", "style parody", "retro artstyle", "alternate costume", "adapted costume",
+    "parody", "style parody", "retro artstyle", "alternate costume", "adapted costume", "invisible",
 ];
+
+/// Body and pose tags the vision model's description states plainly but the writer often drops (sakura_wings:
+/// "a visible navel showing midriff exposure", "one arm extended forward toward the viewer"). Only these come
+/// from the description rules: the rules have misread other words before ("reference sheet" → bedroom).
+const DESCRIPTION_TAGS: &[&str] = &["navel", "midriff", "outstretched arm", "reaching towards viewer"];
 
 /// Breast sizes, smallest first (for `one_per_part` and the tagger's size authority).
 pub(crate) const BREAST_SIZES: &[&str] =

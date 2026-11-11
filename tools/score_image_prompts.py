@@ -58,7 +58,10 @@ def main():
         key, got = tags(answer.read_text()), tags(prompt)
         accept_file = answer.with_name(answer.stem + ".acceptable.txt")
         acceptable = tags(accept_file.read_text()) if accept_file.exists() else set()
-        hit = key & got
+        # a required bare parent ("bikini", "thighhighs") counts as found when a specific version is in the
+        # prompt ("black bikini"): the app drops the bare parent next to it on purpose (recall only)
+        implied = {k for k in key - got if " " not in k and any(g.endswith(" " + k) for g in got)}
+        hit = (key & got) | implied
         rec = len(hit) / max(1, len(key))
         prec = len(got & (key | acceptable)) / max(1, len(got))
         f1 = 2 * rec * prec / max(1e-9, rec + prec)

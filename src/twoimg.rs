@@ -125,6 +125,86 @@ pub fn tag_one(path: &Path, progress: &(dyn Fn(String) + Sync)) -> Result<Vec<Sc
 }
 
 /// Same as `tag_one`, but runs the detector before tagging, so the image is opened once.
+/// Tags that come from anatomy / x-ray diagrams (reference-sheet insets), not from the drawn character.
+const DIAGRAM_TAGS: &[&str] = &[
+    "nude", "completely nude", "x-ray", "ribs", "skeleton", "bone", "faceless", "faceless female", "faceless male",
+    "no eyes", "no nipples", "glitch", "disembodied limb", "heart (organ)", "organs",
+];
+
+fn is_footwear(tag: &str) -> bool {
+    let t = tag.replace('_', " ").to_lowercase();
+    ["shoes", "footwear", "boots", "sneakers", "heels", "sandals", "loafers", "slippers"].iter().any(|f| t == *f || t.ends_with(&format!(" {f}")))
+        || matches!(t.as_str(), "mary janes" | "uwabaki" | "geta")
+}
+
+/// Checks on a finished image prompt that need the picture itself (`None` when nothing could be checked):
+/// 1. Footwear (and `full body`) go when the bottom of every main figure shows no feet or shoes: the tagger
+///    guesses shoes on a picture cut off at the knees (sakura_wings: shoes 0.61, nothing in frame).
+/// 2. Diagram tags (`x-ray`, `skeleton`, `faceless`, `nude`…) go when no detected figure shows them on its own
+///    crop and the figures leave room for insets: they come from small anatomy diagrams beside the character.
+/// Runs the detector and up to two tagger passes per figure, only when the prompt has such tags.
+pub fn figure_checks(path: &Path, prompt: &str) -> Option<String> {
+    let tags: Vec<String> = prompt.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect();
+    let key = |t: &str| crate::danbooru::key(t);
+    let shoes = tags.iter().any(|t| is_footwear(t));
+    let diagram = tags.iter().any(|t| DIAGRAM_TAGS.contains(&key(t).as_str()));
+    if !(shoes || diagram) || !detector::is_installed() || !tagger::is_installed() {
+        return None;
+    }
+    let image = image::open(path).ok()?;
+    let boxes = detector::detect(&image).ok()?;
+    // main figures only: the small figures inside reference-sheet insets are detected as people too
+    let biggest = boxes.iter().map(|b| b.area()).fold(0.0, f32::max);
+    let main: Vec<PersonBox> = boxes.into_iter().filter(|b| b.area() >= 0.3 * biggest).collect();
+    let chars = detector::main_n(&main, main.len().min(4)).unwrap_or(main);
+    if chars.is_empty() {
+        return None;
+    }
+    let mut drop: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if shoes {
+        let feet_seen = chars.iter().any(|b| {
+            let h = b.y1 - b.y0;
+            let strip = PersonBox { y0: (b.y1 - h * 0.22).max(b.y0), ..b.clone() };
+            tagger::tag_dynamic(&detector::crop(&image, &strip)).is_ok_and(|scored| {
+                scored.iter().any(|t| {
+                    t.score >= 0.2
+                        && (is_footwear(&t.name) || matches!(t.name.as_str(), "barefoot" | "feet" | "toes" | "soles"))
+                })
+            })
+        });
+        if !feet_seen {
+            for t in &tags {
+                if is_footwear(t) || key(t) == "full body" {
+                    drop.insert(key(t));
+                }
+            }
+        }
+    }
+    let (w, x0, x1) = (
+        image.width() as f32,
+        chars.iter().map(|b| b.x0).fold(f32::MAX, f32::min),
+        chars.iter().map(|b| b.x1).fold(0.0, f32::max),
+    );
+    if diagram && (x1 - x0) < 0.75 * w {
+        let crops: Vec<Vec<ScoredTag>> =
+            chars.iter().filter_map(|b| tagger::tag_dynamic(&detector::crop(&image, b)).ok()).collect();
+        for t in &tags {
+            let k = key(t);
+            if !DIAGRAM_TAGS.contains(&k.as_str()) {
+                continue;
+            }
+            let on_figure = crops.iter().any(|c| c.iter().any(|s| key(&s.name) == k && s.score >= 0.3));
+            if !on_figure {
+                drop.insert(k);
+            }
+        }
+    }
+    if drop.is_empty() {
+        return None;
+    }
+    Some(tags.into_iter().filter(|t| !drop.contains(&key(t))).collect::<Vec<_>>().join(", "))
+}
+
 pub fn tag_one_fast(path: &Path, progress: &(dyn Fn(String) + Sync)) -> Result<Vec<ScoredTag>> {
     if !detector::is_installed() {
         return tag_one(path, progress);
@@ -510,11 +590,37 @@ mod tests {
     #[ignore]
     fn live_tag_scores() {
         let p = std::env::var("TIMING_TEST").unwrap();
-        let mut tags = tag_one_fast(Path::new(&p), &|_| ()).unwrap();
-        tags.retain(|t| t.score >= 0.3);
+        // TAG_PLAIN=1: the plain tagger pass, without the zoomed crop merge
+        let mut tags = if std::env::var_os("TAG_PLAIN").is_some() {
+            tagger::tag_image(Path::new(&p)).unwrap()
+        } else {
+            tag_one_fast(Path::new(&p), &|_| ()).unwrap()
+        };
+        let min: f32 = std::env::var("TAG_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(0.3);
+        tags.retain(|t| t.score >= min);
         tags.sort_by(|a, b| b.score.total_cmp(&a.score));
         for t in tags {
-            println!("{:.2}  {}", t.score, t.name);
+            println!("{:.2}  {}  {:?}", t.score, t.name, t.kind);
+        }
+    }
+
+    #[test]
+    fn footwear_names_are_recognized() {
+        for f in ["shoes", "black_footwear", "white footwear", "mary janes", "uwabaki", "knee boots", "high heels"] {
+            assert!(is_footwear(f), "{f}");
+        }
+        for n in ["white socks", "thighhighs", "barefoot", "boot cuffs"] {
+            assert!(!is_footwear(n), "{n}");
+        }
+    }
+
+    /// `IMAGE_TEST=a.png:b.png PROMPT="…" cargo test live_figure_checks -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn live_figure_checks() {
+        let prompt = std::env::var("PROMPT").unwrap();
+        for p in std::env::var("IMAGE_TEST").unwrap().split(':') {
+            println!("{p}: {:?}", figure_checks(Path::new(p), &prompt));
         }
     }
 

@@ -544,6 +544,20 @@ mod tests {
     }
 
     #[test]
+    fn plainly_described_body_and_pose_details_come_back() {
+        let desc = "She wears a navy top with a visible navel showing midriff exposure; one arm is extended forward \
+                    toward the viewer. Her shoes are not visible.";
+        let out = polish_image_prompt_with("1girl, sailor collar, invisible", desc, &[], "1girl", &[]);
+        for want in ["navel", "midriff", "outstretched arm", "reaching towards viewer"] {
+            assert!(out.split(", ").any(|t| t == want), "{want} missing: {out}");
+        }
+        assert!(!out.contains("invisible"), "{out}");
+        // negated: no navel claimed
+        let out = polish_image_prompt_with("1girl", "Her navel is not visible.", &[], "1girl", &[]);
+        assert!(!out.contains("navel"), "{out}");
+    }
+
+    #[test]
     fn writer_filler_and_unbacked_named_uniforms_go() {
         let v = |s: &str| s.split(", ").map(str::to_string).collect::<Vec<String>>();
         // named uniforms need the description to name them; generic ones always stay

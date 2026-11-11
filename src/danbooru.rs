@@ -407,6 +407,25 @@ pub fn extract_tags_from_prose(prose: &str) -> Vec<&'static str> {
         push("hands on legs");
         push("adjusting clothes");
     }
+    // body and pose details the writer tends to drop (whole words, negated clauses already skipped)
+    if has("navel") || has("belly button") {
+        push("navel");
+    }
+    if has("midriff") || has("bare stomach") || has("exposed stomach") {
+        push("midriff");
+    }
+    // "one arm is extended forward", "arms outstretched": an arm word and an extension word in one clause
+    let reaching = has("reaching")
+        || clauses.iter().any(|c| {
+            (prose_has(c, "arm") || prose_has(c, "arms"))
+                && (prose_has(c, "extended") || prose_has(c, "outstretched") || prose_has(c, "stretched"))
+        });
+    if reaching {
+        push("outstretched arm");
+        if has("toward the viewer") || has("towards the viewer") || has("toward viewer") || has("towards viewer") {
+            push("reaching towards viewer");
+        }
+    }
     if has("bare foot") || has("barefoot") || has("bare feet") || raw_has("no shoes") || has("unshod") {
         push("bare foot");
     }
