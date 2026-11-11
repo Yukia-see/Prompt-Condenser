@@ -1,7 +1,7 @@
 """ComfyUI nodes for Prompt Condenser integration.
 
 Subprocess-based interface to the high-performance Rust Prompt Condenser engine.
-Runs in <10ms for prompt condensation, auto-negatives, framing conflict resolution,
+Fast rule-based prompt condensation, auto-negatives, framing conflict resolution,
 and LuCiD Visual Regional Prompting (VRP).
 """
 
