@@ -98,6 +98,8 @@ pub(crate) fn describe_with_text_model(
         "keep_alive": "30m",
         "options": {
             "temperature": 0.10,
+            // a fixed seed: the same picture gives the same prompt (it differed every run, ±5-10 points)
+            "seed": 42,
             "top_p": 0.90,
             "repeat_penalty": 1.18,
             "num_predict": 900,
@@ -192,6 +194,8 @@ pub(crate) fn describe_image_with(req: &ImageAiRequest, system: &str, ask: &str)
         "keep_alive": "30m",
         "options": {
             "temperature": 0.10,
+            // a fixed seed: the same picture gives the same prompt (it differed every run, ±5-10 points)
+            "seed": 42,
             "top_p": 0.90,
             "repeat_penalty": 1.18,
             "num_predict": 900,

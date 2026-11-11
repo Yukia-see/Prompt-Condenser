@@ -862,6 +862,7 @@ pub fn observe_with_toriigate(path: &std::path::Path, host: &str, mode: AiMode, 
         "keep_alive": "30s",
         "options": {
             "temperature": 0.2,
+            "seed": 42,
             "num_predict": 900,
             "num_ctx": 8192,
             "num_gpu": if mode == AiMode::CpuOnly { Some(0) } else { None::<i32> },
