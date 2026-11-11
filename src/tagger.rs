@@ -227,9 +227,12 @@ pub fn is_concrete_scene_object(norm: &str) -> bool {
 }
 
 /// Adds what a zoomed-in crop (`detector::upper_crop`, `middle_crop`, `lower_crop`) sees better:
-/// confident (>= 0.55) appearance tags (hair, eyes, traits, body, outfit, expression, held props, micro-poses,
+/// confident (>= `DETAIL_CROP_MIN`) appearance tags (hair, eyes, traits, body, outfit, expression, held props, micro-poses,
 /// and concrete scene objects like plants or furniture). Framing, count, size tags and generic backgrounds
 /// from the crop are ignored, since zooming in changes those.
+/// The lowest score a zoomed-in crop's tag needs to be added (see `merge_detail_crop`).
+const DETAIL_CROP_MIN: f32 = 0.75;
+
 pub fn merge_detail_crop(base: &[ScoredTag], detail: &[ScoredTag]) -> Vec<ScoredTag> {
     use crate::prompt_condenser::{self, CropType};
 
@@ -245,8 +248,10 @@ pub fn merge_detail_crop(base: &[ScoredTag], detail: &[ScoredTag]) -> Vec<Scored
         &detail_tuples,
         CropType::CharacterZone,
         &[],
-        0.55,
-        0.40,
+        // Only tags the crop is sure of: at 0.55 / 0.40 it added 129 tags on the 12 test images, 34% of them
+        // correct (thighs, legs, border, invisible…); at 0.75 the tagger-only score is ~1 point higher.
+        DETAIL_CROP_MIN,
+        DETAIL_CROP_MIN,
     );
 
     restore_kinds(base, merged)
@@ -380,12 +385,12 @@ mod tests {
         let base = vec![t("1girl", 0.9), t("full_body", 0.8), t("thick_eyebrows", 0.2), t("glasses", 0.3)];
         let detail = vec![
             t("portrait", 0.9), t("close-up", 0.8), t("upper_body", 0.9), t("solo", 0.9), t("simple_background", 0.7),
-            t("thick_eyebrows", 0.7), t("glasses", 0.5), t("hair_ornament", 0.8),
+            t("thick_eyebrows", 0.8), t("glasses", 0.7), t("hair_ornament", 0.8),
         ];
         let m = merge_detail_crop(&base, &detail);
         let score = |n: &str| m.iter().find(|x| x.name == n).map(|x| x.score);
-        assert_eq!(score("thick_eyebrows"), Some(0.7));
-        assert_eq!(score("glasses"), Some(0.3)); // below 0.55 in the crop: unchanged
+        assert_eq!(score("thick_eyebrows"), Some(0.8));
+        assert_eq!(score("glasses"), Some(0.3)); // below DETAIL_CROP_MIN in the crop: unchanged
         assert_eq!(score("hair_ornament"), Some(0.8));
         for n in ["portrait", "close-up", "upper_body", "simple_background"] {
             assert_eq!(score(n), None, "{n}");
