@@ -2,6 +2,7 @@ mod ai_engine;
 mod analyzer;
 mod condenser;
 mod caption;
+mod prompt_cli;
 mod danbooru;
 mod detector;
 mod dynamic;
@@ -2619,6 +2620,14 @@ fn main() -> Result<(), slint::PlatformError> {
     // batch captioning for training datasets: no window, no Ollama
     if args.len() > 1 && (args[1] == "--caption" || args[1] == "caption") {
         if let Err(e) = caption::run_caption_cli(&args[2..]) {
+            eprintln!("{e:#}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+    // prompt cleaning for scripts / the ComfyUI node: JSON out, no window
+    if args.len() > 1 && args[1] == "--prompt" {
+        if let Err(e) = prompt_cli::run_prompt_cli(&args[2..]) {
             eprintln!("{e:#}");
             std::process::exit(1);
         }
