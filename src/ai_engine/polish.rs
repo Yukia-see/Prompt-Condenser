@@ -461,6 +461,38 @@ pub fn polish_image_prompt_with(
     enforce_strong_tags(&tags, strong)
 }
 
+/// Tagger tags that are never content (meta / booru bookkeeping), for the fast Tagger mode.
+const TAGGER_NOISE: &[&str] = &[
+    "virtual youtuber", "character name", "copyright name", "artist name", "twitter username", "signature",
+    "watermark", "parody", "style parody", "retro artstyle", "alternate costume", "adapted costume", "invisible",
+    "alternate breast size",
+];
+
+/// Tagger mode's prompt (the tagger's tags above the threshold, no vision model or writer) with the same
+/// rules the AI path gets: colorful pictures lose monochrome, noise tags go, one tag per body part, hair and
+/// feet contradictions, bare parents next to a specific tag, the sketch / panel / no-humans rules and the
+/// footwear / inset picture checks. Measured to keep most of the full pipeline's quality in a few seconds.
+#[cfg(test)]
+pub fn clean_tagger_prompt(prompt: &str, path: &std::path::Path) -> String {
+    let styled = clean_tagger_rules(prompt, path);
+    crate::twoimg::figure_checks(path, &styled).unwrap_or(styled)
+}
+
+/// `clean_tagger_prompt` without the picture checks (those run the detector and more tagger passes, so the
+/// app runs them once in the background and reuses the result when the threshold slider moves).
+pub fn clean_tagger_rules(prompt: &str, path: &std::path::Path) -> String {
+    let checked = color_checked_hints(prompt, path);
+    let tags: Vec<String> = checked
+        .split(',')
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty() && !TAGGER_NOISE.contains(&crate::danbooru::key(t).as_str()))
+        .collect();
+    let tags = drop_contradicted_feet(drop_contradicted_hair(one_per_part(tags)));
+    let tags = crate::danbooru::dedup_color_parents(&tags.join(", "));
+    let panels = image::open(path).map(|i| panel_count(&i)).unwrap_or(1);
+    apply_image_style(&tags, &checked, panels)
+}
+
 /// Defaults a small writer adds without looking: kept only when the tagger or the description backs them.
 const UNBACKED_DEFAULTS: &[&str] =
     &["looking at viewer", "full body", "thigh gap", "kemonomimi", "taut clothes", "impossible clothes"];

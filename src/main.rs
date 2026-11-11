@@ -56,6 +56,12 @@ struct AppState {
     prompt_before_image: Option<String>,
     /// Tag scores for the loaded image, so the threshold slider re-filters instantly.
     last_tags: Option<Vec<tagger::ScoredTag>>,
+    /// `last_tags` came from Tagger mode's single pass (not the multi-pass tagging the AI path uses), so the
+    /// AI path tags again instead of reusing them.
+    last_tags_single_pass: bool,
+    /// Tags Tagger mode's picture checks removed (footwear a cut-off picture can't show, inset diagram
+    /// tags); the threshold slider re-applies them without running the checks again.
+    tagger_picture_drops: std::collections::HashSet<String>,
     /// The AI's reading of the loaded image (cached, so switching modes is instant).
     image_ai: Option<ai_engine::ImageAiResult>,
     /// Installed Ollama models that can read images.
@@ -1926,7 +1932,7 @@ fn run_ai_image(ui: &AppWindow, state: &State) {
         return;
     };
     let text_model = default_text_model(ui, state);
-    let cached_tags = state.borrow().last_tags.clone();
+    let cached_tags = state.borrow().last_tags.clone().filter(|_| !state.borrow().last_tags_single_pass);
     let has_vision = state.borrow().vision_models.iter().any(|v| ai_engine::same_model(v, &text_model));
     let second_pass = ui.get_image_second_pass() && has_vision;
     let req = ai_engine::ImageAiRequest {
@@ -2015,6 +2021,7 @@ fn run_ai_image(ui: &AppWindow, state: &State) {
                 with_state(|state| {
                     if tags.is_some() {
                         state.borrow_mut().last_tags = tags;
+                        state.borrow_mut().last_tags_single_pass = false;
                     }
                     if !dual_result.warnings.is_empty() {
                         ui.set_pipeline_warnings(dual_result.warnings.join(" | ").into());
@@ -2089,6 +2096,7 @@ fn run_ai_image(ui: &AppWindow, state: &State) {
             with_state(|state| {
                 if tags.is_some() {
                     state.borrow_mut().last_tags = tags;
+                    state.borrow_mut().last_tags_single_pass = false;
                 }
                 match result {
                     Ok(res) => {
@@ -2150,7 +2158,21 @@ fn run_tagger(ui: &AppWindow, state: &State) {
     let weak = ui.as_weak();
     std::thread::spawn(move || {
         let started = std::time::Instant::now();
-        let result = twoimg::tag_one_fast(&path, &status_sender(&weak));
+        // One tagger pass plus the cleanup rules scored like the full AI pipeline on the test images
+        // (78%, ~5 s instead of ~32 s); the extra crop passes cost ~20 s and added ~1 point.
+        let result = twoimg::tag_one_passes(&path, &status_sender(&weak), false, false).map(|scores| {
+            // picture checks once, here (they run the detector and more tagger passes): on the widest list the
+            // slider can produce, which tags they remove
+            let wide = ai_engine::clean_tagger_rules(&tagger::build_prompt(&scores, 0.15).prompt, &path);
+            let drops: std::collections::HashSet<String> = match twoimg::figure_checks(&path, &wide) {
+                Some(kept) => {
+                    let kept: std::collections::HashSet<String> = kept.split(',').map(danbooru::key).collect();
+                    wide.split(',').map(danbooru::key).filter(|k| !k.is_empty() && !kept.contains(k)).collect()
+                }
+                None => Default::default(),
+            };
+            (scores, drops)
+        });
         let secs = started.elapsed().as_secs_f32();
         let _ = weak.upgrade_in_event_loop(move |ui| {
             ui.set_tagger_busy(false);
@@ -2158,8 +2180,13 @@ fn run_tagger(ui: &AppWindow, state: &State) {
                 return;
             }
             with_state(|state| match result {
-                Ok(scores) => {
-                    state.borrow_mut().last_tags = Some(scores);
+                Ok((scores, drops)) => {
+                    {
+                        let mut st = state.borrow_mut();
+                        st.last_tags = Some(scores);
+                        st.last_tags_single_pass = true;
+                        st.tagger_picture_drops = drops;
+                    }
                     apply_tags(&ui, state, Some(secs));
                 }
                 Err(e) => ui.set_image_status(format!("Tagging failed: {e:#}").into()),
@@ -2171,12 +2198,23 @@ fn run_tagger(ui: &AppWindow, state: &State) {
 /// Turns the stored tag scores into the Before prompt at the current threshold.
 /// `secs` is set right after tagging (first fill, with Undo); `None` = slider re-filter.
 fn apply_tags(ui: &AppWindow, state: &State, secs: Option<f32>) {
-    let built = {
+    let (built, cleaned) = {
         let st = state.borrow();
         let Some(scores) = st.last_tags.as_ref() else { return };
-        tagger::build_prompt(scores, ui.get_tag_threshold())
+        let built = tagger::build_prompt(scores, ui.get_tag_threshold());
+        // the same cleanup rules as the AI path; the picture checks' result is reused, not re-run
+        let cleaned = match st.image_path.as_ref() {
+            Some(path) => ai_engine::clean_tagger_rules(&built.prompt, path)
+                .split(',')
+                .map(str::trim)
+                .filter(|t| !t.is_empty() && !st.tagger_picture_drops.contains(&danbooru::key(t)))
+                .collect::<Vec<_>>()
+                .join(", "),
+            None => built.prompt.clone(),
+        };
+        (built, cleaned)
     };
-    let prompt = identity(ui, &built.prompt);
+    let prompt = identity(ui, &cleaned);
     if secs.is_some() {
         set_prompt_from_image(ui, state, &prompt);
     } else {

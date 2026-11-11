@@ -206,18 +206,30 @@ pub fn figure_checks(path: &Path, prompt: &str) -> Option<String> {
 }
 
 pub fn tag_one_fast(path: &Path, progress: &(dyn Fn(String) + Sync)) -> Result<Vec<ScoredTag>> {
+    tag_one_passes(path, progress, true, true)
+}
+
+/// `tag_one_fast` with the extra passes switchable: the 4 corner crops (`quadrants`) and the body-zone crops
+/// of each character (`zones`). Each pass is one more tagger run (~2-3 s); the full image is always tagged.
+pub fn tag_one_passes(path: &Path, progress: &(dyn Fn(String) + Sync), quadrants: bool, zones: bool) -> Result<Vec<ScoredTag>> {
     if !detector::is_installed() {
         return tag_one(path, progress);
     }
     let image = image::open(path).with_context(|| format!("Couldn't open {}", path.display()))?;
-    let boxes = detector::detect(&image).unwrap_or_default();
     let full = tagger::tag_dynamic(&image)?;
     let mut merged = full;
+    if !zones && !quadrants {
+        return Ok(merged);
+    }
+    let boxes = detector::detect(&image).unwrap_or_default();
     // 1. Scan 4 Overlapping Quadrants (TL, TR, BL, BR) for environmental objects & props (plants, lamps, furniture)
-    for (_, quad) in detector::quadrant_crops(&image) {
+    for (_, quad) in detector::quadrant_crops(&image).into_iter().filter(|_| quadrants) {
         if let Ok(q_tags) = tagger::tag_dynamic(&quad) {
             merged = tagger::merge_quadrant_scene_crop(&merged, &q_tags);
         }
+    }
+    if !zones {
+        return Ok(merged);
     }
 
     if boxes.is_empty() {
