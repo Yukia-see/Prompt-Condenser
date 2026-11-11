@@ -441,6 +441,17 @@ const UNBACKED_DEFAULTS: &[&str] =
     &["looking at viewer", "full body", "thigh gap", "kemonomimi", "taut clothes", "impossible clothes"];
 /// How many of the tagger's tags may come back after the writer (measured offline: ~18-20 is the best F1).
 const MAX_RECOVERED: usize = 18;
+/// With scores known, every tag the tagger is sure of (>= `RECOVERY_MIN`) comes back; this only guards against
+/// a runaway list. On the 12 test images the cap of 18 cut correct sure tags on busy pictures (loose socks,
+/// cardigan, armor, blazer); without it recall rose 8-10 points. `PC_RECOVERY_MAX` overrides it (testing only).
+const MAX_RECOVERED_SURE: usize = 60;
+
+fn recovery_max(scored: bool) -> usize {
+    if !scored {
+        return MAX_RECOVERED;
+    }
+    std::env::var("PC_RECOVERY_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(MAX_RECOVERED_SURE)
+}
 /// The lowest tagger score a recovered tag needs (when scores are known). `PC_RECOVERY_MIN` overrides it
 /// for measuring (testing only).
 const RECOVERY_MIN: f32 = 0.5;
@@ -463,7 +474,7 @@ pub(crate) const BREAST_SIZES: &[&str] =
 
 /// Reconciles the writer's tags with the tagger's (the writer dropped 202 of 314 missed answer tags that the
 /// tagger had right): unbacked defaults go; a breast size the tagger is >= 0.5 sure of replaces the writer's;
-/// then up to `MAX_RECOVERED` of the tagger's tags, in its order, are appended (not ones already there,
+/// then the tagger's sure tags (all of them when scores are known, else up to `MAX_RECOVERED`), in its order, are appended (not ones already there,
 /// quality / count / solo, or `RECOVERY_SKIP`). Conflicts are left to `one_per_part`, which keeps the first.
 pub fn restore_tagger_tags(mut tags: Vec<String>, tagger_tags: &str, form: &str, tagger_scores: &[(String, f32)]) -> Vec<String> {
     let key = crate::danbooru::key;
@@ -491,9 +502,10 @@ pub fn restore_tagger_tags(mut tags: Vec<String>, tagger_tags: &str, form: &str,
     let mut present: std::collections::HashSet<String> = tags.iter().map(|t| key(t)).collect();
     let scores: std::collections::HashMap<String, f32> = tagger_scores.iter().map(|(t, s)| (key(t), *s)).collect();
     let min = recovery_min();
+    let max = recovery_max(!scores.is_empty());
     let mut added = 0;
     for t in &tagger {
-        if added >= MAX_RECOVERED {
+        if added >= max {
             break;
         }
         let k = key(t);

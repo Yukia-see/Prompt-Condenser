@@ -614,6 +614,10 @@ mod tests {
         assert_eq!(out, v("1girl, smile, white shirt, loose socks"));
         let many: Vec<String> = (0..30).map(|i| format!("tag{i}")).collect();
         assert_eq!(restore_tagger_tags(v("1girl"), &many.join(", "), "", &[]).len(), 1 + 18);
+        // with scores, every sure tag comes back (no cap of 18); unsure ones still don't
+        let mut scored: Vec<(String, f32)> = many.iter().map(|t| (t.clone(), 0.9)).collect();
+        scored[29].1 = 0.3;
+        assert_eq!(restore_tagger_tags(v("1girl"), &many.join(", "), "", &scored).len(), 1 + 29);
         // through the whole polish: the writer's size and hair win over recovered rivals
         let out = polish_image_prompt_with(
             "1girl, short hair, long sidelocks, huge breasts, crop top",
