@@ -6,6 +6,9 @@ from a file or stdin. Each image needs an answer file next to it with the same n
 the Danbooru tags a good prompt should contain. Prints recall, precision and F1 per image and the
 average F1. Quality tags and `solo` are ignored on both sides.
 
+An optional `<image>.acceptable.txt` lists tags that are also correct but not required: they count as
+hits for precision, not for recall (answer files list the essentials; a good prompt has more true detail).
+
 Images in an `ai_generated/` folder are skipped (AI-made pictures could flatter the scores); pass --all
 to include them.
 
@@ -53,9 +56,11 @@ def main():
             print(f"(no answer file for {image})", file=sys.stderr)
             continue
         key, got = tags(answer.read_text()), tags(prompt)
+        accept_file = answer.with_name(answer.stem + ".acceptable.txt")
+        acceptable = tags(accept_file.read_text()) if accept_file.exists() else set()
         hit = key & got
         rec = len(hit) / max(1, len(key))
-        prec = len(hit) / max(1, len(got))
+        prec = len(got & (key | acceptable)) / max(1, len(got))
         f1 = 2 * rec * prec / max(1e-9, rec + prec)
         rows.append((Path(image).name, rec, prec, f1, len(got)))
     print(f"{'image':<32} {'recall':>7} {'precision':>9} {'F1':>6} {'#tags':>6}")
