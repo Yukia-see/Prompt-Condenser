@@ -117,7 +117,6 @@ static MODEL: Mutex<Option<Loaded>> = Mutex::new(None);
 /// swapped. The next image read loads them again (~5 s).
 pub fn release() {
     *MODEL.lock().unwrap_or_else(|e| e.into_inner()) = None;
-    *MODEL2.lock().unwrap_or_else(|e| e.into_inner()) = None;
     crate::detector::release();
 }
 
@@ -169,11 +168,7 @@ pub fn tag_image(path: &Path) -> Result<Vec<ScoredTag>> {
 
 /// Scores every Danbooru tag for an image already in memory (e.g. one character's crop).
 pub fn tag_dynamic(img: &image::DynamicImage) -> Result<Vec<ScoredTag>> {
-    let first = tag_many(&[img])?.remove(0);
-    match second_tagger_dir() {
-        Some(dir) => Ok(blend_scores(first, second_tagger_scores(img, &dir)?)),
-        None => Ok(first),
-    }
+    Ok(tag_many(&[img])?.remove(0))
 }
 
 /// Tags several images in one run of the model. (Batching measured ~5x slower than
@@ -206,86 +201,6 @@ fn tag_many(imgs: &[&image::DynamicImage]) -> Result<Vec<Vec<ScoredTag>>> {
             })
             .collect())
     })
-}
-
-/// Experiment (testing only): a second tagger whose scores are averaged in, switched on by `PC_TAGGER2_DIR`
-/// (a folder with `model.onnx` and `selected_tags.csv`). Built for Redstonexs danbooru-tagger-v1 (EVA02-Large,
-/// 24k tags): pad to white, 448, BGR, (x / 255 - 0.5) / 0.5, NCHW, logits. Shared tags get the mean of both
-/// scores, tags only one model knows keep that model's score (Gemini's ensemble benchmark).
-static MODEL2: Mutex<Option<Loaded>> = Mutex::new(None);
-
-fn second_tagger_dir() -> Option<PathBuf> {
-    std::env::var_os("PC_TAGGER2_DIR").map(PathBuf::from).filter(|d| d.join("model.onnx").exists())
-}
-
-/// `tag_id,name,category,…`: name and category by position (the Redstonexs list has extra columns).
-fn load_tags_by_position(path: &Path) -> Result<Vec<(String, TagKind)>> {
-    let text = std::fs::read_to_string(path)?;
-    Ok(text
-        .lines()
-        .skip(1)
-        .filter_map(|line| {
-            let f: Vec<&str> = line.split(',').collect();
-            (f.len() >= 3).then(|| {
-                let kind = match f[2] {
-                    "9" => TagKind::Rating,
-                    "4" => TagKind::Character,
-                    _ => TagKind::General,
-                };
-                (f[1].to_string(), kind)
-            })
-        })
-        .collect())
-}
-
-fn second_tagger_scores(img: &image::DynamicImage, dir: &Path) -> Result<Vec<ScoredTag>> {
-    let mut guard = MODEL2.lock().unwrap_or_else(|e| e.into_inner());
-    if guard.is_none() {
-        let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-        let session = Session::builder(ort_env()?)?
-            .with_optimization_level(GraphOptimizationLevel::Level3)
-            .map_err(|e| anyhow!("{e}"))?
-            .with_intra_threads(threads)
-            .map_err(|e| anyhow!("{e}"))?
-            .commit_from_file(dir.join("model.onnx"))
-            .context("Couldn't load the second tagger")?;
-        *guard = Some(Loaded { session, tags: load_tags_by_position(&dir.join("selected_tags.csv"))? });
-    }
-    let loaded = guard.as_mut().expect("just loaded");
-    // same padding / size as WD, then normalized BGR in NCHW
-    let hwc = preprocess(img)?;
-    let n = (INPUT_SIZE * INPUT_SIZE) as usize;
-    let mut chw = vec![0f32; 3 * n];
-    for i in 0..n {
-        for c in 0..3 {
-            chw[c * n + i] = (hwc[i * 3 + c] / 255.0 - 0.5) / 0.5;
-        }
-    }
-    let tensor = Tensor::from_array(([1usize, 3, INPUT_SIZE as usize, INPUT_SIZE as usize], chw.into_boxed_slice()))?;
-    let outputs = loaded.session.run(ort::inputs![tensor])?;
-    let (_, logits) = outputs[0].try_extract_tensor::<f32>()?;
-    Ok(loaded
-        .tags
-        .iter()
-        .zip(logits.iter())
-        .map(|((name, kind), &l)| ScoredTag { name: name.clone(), kind: *kind, score: 1.0 / (1.0 + (-l).exp()) })
-        .collect())
-}
-
-/// Averages the second tagger's scores into the first's (shared tags: mean; one model only: its score).
-fn blend_scores(first: Vec<ScoredTag>, second: Vec<ScoredTag>) -> Vec<ScoredTag> {
-    let mut other: std::collections::HashMap<String, ScoredTag> = second.into_iter().map(|t| (t.name.clone(), t)).collect();
-    let mut out: Vec<ScoredTag> = first
-        .into_iter()
-        .map(|mut t| {
-            if let Some(o) = other.remove(&t.name) {
-                t.score = 0.5 * (t.score + o.score);
-            }
-            t
-        })
-        .collect();
-    out.extend(other.into_values());
-    out
 }
 
 fn with_model<T>(f: impl FnOnce(&mut Loaded) -> Result<T>) -> Result<T> {

@@ -22,3 +22,10 @@ __pycache__/
 /tests/eval_local/
 /tests/tagger_shootout/
 *.onnx
+# local-only: collaboration reports and unreviewed scripts (2026-11-11)
+/docs/reports/
+/prompt_condenser_dual_pass.py
+/test_prompt_condenser.py
+/tools/bench_combo_taggers.py
+/tools/bench_taggers_shootout.py
+/tools/claude_bridge.py
