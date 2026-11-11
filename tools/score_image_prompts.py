@@ -9,8 +9,8 @@ average F1. Quality tags and `solo` are ignored on both sides.
 An optional `<image>.acceptable.txt` lists tags that are also correct but not required: they count as
 hits for precision, not for recall (answer files list the essentials; a good prompt has more true detail).
 
-Images in an `ai_generated/` folder are skipped (AI-made pictures could flatter the scores); pass --all
-to include them.
+Images in an `ai_generated/` folder (AI-made pictures could flatter the scores) or an `excluded/` folder
+(taken out of the test set) are skipped; pass --all to include them.
 
 Usage: tools/score_image_prompts.py results.txt [label] [--all]
 """
@@ -49,7 +49,7 @@ def main():
     label = args[1] if len(args) > 1 else ""
     rows = []
     for image, prompt in parse(text):
-        if "/ai_generated/" in image and not include_ai:
+        if ("/ai_generated/" in image or "/excluded/" in image) and not include_ai:
             continue
         answer = Path(image).with_suffix(".txt")
         if not answer.exists():
