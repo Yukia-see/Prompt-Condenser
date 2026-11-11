@@ -567,36 +567,56 @@ pub fn combine(texts: &[String], config: &ScanConfig, strip_conflicts: bool, sen
 /// left-to-right strips. The canvas keeps the image's shape at ~1 MP in multiples of 64 (the node needs
 /// multiples of 8; without an image, 1216 x 832 landscape). The shared scene is not a region: it goes
 /// into the node's global prompt.
+#[cfg(test)]
 pub fn vrp_state_json(prompts: &[String], boxes: Option<&[crate::detector::PersonBox]>, image_size: Option<(u32, u32)>) -> String {
+    let regions = vrp_regions(prompts.len(), boxes, image_size);
+    vrp_state_json_from(prompts, &regions, image_size)
+}
+
+/// The regions (x, y, width, height as fractions of the canvas) `vrp_state_json` uses: the detector boxes
+/// (`boxes`, pixels in an image of `image_size`) with a little padding when there is one per character, else
+/// even left-to-right strips. The region editor starts from these.
+pub fn vrp_regions(n: usize, boxes: Option<&[crate::detector::PersonBox]>, image_size: Option<(u32, u32)>) -> Vec<[f64; 4]> {
+    let (w, h) = image_size.filter(|(w, h)| *w > 0 && *h > 0).unwrap_or((1216, 832));
+    (0..n)
+        .map(|i| match boxes.filter(|b| b.len() == n) {
+            Some(b) => {
+                let b = &b[i];
+                let pad = 0.02;
+                let x0 = (b.x0 as f64 / w as f64 - pad).clamp(0.0, 1.0);
+                let y0 = (b.y0 as f64 / h as f64 - pad).clamp(0.0, 1.0);
+                let x1 = (b.x1 as f64 / w as f64 + pad).clamp(0.0, 1.0);
+                let y1 = (b.y1 as f64 / h as f64 + pad).clamp(0.0, 1.0);
+                // never past the canvas edge, even for a sliver of a box at the border
+                [x0.min(0.99), y0.min(0.99), (x1 - x0).max(0.01).min(1.0 - x0.min(0.99)), (y1 - y0).max(0.01).min(1.0 - y0.min(0.99))]
+            }
+            None => {
+                // even strips with a little overlap, so nobody's edge is cut off
+                let strip = 1.0 / n.max(1) as f64;
+                let x0 = (i as f64 * strip - 0.02).max(0.0);
+                let x1 = ((i + 1) as f64 * strip + 0.02).min(1.0);
+                [x0, 0.0, x1 - x0, 1.0]
+            }
+        })
+        .collect()
+}
+
+/// The `vrp_state` JSON for given regions (fractions of the canvas, one per prompt; clamped to the canvas).
+pub fn vrp_state_json_from(prompts: &[String], regions: &[[f64; 4]], image_size: Option<(u32, u32)>) -> String {
     let (w, h) = image_size.filter(|(w, h)| *w > 0 && *h > 0).unwrap_or((1216, 832));
     let scale = (1_048_576.0 / (w as f64 * h as f64)).sqrt();
     let round64 = |v: f64| (((v / 64.0).round() as u32).max(4)) * 64;
     let (cw, ch) = (round64(w as f64 * scale), round64(h as f64 * scale));
-    let n = prompts.len().max(1);
+    let r4 = |v: f64| (v * 10_000.0).round() / 10_000.0;
     let regions: Vec<serde_json::Value> = prompts
         .iter()
+        .zip(regions)
         .enumerate()
-        .map(|(i, prompt)| {
-            let (x, y, bw, bh) = match boxes.filter(|b| b.len() == prompts.len()) {
-                Some(b) => {
-                    let b = &b[i];
-                    let pad = 0.02;
-                    let x0 = (b.x0 as f64 / w as f64 - pad).clamp(0.0, 1.0);
-                    let y0 = (b.y0 as f64 / h as f64 - pad).clamp(0.0, 1.0);
-                    let x1 = (b.x1 as f64 / w as f64 + pad).clamp(0.0, 1.0);
-                    let y1 = (b.y1 as f64 / h as f64 + pad).clamp(0.0, 1.0);
-                    // never past the canvas edge, even for a sliver of a box at the border
-                    (x0.min(0.99), y0.min(0.99), (x1 - x0).max(0.01).min(1.0 - x0.min(0.99)), (y1 - y0).max(0.01).min(1.0 - y0.min(0.99)))
-                }
-                None => {
-                    // even strips with a little overlap, so nobody's edge is cut off
-                    let strip = 1.0 / n as f64;
-                    let x0 = (i as f64 * strip - 0.02).max(0.0);
-                    let x1 = ((i + 1) as f64 * strip + 0.02).min(1.0);
-                    (x0, 0.0, x1 - x0, 1.0)
-                }
-            };
-            let r4 = |v: f64| (v * 10_000.0).round() / 10_000.0;
+        .map(|(i, (prompt, r))| {
+            let x = r[0].clamp(0.0, 0.99);
+            let y = r[1].clamp(0.0, 0.99);
+            let bw = r[2].clamp(0.01, 1.0 - x);
+            let bh = r[3].clamp(0.01, 1.0 - y);
             serde_json::json!({
                 "id": format!("c{}", i + 1),
                 "label": format!("Character {}", i + 1),
@@ -1374,6 +1394,23 @@ masterpiece, 2girls, indoors, gym, polished floor
         );
         assert!(!out.contains("A scene with"), "{out}");
         assert!(out.contains("A lone girl with") || out.contains("A girl with"), "{out}");
+    }
+
+    #[test]
+    fn edited_vrp_regions_are_written_and_clamped() {
+        let prompts = vec!["1girl, red hair".to_string(), "1girl, blue hair".to_string()];
+        // even strips by default, one per prompt
+        let r = vrp_regions(2, None, None);
+        assert_eq!(r.len(), 2);
+        assert!(r[0][0] == 0.0 && r[1][0] > 0.4);
+        // edited boxes go into the JSON as they are; one past the edge is clamped to the canvas
+        let edited = vec![[0.1, 0.2, 0.3, 0.6], [0.8, 0.5, 0.5, 0.7]];
+        let v: serde_json::Value = serde_json::from_str(&vrp_state_json_from(&prompts, &edited, Some((1000, 1000)))).unwrap();
+        assert_eq!(v["regions"][0]["x"], 0.1);
+        assert_eq!(v["regions"][0]["height"], 0.6);
+        let (x, w) = (v["regions"][1]["x"].as_f64().unwrap(), v["regions"][1]["width"].as_f64().unwrap());
+        let (y, h) = (v["regions"][1]["y"].as_f64().unwrap(), v["regions"][1]["height"].as_f64().unwrap());
+        assert!(x + w <= 1.0 + 1e-9 && y + h <= 1.0 + 1e-9, "{}", v["regions"][1]);
     }
 
     #[test]

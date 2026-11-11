@@ -101,6 +101,14 @@ export global M3 {
 
 /// One category line of the Organized Structure box; `kind` picks its color
 /// (the order of parser::TokenCategory).
+/// One LuCiD VRP region in the region editor: position and size as fractions of the canvas.
+export struct VrpRegion {
+    x: float,
+    y: float,
+    w: float,
+    h: float,
+}
+
 export struct StructureRow {
     label: string,
     items: string,
@@ -1339,6 +1347,15 @@ export component AppWindow inherits Window {
     callback char_image_requested(int);                  // 0..3 = character 1..4
     // Danbooru translator dialog
     in-out property <bool> translate_open: false;
+    // Region editor (2-4 Characters tabs): one box per character over the picture, dragged / resized here
+    in-out property <bool> vrp_open: false;
+    in-out property <[VrpRegion]> vrp_regions: [];
+    in-out property <float> vrp_aspect: 1.46;   // canvas width / height
+    in-out property <bool> vrp_has_image: false;
+    callback edit_vrp_requested();
+    callback vrp_region_moved(int, float, float);    // region, dx, dy (fractions of the canvas)
+    callback vrp_region_resized(int, float, float);  // region, dw, dh
+    callback vrp_reset_requested();
     in-out property <bool> translate_busy: false;
     in-out property <string> translate_input: "";
     in-out property <string> translate_tags: "";
@@ -1399,6 +1416,10 @@ export component AppWindow inherits Window {
                 if root.app_tab >= 1 : PillButton {
                     text: "🗺 Copy VRP regions";
                     clicked => { root.copy_vrp_requested(); }
+                }
+                if root.app_tab >= 1 : PillButton {
+                    text: "✎ Edit regions";
+                    clicked => { root.edit_vrp_requested(); }
                 }
                 PillButton {
                     text: "📖 Danbooru Words…";
@@ -2463,6 +2484,110 @@ export component AppWindow inherits Window {
     }
 
     // ==================== DANBOORU TRANSLATOR DIALOG ====================
+    if root.vrp_open : Rectangle {
+        x: 0;
+        y: 0;
+        width: root.width;
+        height: root.height;
+        background: #000000b0;
+        TouchArea { }
+        Rectangle {
+            width: min(parent.width - 32px, 980px);
+            height: min(parent.height - 32px, 760px);
+            border-radius: 16px;
+            background: M3.surface-container;
+            clip: true;
+            VerticalLayout {
+                padding: 18px;
+                spacing: 8px;
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text {
+                        text: "VRP regions";
+                        font-size: 18px;
+                        font-weight: 700;
+                        color: M3.on-surface;
+                        vertical-alignment: center;
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                    PillButton {
+                        text: "↺ Reset";
+                        clicked => { root.vrp_reset_requested(); }
+                    }
+                    PillButton {
+                        text: "🗺 Copy VRP regions";
+                        primary: true;
+                        clicked => { root.copy_vrp_requested(); }
+                    }
+                    PillButton {
+                        text: "✕ Close";
+                        clicked => { root.vrp_open = false; }
+                    }
+                }
+                Text {
+                    text: "Drag a box to move it, drag its corner to resize it. Copy writes these boxes into the Anima VRP (core) node's vrp_state; the Scene box goes into the node's global prompt.";
+                    font-size: 12px;
+                    color: M3.on-surface-variant;
+                    wrap: word-wrap;
+                }
+                // the canvas keeps the picture's shape, as large as fits
+                vrp-area := Rectangle {
+                    vertical-stretch: 1;
+                    vrp-canvas := Rectangle {
+                        width: min(parent.width, parent.height * root.vrp_aspect);
+                        height: self.width / root.vrp_aspect;
+                        background: M3.surface-container-high;
+                        clip: true;
+                        if root.vrp_has_image : Image {
+                            width: parent.width;
+                            height: parent.height;
+                            source: root.image_thumb;
+                            image-fit: fill;
+                            opacity: 0.85;
+                        }
+                        for r[i] in root.vrp_regions : Rectangle {
+                            x: r.x * vrp-canvas.width;
+                            y: r.y * vrp-canvas.height;
+                            width: r.w * vrp-canvas.width;
+                            height: r.h * vrp-canvas.height;
+                            border-width: 2px;
+                            border-color: i == 0 ? #eb1e1e : i == 1 ? #1e6ef5 : i == 2 ? #28be3c : #f5c814;
+                            background: i == 0 ? #eb1e1e30 : i == 1 ? #1e6ef530 : i == 2 ? #28be3c30 : #f5c81430;
+                            move-ta := TouchArea {
+                                mouse-cursor: move;
+                                moved => {
+                                    root.vrp_region_moved(i, (self.mouse-x - self.pressed-x) / vrp-canvas.width, (self.mouse-y - self.pressed-y) / vrp-canvas.height);
+                                }
+                            }
+                            Text {
+                                x: 6px;
+                                y: 4px;
+                                text: "Character " + (i + 1);
+                                font-size: 13px;
+                                font-weight: 700;
+                                color: white;
+                            }
+                            // resize handle, bottom-right corner
+                            Rectangle {
+                                x: parent.width - 16px;
+                                y: parent.height - 16px;
+                                width: 16px;
+                                height: 16px;
+                                background: i == 0 ? #eb1e1e : i == 1 ? #1e6ef5 : i == 2 ? #28be3c : #f5c814;
+                                TouchArea {
+                                    mouse-cursor: nwse-resize;
+                                    moved => {
+                                        root.vrp_region_resized(i, (self.mouse-x - self.pressed-x) / vrp-canvas.width, (self.mouse-y - self.pressed-y) / vrp-canvas.height);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     if root.translate_open : Rectangle {
         x: 0;
         y: 0;

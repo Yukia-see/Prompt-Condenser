@@ -49,6 +49,8 @@ struct AppState {
     /// One model for the card list, updated row by row so unchanged cards
     /// aren't rebuilt on every keystroke.
     cards_model: Rc<VecModel<ChangeCardItem>>,
+    /// The region editor's boxes, updated row by row (replacing the model would rebuild the box being dragged).
+    vrp_model: Rc<VecModel<VrpRegion>>,
     /// Entries behind the AI model dropdown, same order as `model_labels`.
     model_choices: Vec<ModelChoice>,
     /// The image last loaded with "From Image…".
@@ -91,6 +93,9 @@ struct AppState {
     char_paths: [Option<std::path::PathBuf>; 4],
     /// Thumbnails of the character reference images (Scene panel and its bar).
     char_thumbs: [Option<slint::Image>; 4],
+    /// Region boxes edited in the region editor (fractions of the canvas, one per character); `None` = use the
+    /// detector boxes / even strips. Cleared when a new picture is split.
+    vrp_regions: Option<Vec<[f64; 4]>>,
     /// Kept alive for the whole session: on Linux the copied text disappears
     /// when the `Clipboard` that owns it is dropped.
     clipboard: Option<arboard::Clipboard>,
@@ -1082,6 +1087,7 @@ fn run_two_image(ui: &AppWindow, state: &State) {
             with_state(|state| match result {
                 Ok((tags, ai_split)) => {
                     state.borrow_mut().two_tags = Some(tags.clone());
+                    state.borrow_mut().vrp_regions = None;
                     let (split, how) = match ai_split {
                         Some(Ok(split)) => {
                             state.borrow_mut().two_ai = Some(split.clone());
@@ -1623,6 +1629,41 @@ fn apply_scene_ref(ui: &AppWindow, state: &State) {
         sr.boxes = new_snaps;
     }
     analyze(ui, state);
+}
+
+/// The VRP regions for `n` characters and the canvas's source size: the edited boxes when there's one per
+/// character, else the detector boxes of the last Split Image, else even strips.
+fn vrp_current(st: &AppState, n: usize) -> (Vec<[f64; 4]>, Option<(u32, u32)>) {
+    let split = st.two_tags.as_ref();
+    let size = split
+        .map(|s| (s.image.width(), s.image.height()))
+        .or_else(|| st.image_path.as_ref().and_then(|p| image::image_dimensions(p).ok()));
+    if let Some(edited) = st.vrp_regions.as_ref().filter(|v| v.len() == n) {
+        return (edited.clone(), size);
+    }
+    let boxes = split.and_then(|s| s.boxes.as_deref());
+    (two::vrp_regions(n, boxes, size), size)
+}
+
+/// Shows the edited regions in the region editor.
+fn push_vrp_regions(st: &AppState) {
+    let rows: Vec<VrpRegion> = st
+        .vrp_regions
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(|r| VrpRegion { x: r[0] as f32, y: r[1] as f32, w: r[2] as f32, h: r[3] as f32 })
+        .collect();
+    let model = &st.vrp_model;
+    if model.row_count() == rows.len() {
+        for (i, r) in rows.into_iter().enumerate() {
+            if model.row_data(i).as_ref() != Some(&r) {
+                model.set_row_data(i, r);
+            }
+        }
+    } else {
+        model.set_vec(rows);
+    }
 }
 
 /// Restores boxes from a snapshot: exact match restores original, modified only strips added tags.
@@ -2627,6 +2668,7 @@ fn main() -> Result<(), slint::PlatformError> {
     state.borrow_mut().preferred_model = saved_ai_model();
 
     ui.set_change_cards(ModelRc::from(state.borrow().cards_model.clone()));
+    ui.set_vrp_regions(ModelRc::from(state.borrow().vrp_model.clone()));
 
     // --- Rule analysis ---
     // Debounced: typing or dragging the slider fires this on every change, so the
@@ -2703,6 +2745,59 @@ fn main() -> Result<(), slint::PlatformError> {
         });
     }
 
+    // --- Region editor (2-4 Characters tabs): move / resize each character's VRP box ---
+    {
+        let weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_edit_vrp_requested(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            let n = tab_chars(&ui);
+            let (regions, size) = vrp_current(&state.borrow(), n);
+            state.borrow_mut().vrp_regions = Some(regions);
+            let (w, h) = size.unwrap_or((1216, 832));
+            ui.set_vrp_aspect(w as f32 / h.max(1) as f32);
+            ui.set_vrp_has_image(ui.get_image_loaded());
+            push_vrp_regions(&state.borrow());
+            ui.set_vrp_open(true);
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_vrp_region_moved(move |i, dx, dy| {
+            if weak.upgrade().is_none() { return; }
+            if let Some(r) = state.borrow_mut().vrp_regions.as_mut().and_then(|v| v.get_mut(i as usize)) {
+                r[0] = (r[0] + dx as f64).clamp(0.0, 1.0 - r[2]);
+                r[1] = (r[1] + dy as f64).clamp(0.0, 1.0 - r[3]);
+            }
+            push_vrp_regions(&state.borrow());
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_vrp_region_resized(move |i, dw, dh| {
+            if weak.upgrade().is_none() { return; }
+            if let Some(r) = state.borrow_mut().vrp_regions.as_mut().and_then(|v| v.get_mut(i as usize)) {
+                r[2] = (r[2] + dw as f64).clamp(0.04, 1.0 - r[0]);
+                r[3] = (r[3] + dh as f64).clamp(0.04, 1.0 - r[1]);
+            }
+            push_vrp_regions(&state.borrow());
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_vrp_reset_requested(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            let n = tab_chars(&ui);
+            state.borrow_mut().vrp_regions = None;
+            let (regions, _) = vrp_current(&state.borrow(), n);
+            state.borrow_mut().vrp_regions = Some(regions);
+            push_vrp_regions(&state.borrow());
+        });
+    }
+
     // --- LuCiD VRP regions to the clipboard (2-4 Characters tabs) ---
     {
         let weak = ui.as_weak();
@@ -2721,10 +2816,8 @@ fn main() -> Result<(), slint::PlatformError> {
                 .collect();
             let json = {
                 let st = state.borrow();
-                let split = st.two_tags.as_ref();
-                let boxes = split.and_then(|s| s.boxes.as_deref());
-                let size = split.map(|s| (s.image.width(), s.image.height()));
-                two::vrp_state_json(&prompts, boxes, size)
+                let (regions, size) = vrp_current(&st, n);
+                two::vrp_state_json_from(&prompts, &regions, size)
             };
             let mut st = state.borrow_mut();
             if st.clipboard.is_none() {
