@@ -1,6 +1,7 @@
 mod ai_engine;
 mod analyzer;
 mod condenser;
+mod caption;
 mod danbooru;
 mod detector;
 mod dynamic;
@@ -2574,6 +2575,14 @@ impl Zoom {
 
 fn main() -> Result<(), slint::PlatformError> {
     let args: Vec<String> = std::env::args().collect();
+    // batch captioning for training datasets: no window, no Ollama
+    if args.len() > 1 && (args[1] == "--caption" || args[1] == "caption") {
+        if let Err(e) = caption::run_caption_cli(&args[2..]) {
+            eprintln!("{e:#}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     if args.len() > 1 && (args[1] == "eval" || args[1] == "--eval") {
         if let Err(e) = eval::run_eval_cli(&args[2..]) {
             eprintln!("Evaluation error: {e}");

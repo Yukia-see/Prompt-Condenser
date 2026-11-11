@@ -472,7 +472,6 @@ const TAGGER_NOISE: &[&str] = &[
 /// rules the AI path gets: colorful pictures lose monochrome, noise tags go, one tag per body part, hair and
 /// feet contradictions, bare parents next to a specific tag, the sketch / panel / no-humans rules and the
 /// footwear / inset picture checks. Measured to keep most of the full pipeline's quality in a few seconds.
-#[cfg(test)]
 pub fn clean_tagger_prompt(prompt: &str, path: &std::path::Path) -> String {
     let styled = clean_tagger_rules(prompt, path);
     crate::twoimg::figure_checks(path, &styled).unwrap_or(styled)
