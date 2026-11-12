@@ -1252,10 +1252,69 @@ pub fn describe(tokens: &[PromptToken]) -> SceneDescription {
     SceneDescription { headline, details, missing }
 }
 
+/// The 🎨 Palette drawer: lighting / atmosphere / style tags added on an explicit click (like "+ Quality",
+/// so not covered by the "never add tags" rule). Real Danbooru tags only (checked against the tagger's
+/// `selected_tags.csv`), parentheses escaped the way the parser expects.
+pub const PALETTE: &[(&str, &[&str])] = &[
+    ("Lighting", &["backlighting", "sunlight", "moonlight", "dappled sunlight", "light rays", "sunbeam", "sunset", "twilight", "neon lights", "glowing"]),
+    ("Atmosphere", &["light particles", "sparkle", "bokeh", "lens flare", "fog", "depth of field", "blurry background", "chromatic aberration", "film grain"]),
+    ("Style", &["retro artstyle", "1990s \\(style\\)", "flat color", "anime coloring", "pastel colors", "watercolor \\(medium\\)", "faux traditional media"]),
+];
+
+/// A tag compared loosely: lowercase, underscores as spaces, no escapes, single spaces.
+fn loose_tag(t: &str) -> String {
+    t.to_lowercase().replace('_', " ").replace('\\', "").split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// `text` with `tag` appended after a comma, or `None` when the text already has it (case, underscores,
+/// escapes and weights ignored: `(Film_Grain:1.2)` counts).
+pub fn append_palette_tag(text: &str, tag: &str) -> Option<String> {
+    let want = loose_tag(tag);
+    if crate::parser::parse_prompt(text).iter().any(|t| loose_tag(&t.text) == want) {
+        return None;
+    }
+    let body = text.trim_end();
+    Some(if body.is_empty() {
+        tag.to_string()
+    } else if body.ends_with(',') {
+        format!("{body} {tag}")
+    } else {
+        format!("{body}, {tag}")
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::parser::parse_prompt;
+
+    #[test]
+    fn palette_tags_append_once() {
+        assert_eq!(append_palette_tag("1girl, beach", "film grain").as_deref(), Some("1girl, beach, film grain"));
+        assert_eq!(append_palette_tag("1girl, beach,\n", "bokeh").as_deref(), Some("1girl, beach, bokeh"));
+        assert_eq!(append_palette_tag("", "fog").as_deref(), Some("fog"));
+        assert_eq!(append_palette_tag("1girl, (Film_Grain:1.2)", "film grain"), None);
+        assert_eq!(append_palette_tag("1990s (style), 1girl", "1990s \\(style\\)"), None);
+        assert_eq!(append_palette_tag("1girl, watercolor \\(medium\\)", "watercolor \\(medium\\)"), None);
+        // a longer tag holding the words is not the same tag
+        assert!(append_palette_tag("1girl, red glowing eyes", "glowing").is_some());
+    }
+
+    #[test]
+    fn palette_tags_are_real_danbooru_tags() {
+        let Some(home) = std::env::var_os("HOME") else { return };
+        let csv = std::path::PathBuf::from(home).join(".local/share/prompt-condenser/wd-eva02-large-tagger-v3/selected_tags.csv");
+        let Ok(csv) = std::fs::read_to_string(csv) else {
+            eprintln!("selected_tags.csv not installed: skipped");
+            return;
+        };
+        let known: std::collections::HashSet<String> = csv.lines().filter_map(|l| l.split(',').nth(1)).map(|t| t.replace('_', " ")).collect();
+        for (group, tags) in PALETTE {
+            for t in *tags {
+                assert!(known.contains(&t.replace('\\', "")), "{group}: {t} is not a Danbooru tag");
+            }
+        }
+    }
 
     #[test]
     fn scene_words_are_not_mistaken_for_looks_or_poses() {
@@ -1422,7 +1481,7 @@ mod tests {
         let read = |p: &str| {
             let path = std::path::Path::new(p);
             let scores = crate::twoimg::tag_one_passes(path, &|_| (), false, false).unwrap();
-            crate::ai_engine::clean_tagger_prompt(&crate::tagger::build_prompt(&scores, 0.30).prompt, path)
+            crate::ai_engine::clean_tagger_prompt(&crate::twoimg::build_fast_prompt(&scores, 0.0).prompt, path)
         };
         let (c, r) = (read(&std::env::var("CHAR_IMG").unwrap()), read(&std::env::var("REF_IMG").unwrap()));
         println!("CHARACTER : {c}\nREFERENCE : {r}");

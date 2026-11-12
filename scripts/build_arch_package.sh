@@ -29,6 +29,7 @@ tar -C "$ROOT" \
   --exclude=./docs/reports --exclude=./.agents --exclude=__pycache__ --exclude='*.zip' \
   --exclude='./*.jpg' --exclude='./packaging/arch/*.jpg' --exclude='./packaging/arch/PROGRAM RESULT' \
   --exclude='./Untitled Document' --exclude=./prompt_condenser.rs \
+  --exclude=./tests/tagger_shootout \
   --transform "s,^\.,$NAME-$VER," \
   -czf "$PKGDIR/$NAME-$VER.tar.gz" .
 

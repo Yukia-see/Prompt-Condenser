@@ -600,3 +600,229 @@ pub fn run_eval_cli(args: &[String]) -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod category_tests {
+    use crate::scene::Slot;
+    use std::collections::{BTreeMap, HashSet};
+    use std::path::{Path, PathBuf};
+
+    /// Ignored on both sides, as in tools/score_image_prompts.py.
+    const IGNORED: &[&str] = &[
+        "masterpiece", "best quality", "high quality", "amazing quality", "very aesthetic", "absurdres", "highres",
+        "solo", "score 9", "score 8 up", "score 7 up",
+    ];
+
+    /// The scorer's `norm`: lowercase, spaces for underscores, `(tag:1.2)` → tag, `\(` → `(`.
+    fn norm(tag: &str) -> String {
+        let mut t = tag.trim().to_lowercase().replace('_', " ");
+        if t.starts_with('(') && t.ends_with(')') && !t.ends_with("\\)") {
+            let inner = &t[1..t.len() - 1];
+            let inner = match inner.rsplit_once(':') {
+                Some((a, w)) if w.parse::<f32>().is_ok() => a,
+                _ => inner,
+            };
+            t = inner.to_string();
+        }
+        t.replace("\\(", "(").replace("\\)", ")").trim().to_string()
+    }
+
+    fn tags(text: &str) -> HashSet<String> {
+        text.split([',', '\n']).map(norm).filter(|t| !t.is_empty() && !IGNORED.contains(&t.as_str())).collect()
+    }
+
+    fn category(tag: &str) -> &'static str {
+        let Some(t) = crate::parser::parse_prompt(tag).into_iter().next() else { return "other" };
+        match crate::scene::slot(&t) {
+            Slot::Setting | Slot::Light => "setting/bg",
+            Slot::Hair => "hair",
+            Slot::Eyes => "eyes",
+            Slot::Outfit => "outfit",
+            _ => "other",
+        }
+    }
+
+    /// Fast Tagger mode (one pass + `clean_tagger_rules`) scored per tag category at several thresholds,
+    /// on the top-level images of tests/eval_local that have answer files (never ai_generated/ or excluded/):
+    /// `cargo test live_fast_categories -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn live_fast_categories() {
+        let dir = std::env::var("EVAL_DIR").unwrap_or_else(|_| "tests/eval_local".into());
+        let mut images: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_file())
+            .filter(|p| p.extension().is_some_and(|e| matches!(e.to_string_lossy().to_lowercase().as_str(), "png" | "jpg" | "jpeg" | "webp")))
+            .filter(|p| p.with_extension("txt").exists())
+            .collect();
+        images.sort();
+        let thresholds = [0.25f32, 0.30, 0.35, 0.42];
+        let cats = ["setting/bg", "hair", "eyes", "outfit", "other"];
+        // per threshold: category -> (output, right, missed); and per-image (P, R, F1)
+        let mut table: Vec<BTreeMap<&str, (usize, usize, usize)>> = vec![BTreeMap::new(); thresholds.len()];
+        let mut per_image: Vec<Vec<(f64, f64, f64)>> = vec![Vec::new(); thresholds.len()];
+        let mut missed_list: Vec<BTreeMap<&str, Vec<String>>> = vec![BTreeMap::new(); thresholds.len()];
+        for path in &images {
+            let scored = crate::twoimg::tag_one_passes(path, &|_| (), false, false).unwrap_or_default();
+            let key = tags(&std::fs::read_to_string(path.with_extension("txt")).unwrap());
+            let accept_file = path.with_file_name(format!("{}.acceptable.txt", path.file_stem().unwrap().to_string_lossy()));
+            let acceptable = std::fs::read_to_string(&accept_file).map(|t| tags(&t)).unwrap_or_default();
+            for (ti, &th) in thresholds.iter().enumerate() {
+                let raw = crate::tagger::build_prompt(&scored, th).prompt;
+                let got = tags(&crate::ai_engine::clean_tagger_rules(&raw, Path::new(path)));
+                let implied: HashSet<String> = key
+                    .iter()
+                    .filter(|k| !got.contains(*k) && !k.contains(' ') && got.iter().any(|g| g.ends_with(&format!(" {k}"))))
+                    .cloned()
+                    .collect();
+                let hit: HashSet<&String> = key.iter().filter(|k| got.contains(*k) || implied.contains(*k)).collect();
+                let right: HashSet<&String> = got.iter().filter(|g| key.contains(*g) || acceptable.contains(*g)).collect();
+                for g in &got {
+                    let e = table[ti].entry(category(g)).or_default();
+                    e.0 += 1;
+                    if right.contains(g) {
+                        e.1 += 1;
+                    }
+                }
+                for k in key.iter().filter(|k| !hit.contains(k)) {
+                    table[ti].entry(category(k)).or_default().2 += 1;
+                    missed_list[ti].entry(category(k)).or_default().push(k.clone());
+                }
+                let rec = hit.len() as f64 / key.len().max(1) as f64;
+                let prec = right.len() as f64 / got.len().max(1) as f64;
+                let f1 = 2.0 * rec * prec / (rec + prec).max(1e-9);
+                per_image[ti].push((prec, rec, f1));
+                println!("{:<28} th {th:.2}: P {:3.0}% R {:3.0}% F1 {:3.0}% ({} tags)", path.file_name().unwrap().to_string_lossy(), prec * 100.0, rec * 100.0, f1 * 100.0, got.len());
+            }
+        }
+        println!("\n{} images: {}", images.len(), images.iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect::<Vec<_>>().join(", "));
+        for (ti, th) in thresholds.iter().enumerate() {
+            let n = per_image[ti].len().max(1) as f64;
+            let avg = |f: fn(&(f64, f64, f64)) -> f64| per_image[ti].iter().map(f).sum::<f64>() / n * 100.0;
+            println!("\nthreshold {th:.2}: avg P {:.1}%  R {:.1}%  F1 {:.1}%", avg(|x| x.0), avg(|x| x.1), avg(|x| x.2));
+            println!("  {:<11} {:>6} {:>6} {:>6} {:>7}", "category", "output", "right", "prec", "missed");
+            for c in cats {
+                let (o, r, m) = table[ti].get(c).copied().unwrap_or_default();
+                println!("  {c:<11} {o:>6} {r:>6} {:>5.0}% {m:>7}", r as f64 * 100.0 / o.max(1) as f64);
+            }
+            for c in cats {
+                if let Some(m) = missed_list[ti].get(c) {
+                    println!("  missed {c}: {}", m.join(", "));
+                }
+            }
+        }
+    }
+
+    /// Per-category thresholds (`category` of each general tag) instead of one, on the same images and
+    /// scoring as `live_fast_categories`: prints the top combinations of a small grid, the plain 0.30
+    /// baseline and the best combination's per-image change.
+    /// `cargo test live_fast_category_thresholds -- --ignored --nocapture`
+    /// (`EVAL_DIR=tests/eval_local/fresh CATEGORY_COMBOS="0.3,0.3,0.3,0.3,0.3;…"` scores given combinations per image)
+    #[test]
+    #[ignore]
+    fn live_fast_category_thresholds() {
+        use crate::tagger::{ScoredTag, TagKind};
+        let dir = std::env::var("EVAL_DIR").unwrap_or_else(|_| "tests/eval_local".into());
+        let mut images: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_file())
+            .filter(|p| p.extension().is_some_and(|e| matches!(e.to_string_lossy().to_lowercase().as_str(), "png" | "jpg" | "jpeg" | "webp")))
+            .filter(|p| p.with_extension("txt").exists())
+            .collect();
+        images.sort();
+        struct Img {
+            path: PathBuf,
+            scored: Vec<ScoredTag>,
+            cats: Vec<&'static str>,
+            key: HashSet<String>,
+            acceptable: HashSet<String>,
+        }
+        let data: Vec<Img> = images
+            .iter()
+            .map(|path| {
+                let scored = crate::twoimg::tag_one_passes(path, &|_| (), false, false).unwrap_or_default();
+                let cats = scored.iter().map(|t| category(&t.name.replace('_', " "))).collect();
+                let accept_file = path.with_file_name(format!("{}.acceptable.txt", path.file_stem().unwrap().to_string_lossy()));
+                Img {
+                    path: path.clone(),
+                    scored,
+                    cats,
+                    key: tags(&std::fs::read_to_string(path.with_extension("txt")).unwrap()),
+                    acceptable: std::fs::read_to_string(&accept_file).map(|t| tags(&t)).unwrap_or_default(),
+                }
+            })
+            .collect();
+        // [setting/bg, hair, eyes, outfit, other]
+        let score = |img: &Img, th: [f32; 5]| -> (f64, f64, f64) {
+            let idx = |c: &str| ["setting/bg", "hair", "eyes", "outfit", "other"].iter().position(|x| *x == c).unwrap();
+            let kept: Vec<ScoredTag> = img
+                .scored
+                .iter()
+                .zip(&img.cats)
+                .filter(|(t, c)| t.kind != TagKind::General || t.score >= th[idx(c)])
+                .map(|(t, _)| t.clone())
+                .collect();
+            let min = th.iter().cloned().fold(1.0f32, f32::min);
+            let raw = crate::tagger::build_prompt(&kept, min).prompt;
+            let got = tags(&crate::ai_engine::clean_tagger_rules(&raw, &img.path));
+            let key = &img.key;
+            let implied = |k: &String| !k.contains(' ') && got.iter().any(|g| g.ends_with(&format!(" {k}")));
+            let hit = key.iter().filter(|k| got.contains(*k) || implied(k)).count();
+            let right = got.iter().filter(|g| key.contains(*g) || img.acceptable.contains(*g)).count();
+            let rec = hit as f64 / key.len().max(1) as f64;
+            let prec = right as f64 / got.len().max(1) as f64;
+            (prec, rec, 2.0 * rec * prec / (rec + prec).max(1e-9))
+        };
+        let run = |th: [f32; 5]| -> Vec<(f64, f64, f64)> { data.iter().map(|img| score(img, th)).collect() };
+        let avg = |v: &[(f64, f64, f64)]| {
+            let n = v.len().max(1) as f64;
+            (v.iter().map(|x| x.0).sum::<f64>() / n * 100.0, v.iter().map(|x| x.1).sum::<f64>() / n * 100.0, v.iter().map(|x| x.2).sum::<f64>() / n * 100.0)
+        };
+        // CATEGORY_COMBOS="bg,hair,eyes,outfit,other;…": just these, per image (for held-out images)
+        if let Ok(list) = std::env::var("CATEGORY_COMBOS") {
+            for combo in list.split(';') {
+                let v: Vec<f32> = combo.split(',').map(|x| x.trim().parse().unwrap()).collect();
+                let th = [v[0], v[1], v[2], v[3], v[4]];
+                let per = run(th);
+                let (p, r, f) = avg(&per);
+                println!("\n{th:?}: avg P {p:.1}%  R {r:.1}%  F1 {f:.1}%");
+                for (img, (p, r, f)) in data.iter().zip(&per) {
+                    println!("  {:<28} P {:5.1}%  R {:5.1}%  F1 {:5.1}%", img.path.file_name().unwrap().to_string_lossy(), p * 100.0, r * 100.0, f * 100.0);
+                }
+            }
+            return;
+        }
+        let base = run([0.30; 5]);
+        let (bp, br, bf) = avg(&base);
+        let mut results: Vec<([f32; 5], (f64, f64, f64), Vec<(f64, f64, f64)>)> = Vec::new();
+        for bg in [0.30f32, 0.35, 0.42] {
+            for eyes in [0.30f32, 0.35, 0.42] {
+                for hair in [0.30f32, 0.35] {
+                    for outfit in [0.25f32, 0.30] {
+                        for other in [0.25f32, 0.30] {
+                            let th = [bg, hair, eyes, outfit, other];
+                            let per = run(th);
+                            results.push((th, avg(&per), per));
+                        }
+                    }
+                }
+            }
+        }
+        results.sort_by(|a, b| b.1 .2.partial_cmp(&a.1 .2).unwrap());
+        println!("\n{} images, {} combinations", data.len(), results.len());
+        println!("baseline 0.30 everywhere: P {bp:.1}%  R {br:.1}%  F1 {bf:.1}%");
+        println!("top 5 (setting/bg, hair, eyes, outfit, other):");
+        for (th, (p, r, f), _) in results.iter().take(5) {
+            println!("  bg {:.2} hair {:.2} eyes {:.2} outfit {:.2} other {:.2}: P {p:.1}%  R {r:.1}%  F1 {f:.1}% ({:+.1})", th[0], th[1], th[2], th[3], th[4], f - bf);
+        }
+        let (th, _, per) = &results[0];
+        println!("best {th:?} per image, F1 vs 0.30:");
+        for ((img, b), n) in data.iter().zip(&base).zip(per) {
+            println!("  {:<28} {:5.1}% -> {:5.1}% ({:+.1})", img.path.file_name().unwrap().to_string_lossy(), b.2 * 100.0, n.2 * 100.0, (n.2 - b.2) * 100.0);
+        }
+    }
+}

@@ -135,6 +135,7 @@ pub fn run_ai_scan(req: &AiScanRequest) -> Result<(AiJsonOutput, String)> {
     }
     best.recommended_negative = clean_negative(&best.recommended_negative);
     enforce_checkpoint_rules(&mut best, req.config.checkpoint);
+    enforce_body_choices(&mut best, &req.config);
     let mut placement = model_placement(&req.host, &req.model).unwrap_or_else(|| "unknown device".to_string());
     let missing = scan_problems(&best, req);
     if rescans > 0 {

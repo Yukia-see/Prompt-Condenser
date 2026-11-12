@@ -7,7 +7,9 @@ use crate::{ai_engine, detector, tagger, twoimg};
 use anyhow::{anyhow, Result};
 use std::path::{Path, PathBuf};
 
-/// Measured best for the fast mode on the 11 test images (0.30: 79.2%, 0.35: 78.5%, 0.25: 77.8%).
+/// Measured best single threshold for the fast mode on the 11 test images (0.30: 79.2%, 0.35: 78.5%,
+/// 0.25: 77.8%). At this value the per-kind thresholds (`twoimg::build_fast_prompt`) apply as measured;
+/// another `--threshold` moves them all by the difference.
 const DEFAULT_THRESHOLD: f32 = 0.30;
 const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "bmp"];
 
@@ -52,7 +54,7 @@ fn is_image(p: &Path) -> bool {
         .is_some_and(|e| IMAGE_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
 }
 
-fn collect_images(dir: &Path, recursive: bool, out: &mut Vec<PathBuf>) -> Result<()> {
+pub(crate) fn collect_images(dir: &Path, recursive: bool, out: &mut Vec<PathBuf>) -> Result<()> {
     let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)?.filter_map(|e| e.ok().map(|e| e.path())).collect();
     entries.sort();
     for p in entries {
@@ -102,6 +104,15 @@ fn ensure_models() -> Result<()> {
     result
 }
 
+/// The training caption for one image: one tagger pass, the per-kind thresholds (`threshold` is the
+/// `--threshold` value, default 0.30), the cleanup rules and picture checks, unescaped. Shared by `--caption`
+/// and `dataset::batch_tag_images_in_folder`.
+pub(crate) fn caption_for(path: &Path, threshold: f32) -> Result<String> {
+    let scores = twoimg::tag_one_passes(path, &|_| (), false, false)?;
+    let raw = twoimg::build_fast_prompt(&scores, threshold - DEFAULT_THRESHOLD).prompt;
+    Ok(as_caption(&ai_engine::clean_tagger_prompt(&raw, path)))
+}
+
 pub fn run_caption_cli(args: &[String]) -> Result<()> {
     let opts = parse_args(args)?;
     if !opts.folder.is_dir() {
@@ -124,10 +135,7 @@ pub fn run_caption_cli(args: &[String]) -> Result<()> {
             continue;
         }
         let t = std::time::Instant::now();
-        let caption = twoimg::tag_one_passes(path, &|_| (), false, false).map(|scores| {
-            let raw = tagger::build_prompt(&scores, opts.threshold).prompt;
-            as_caption(&ai_engine::clean_tagger_prompt(&raw, path))
-        });
+        let caption = caption_for(path, opts.threshold);
         match caption.and_then(|c| std::fs::write(&txt, format!("{c}\n")).map(|_| c).map_err(Into::into)) {
             Ok(c) => {
                 written += 1;

@@ -45,6 +45,12 @@ impl CheckpointProfile {
         }
     }
 
+    /// Whether the checkpoint reads the prompt with CLIP in 75-token chunks (not Anima's LLM
+    /// text encoder or Flux's T5).
+    pub fn uses_clip_chunks(&self) -> bool {
+        !matches!(self, Self::Anima | Self::Flux)
+    }
+
     pub fn supports_natural_language(&self) -> bool {
         matches!(self, Self::Anima | Self::Sdxl | Self::Flux)
     }
@@ -518,6 +524,42 @@ impl DetailLevel {
             0 => Self::Faithful,
             2 => Self::Rich,
             _ => Self::Balanced,
+        }
+    }
+}
+
+/// User-saved preset profile configuration for 1-click preset recall.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct UserPresetProfile {
+    pub name: String,
+    pub checkpoint: CheckpointProfile,
+    pub target_view: TargetView,
+    pub camera_angle: usize,
+    pub pose: usize,
+    pub bust: usize,
+    pub frame: usize,
+    pub exaggerated_proportions: bool,
+    pub dynamic: bool,
+    pub fit_suggestions: bool,
+    pub lora_tags: String,
+    pub custom_negative: String,
+}
+
+impl Default for UserPresetProfile {
+    fn default() -> Self {
+        Self {
+            name: "Default Preset".to_string(),
+            checkpoint: CheckpointProfile::Anima,
+            target_view: TargetView::None,
+            camera_angle: 0,
+            pose: 0,
+            bust: 0,
+            frame: 0,
+            exaggerated_proportions: false,
+            dynamic: false,
+            fit_suggestions: true,
+            lora_tags: String::new(),
+            custom_negative: String::new(),
         }
     }
 }

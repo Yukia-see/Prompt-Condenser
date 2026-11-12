@@ -102,6 +102,25 @@ export global M3 {
 /// One category line of the Organized Structure box; `kind` picks its color
 /// (the order of parser::TokenCategory).
 /// One LuCiD VRP region in the region editor: position and size as fractions of the canvas.
+export struct HistoryRow {
+    label: string,
+    when: string,
+    starred: bool,
+    chars: int,
+}
+
+/// One `<lora:…>` of a LoRA box with its first weight, for the − / + chips under the box.
+export struct LoraWeight {
+    name: string,
+    weight: string,
+}
+
+/// A row of the 🎨 Palette drawer (`scene::PALETTE`); `title` is empty on a group's continuation rows.
+export struct PaletteRow {
+    title: string,
+    tags: [string],
+}
+
 export struct VrpRegion {
     x: float,
     y: float,
@@ -152,6 +171,10 @@ component PillButton inherits Rectangle {
     callback clicked();
     height: 28px;
     min-width: label.preferred-width + 22px;
+    accessible-role: button;
+    accessible-label: root.text;
+    accessible-enabled: root.enabled;
+    accessible-action-default => { if root.enabled { root.clicked(); } }
     border-radius: 14px;
     border-width: root.primary ? 0px : 1px;
     border-color: M3.outline-variant;
@@ -179,6 +202,12 @@ component FilterChip inherits Rectangle {
     callback toggled();
     height: 26px;
     min-width: lbl.preferred-width + 20px;
+    accessible-role: checkbox;
+    accessible-label: root.text;
+    accessible-checkable: true;
+    accessible-checked: root.checked;
+    accessible-enabled: root.enabled;
+    accessible-action-default => { if root.enabled { root.checked = !root.checked; root.toggled(); } }
     border-radius: 8px;
     border-width: 1px;
     border-color: !root.enabled ? M3.outline-variant : (root.checked ? M3.primary : M3.outline-variant);
@@ -442,6 +471,222 @@ component LiveSceneCard inherits Rectangle {
 }
 
 // The scene card, AI analysis and suggestion cards in one horizontally scrolling strip.
+/// The reference bar's scan engine, main action and drawer toggles (inline, or on a second row in
+/// narrow windows).
+component ScanZone inherits HorizontalLayout {
+    in-out property <bool> image-use-ai;
+    in property <bool> tagger-busy;
+    in property <bool> scene-ref-loaded;
+    in property <int> app-tab;
+    in-out property <int> reference-use-index;
+    in property <bool> image-loaded;
+    in property <bool> images-pending;
+    in property <bool> char1-image-loaded;
+    in-out property <bool> image-advanced;
+    in-out property <bool> scene-panel-open;
+    in property <int> settings-on;
+    callback image-mode-changed();
+    callback transfer();
+    callback auto-scene();
+    callback read-image();
+    spacing: 8px;
+    alignment: end;
+    Rectangle { width: 1px; height: 26px; background: M3.outline-variant; }
+
+    // Zone 2: scan engine (+ what the reference is used for, 1 Character tab)
+    PillButton {
+        text: "⚡ Fast Tagger";
+        primary: !root.image-use-ai;
+        enabled: !root.tagger-busy;
+        clicked => { root.image-use-ai = false; root.image-mode-changed(); }
+    }
+    PillButton {
+        text: "🧠 Combined AI";
+        primary: root.image-use-ai;
+        enabled: !root.tagger-busy;
+        clicked => { root.image-use-ai = true; root.image-mode-changed(); }
+    }
+    if root.scene-ref-loaded && root.app-tab == 0 : ComboBox {
+        width: 160px;
+        model: ["Scene & pose", "Identity transfer", "Outfit transfer", "Atmosphere"];
+        current-index <=> root.reference-use-index;
+    }
+
+    Rectangle { width: 1px; height: 26px; background: M3.outline-variant; }
+
+    // Zone 3: one main action, then the drawers
+    PillButton {
+        property <bool> transfer: root.scene-ref-loaded && root.app-tab == 0 && root.reference-use-index > 0;
+        property <bool> auto-scene: root.scene-ref-loaded && !root.image-use-ai && !root.image-loaded && !root.images-pending && !root.char1-image-loaded;
+        primary: true;
+        text: root.tagger-busy ? "Scanning…" : (self.transfer ? "⇄ Transfer" : (self.auto-scene ? "⚡ Auto Scene" : "⚡ Scan Image"));
+        enabled: !root.tagger-busy && (self.transfer || self.auto-scene || root.image-loaded || root.images-pending || root.scene-ref-loaded || root.char1-image-loaded);
+        clicked => {
+            if self.transfer {
+                root.transfer();
+            } else if self.auto-scene {
+                root.auto-scene();
+            } else {
+                root.read-image();
+            }
+        }
+    }
+    // the fast per-character pose / scene read of the reference stays reachable when the
+    // main button does something else
+    if root.scene-ref-loaded && (root.image-use-ai || root.image-loaded || root.images-pending || root.char1-image-loaded || (root.app-tab == 0 && root.reference-use-index > 0)) : PillButton {
+        text: "⚡ Auto Scene";
+        enabled: !root.tagger-busy;
+        clicked => { root.auto-scene(); }
+    }
+    PillButton {
+        property <int> on: root.settings-on;
+        text: (root.image-advanced ? "⚙ Settings ▴" : "⚙ Settings ▾") + (self.on > 0 ? " · " + self.on + " on" : "");
+        primary: root.image-advanced;
+        clicked => { root.image-advanced = !root.image-advanced; }
+    }
+    PillButton {
+        text: root.scene-panel-open ? "Scene Panel ▴" : "Scene Panel ▾";
+        primary: root.scene-panel-open;
+        clicked => { root.scene-panel-open = !root.scene-panel-open; }
+    }
+}
+
+/// The Options row's last chips (inline, or on their own row in narrow windows).
+component MoreOptionChips inherits HorizontalLayout {
+    in-out property <bool> ref-adapter;
+    in property <bool> natural-available;
+    in-out property <bool> natural;
+    in-out property <bool> dynamic;
+    in-out property <bool> fit-suggestions;
+    in-out property <bool> exaggerated-proportions;
+    in property <bool> show-break;
+    in property <bool> break-supported;
+    in-out property <bool> char-break;
+    callback toggled();
+    spacing: 6px;
+    FilterChip {
+        text: "Fit & Dynamics";
+        checked <=> root.fit-suggestions;
+        toggled => { root.toggled(); }
+    }
+    FilterChip {
+        text: "Exaggerated";
+        checked <=> root.exaggerated-proportions;
+        toggled => { root.toggled(); }
+    }
+    FilterChip {
+        text: "Ref Adapter";
+        checked <=> root.ref-adapter;
+        toggled => { root.toggled(); }
+    }
+    FilterChip {
+        text: "Natural NL";
+        enabled: root.natural-available;
+        checked <=> root.natural;
+        toggled => { root.toggled(); }
+    }
+    FilterChip {
+        text: "Dynamic {a|b}";
+        checked <=> root.dynamic;
+        toggled => { root.toggled(); }
+    }
+    if root.show-break : FilterChip {
+        text: "BREAK Sep";
+        enabled: root.break-supported;
+        checked <=> root.char-break;
+        toggled => { root.toggled(); }
+    }
+}
+
+/// THEME dropdown and the Ollama host field (top bar; on a second row in narrow windows).
+component HostThemeControls inherits HorizontalLayout {
+    in-out property <string> host;
+    in property <bool> connected;
+    in property <bool> busy;
+    callback connect();
+    callback theme-changed();
+    spacing: 8px;
+    // Theme Dropdown Box
+    SectionLabel {
+        text: "THEME:";
+        vertical-alignment: center;
+    }
+    ComboBox {
+        width: 150px;
+        model: [
+            "OLED Pitch Black (#000000)",
+            "M3 Deep Violet (Default)",
+            "OLED Cyber Emerald",
+            "M3 Ocean Blue",
+            "M3 Crimson Ember",
+            "M3 Mocha Gold"
+        ];
+        current-index <=> M3.theme-index;
+        selected => { root.theme-changed(); }
+    }
+
+    // Compact Ollama Host pill
+    SectionLabel {
+        text: root.connected ? "● Ollama:" : "○ Ollama:";
+        color: root.connected ? M3.success : M3.warning;
+        vertical-alignment: center;
+    }
+    Rectangle {
+        width: 135px;
+        height: 28px;
+        border-radius: 8px;
+        border-width: 1px;
+        border-color: host-input.has-focus ? M3.primary : M3.outline-variant;
+        background: M3.surface-container;
+        host-input := TextInput {
+            x: 8px;
+            width: parent.width - 16px;
+            height: parent.height;
+            vertical-alignment: center;
+            single-line: true;
+            font-size: 12px;
+            color: M3.on-surface;
+            text <=> root.host;
+            accepted => { root.connect(); }
+        }
+    }
+    PillButton {
+        text: root.busy ? "…" : "↻";
+        enabled: !root.busy;
+        clicked => { root.connect(); }
+    }
+}
+
+/// Mini preview of the VRP regions (2-4 Characters tabs), in the region editor's colors; click opens it.
+component RegionPreview inherits Rectangle {
+    in property <[VrpRegion]> regions;
+    in property <float> aspect: 1.46;
+    callback clicked();
+    border-radius: 6px;
+    border-width: 1px;
+    border-color: pv-ta.has-hover ? M3.primary : M3.outline-variant;
+    background: M3.surface-container-high;
+    pv-canvas := Rectangle {
+        width: min(parent.width - 6px, (parent.height - 6px) * root.aspect);
+        height: self.width / root.aspect;
+        background: M3.surface;
+        clip: true;
+        for r[i] in root.regions : Rectangle {
+            x: r.x * pv-canvas.width;
+            y: r.y * pv-canvas.height;
+            width: r.w * pv-canvas.width;
+            height: r.h * pv-canvas.height;
+            border-width: 1px;
+            border-color: i == 0 ? #eb1e1e : i == 1 ? #1e6ef5 : i == 2 ? #28be3c : #f5c814;
+            background: i == 0 ? #eb1e1e40 : i == 1 ? #1e6ef540 : i == 2 ? #28be3c40 : #f5c81440;
+        }
+    }
+    pv-ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
 component CardsPanel inherits M3Card {
     in property <[ChangeCardItem]> cards;
     in property <string> live-headline;
@@ -524,13 +769,22 @@ component CardsPanel inherits M3Card {
 component CharacterCard inherits M3Card {
     in property <string> title;
     in property <string> stats;
+    /// More than one CLIP chunk: the token readout turns amber.
+    in property <bool> stats-warn;
     in property <string> lora-title: "LORA & TRIGGER WORDS";
     in-out property <string> text;
     in-out property <string> lora-text;
     in-out property <float> prompt-ratio: 0.68;
+    /// Trigger words from the LoRA files' training tags (`lora_meta`), not yet in the LoRA box.
+    in property <[string]> lora-suggestions: [];
+    /// The box's `<lora:…>` weights: a chip each with − / + (±0.05, `lora_meta::step_weight`).
+    in property <[LoraWeight]> lora-weights: [];
+    callback lora-step(int, float);
     callback edited();
     callback clear_requested();
-    min-height: 90px;
+    /// "+ Quality" (character 1 / Before only; hidden for Flux): the checkpoint's quality tags in front.
+    in property <bool> quality-button: false;
+    callback add-quality();
     border-color: M3.outline;
 
     VerticalLayout {
@@ -540,14 +794,18 @@ component CharacterCard inherits M3Card {
         // Top: Character Prompt
         VerticalLayout {
             vertical-stretch: root.prompt-ratio;
-            min-height: 44px;
+            min-height: 36px;
             spacing: 4px;
             HorizontalLayout {
                 spacing: 6px;
                 alignment: center;
                 Text { text: root.title; font-size: 11px; font-weight: 700; color: M3.error; vertical-alignment: center; }
                 Rectangle { horizontal-stretch: 1; }
-                Text { text: root.stats; font-size: 11px; color: M3.on-surface-variant; vertical-alignment: center; }
+                Text { text: root.stats; font-size: 11px; color: root.stats-warn ? M3.warning : M3.on-surface-variant; vertical-alignment: center; }
+                if root.quality-button : PillButton {
+                    text: "+ Quality";
+                    clicked => { root.add-quality(); }
+                }
                 if root.text != "" || root.lora-text != "" : PillButton {
                     text: "✕ Clear";
                     clicked => {
@@ -589,11 +847,73 @@ component CharacterCard inherits M3Card {
             }
             TextEdit {
                 vertical-stretch: 1;
+                // the weight / trigger chip rows below may not squeeze the box to nothing
+                min-height: 30px;
                 text <=> root.lora-text;
                 wrap: word-wrap;
                 font-size: 12px;
                 placeholder-text: "e.g. <lora:character:0.8>, trigger words...";
                 edited => { root.edited(); }
+            }
+            // weight chips: "name 0.8 [−][+]", a click rewrites the box (Rust side)
+            if root.lora-weights.length > 0 : HorizontalLayout {
+                spacing: 4px;
+                alignment: start;
+                Text { text: "Weight:"; font-size: 10px; color: M3.on-surface-variant; vertical-alignment: center; }
+                for lw[i] in root.lora-weights : Rectangle {
+                    height: 20px;
+                    border-radius: 10px;
+                    border-width: 1px;
+                    border-color: M3.outline-variant;
+                    background: M3.surface-container-high;
+                    HorizontalLayout {
+                        padding-left: 7px;
+                        padding-right: 2px;
+                        spacing: 2px;
+                        Text { text: lw.name; font-size: 10px; color: M3.on-surface-variant; vertical-alignment: center; overflow: elide; max-width: 110px; }
+                        Text { text: lw.weight; font-size: 10px; font-weight: 700; color: M3.primary; vertical-alignment: center; }
+                        Rectangle {
+                            width: 16px;
+                            border-radius: 8px;
+                            background: minus-ta.has-hover ? M3.secondary-container : transparent;
+                            accessible-role: button;
+                            accessible-label: "LoRA weight −";
+                            Text { text: "−"; font-size: 11px; color: M3.primary; }
+                            minus-ta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.lora-step(i, -0.05); } }
+                        }
+                        Rectangle {
+                            width: 16px;
+                            border-radius: 8px;
+                            background: plus-ta.has-hover ? M3.secondary-container : transparent;
+                            accessible-role: button;
+                            accessible-label: "LoRA weight +";
+                            Text { text: "+"; font-size: 11px; color: M3.primary; }
+                            plus-ta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.lora-step(i, 0.05); } }
+                        }
+                    }
+                }
+            }
+            // "+ tag" chips: a click appends the tag to this LoRA box (never added on their own)
+            if root.lora-suggestions.length > 0 : HorizontalLayout {
+                spacing: 4px;
+                alignment: start;
+                Text { text: "Triggers:"; font-size: 10px; color: M3.on-surface-variant; vertical-alignment: center; }
+                for tag in root.lora-suggestions : Rectangle {
+                    height: 20px;
+                    min-width: chip-label.preferred-width + 14px;
+                    border-radius: 10px;
+                    border-width: 1px;
+                    border-color: M3.outline-variant;
+                    background: chip-ta.has-hover ? M3.secondary-container : M3.surface-container-high;
+                    chip-label := Text { text: "+ " + tag; font-size: 10px; color: M3.primary; }
+                    chip-ta := TouchArea {
+                        mouse-cursor: MouseCursor.pointer;
+                        clicked => {
+                            root.lora-text = root.lora-text == "" ? tag : root.lora-text + ", " + tag;
+                            root.edited();
+                        }
+                    }
+                }
             }
         }
     }
@@ -612,11 +932,18 @@ component PromptColumn inherits VerticalLayout {
     in-out property <string> lora-tags;
     in property <string> before-stats;
     in property <string> after-stats;
+    in property <bool> before-stats-warn;
+    in property <bool> after-stats-warn;
+    in property <bool> char2-stats-warn;
+    in property <bool> char3-stats-warn;
+    in property <bool> char4-stats-warn;
     in property <string> condensed-plain;
     in property <int> after-view;
     in property <bool> ai-improved-available;
     in property <bool> dynamic-enabled;
     in property <string> dynamic-note;
+    /// After shows a 🎲 Roll of the Dynamic template (one pick per group), not the template.
+    in property <bool> rolled: false;
     in property <string> ai-dropped;
     in property <string> substituted-list;
     in property <string> added-list;
@@ -633,6 +960,16 @@ component PromptColumn inherits VerticalLayout {
     in property <string> char2-stats;
     in property <string> char3-stats;
     in property <string> char4-stats: "";
+    in property <[string]> lora-suggest-c1: [];
+    in property <[string]> lora-suggest-c2: [];
+    in property <[string]> lora-suggest-c3: [];
+    in property <[string]> lora-suggest-c4: [];
+    in property <[LoraWeight]> lora-weights-c1: [];
+    in property <[LoraWeight]> lora-weights-c2: [];
+    in property <[LoraWeight]> lora-weights-c3: [];
+    in property <[LoraWeight]> lora-weights-c4: [];
+    /// A weight chip's − / + (character, LoRA index in that box, delta).
+    callback lora-step(int, int, float);
     /// Share of the height the top workspace row gets vs bottom After row.
     in-out property <float> before-ratio;
     /// Shared right-column width for 1-Char, 2-Char, and Bottom (After | Negative) so their vertical sliders move together!
@@ -647,12 +984,22 @@ component PromptColumn inherits VerticalLayout {
     in-out property <float> lora-ratio-c3: 0.68;
     in-out property <float> lora-ratio-c4: 0.68;
 
+    in property <bool> quality-available: false;
+    callback add-quality();
     in property <string> negative-plain;
     in property <string> negative-note;
     in property <bool> negative-available;
+    /// The negative box open; collapsed it is a slim strip under After, which then takes the full width.
+    in-out property <bool> negative-expanded: true;
+    in property <string> negative-tokens;
+    /// Zen mode: the output header row is hidden (After keeps its own Copy).
+    in property <bool> zen: false;
     in-out property <bool> output-collapsed: false;
+    /// Copy format (condenser::ExportFormat): 0 ComfyUI, 1 WebUI, 2 NovelAI, 3 Plain.
+    in-out property <int> export-index: 0;
     callback edited();
     callback after-view-changed(int);
+    callback roll();
     callback copy();
     callback copy-section-blocks();
     callback copy-negative();
@@ -666,7 +1013,6 @@ component PromptColumn inherits VerticalLayout {
     // ---- MODE 1 & MODE 2 (1 Character OR 2 Characters 2x1 Side-by-Side; V-Slider synced with Bottom Row)
     if root.char-count == 1 || root.char-count == 2 : HorizontalLayout {
         vertical-stretch: root.before-ratio;
-        min-height: 110px;
         spacing: 0px;
 
         CharacterCard {
@@ -675,8 +1021,14 @@ component PromptColumn inherits VerticalLayout {
             title: root.char-count == 2 ? "CHARACTER 1 (LEFT) — PROMPT" : "BEFORE — RAW COMFYUI PROMPT";
             lora-title: root.char-count == 2 ? "LORA C1 (LEFT)" : "LORA & TRIGGER WORDS";
             stats: root.before-stats;
+            stats-warn: root.before-stats-warn;
             text <=> root.raw-prompt;
+            quality-button: root.quality-available;
+            add-quality => { root.add-quality(); }
             lora-text <=> root.lora-tags;
+            lora-suggestions: root.lora-suggest-c1;
+            lora-weights: root.lora-weights-c1;
+            lora-step(i, d) => { root.lora-step(0, i, d); }
             prompt-ratio <=> root.lora-ratio-c1;
             edited => { root.edited(); }
         }
@@ -754,8 +1106,12 @@ component PromptColumn inherits VerticalLayout {
             title: "CHARACTER 2 (RIGHT) — PROMPT";
             lora-title: "LORA C2 (RIGHT)";
             stats: root.char2-stats;
+            stats-warn: root.char2-stats-warn;
             text <=> root.char2-prompt;
             lora-text <=> root.char2-lora-tags;
+            lora-suggestions: root.lora-suggest-c2;
+            lora-weights: root.lora-weights-c2;
+            lora-step(i, d) => { root.lora-step(1, i, d); }
             prompt-ratio <=> root.lora-ratio-c2;
             edited => { root.edited(); }
         }
@@ -764,7 +1120,6 @@ component PromptColumn inherits VerticalLayout {
     // ---- MODE 3: 3 CHARACTERS (3 x 1 Side-by-Side Grid with 2 Adjustable Vertical Splitters)
     if root.char-count == 3 : HorizontalLayout {
         vertical-stretch: root.before-ratio;
-        min-height: 110px;
         spacing: 0px;
 
         CharacterCard {
@@ -773,8 +1128,14 @@ component PromptColumn inherits VerticalLayout {
             title: "CHARACTER 1 (LEFT)";
             lora-title: "LORA C1";
             stats: root.before-stats;
+            stats-warn: root.before-stats-warn;
             text <=> root.raw-prompt;
+            quality-button: root.quality-available;
+            add-quality => { root.add-quality(); }
             lora-text <=> root.lora-tags;
+            lora-suggestions: root.lora-suggest-c1;
+            lora-weights: root.lora-weights-c1;
+            lora-step(i, d) => { root.lora-step(0, i, d); }
             prompt-ratio <=> root.lora-ratio-c1;
             edited => { root.edited(); }
         }
@@ -793,8 +1154,12 @@ component PromptColumn inherits VerticalLayout {
             title: "CHARACTER 2 (CENTER)";
             lora-title: "LORA C2";
             stats: root.char2-stats;
+            stats-warn: root.char2-stats-warn;
             text <=> root.char2-prompt;
             lora-text <=> root.char2-lora-tags;
+            lora-suggestions: root.lora-suggest-c2;
+            lora-weights: root.lora-weights-c2;
+            lora-step(i, d) => { root.lora-step(1, i, d); }
             prompt-ratio <=> root.lora-ratio-c2;
             edited => { root.edited(); }
         }
@@ -813,8 +1178,12 @@ component PromptColumn inherits VerticalLayout {
             title: "CHARACTER 3 (RIGHT)";
             lora-title: "LORA C3";
             stats: root.char3-stats;
+            stats-warn: root.char3-stats-warn;
             text <=> root.char3-prompt;
             lora-text <=> root.char3-lora-tags;
+            lora-suggestions: root.lora-suggest-c3;
+            lora-weights: root.lora-weights-c3;
+            lora-step(i, d) => { root.lora-step(2, i, d); }
             prompt-ratio <=> root.lora-ratio-c3;
             edited => { root.edited(); }
         }
@@ -823,13 +1192,11 @@ component PromptColumn inherits VerticalLayout {
     // ---- MODE 4: 4 CHARACTERS (2 x 2 Grid with Unified Vertical Slider + Horizontal Slider)
     if root.char-count == 4 : g4 := VerticalLayout {
         vertical-stretch: root.before-ratio;
-        min-height: 180px;
         spacing: 0px;
 
         // Top Row of 2x2 (Character 1 | Unified V-Splitter | Character 2)
         HorizontalLayout {
             vertical-stretch: root.char4-top-ratio;
-            min-height: 85px;
             spacing: 0px;
 
             CharacterCard {
@@ -838,8 +1205,14 @@ component PromptColumn inherits VerticalLayout {
                 title: "CHARACTER 1 (TOP-LEFT)";
                 lora-title: "LORA C1";
                 stats: root.before-stats;
+                stats-warn: root.before-stats-warn;
                 text <=> root.raw-prompt;
+            quality-button: root.quality-available;
+            add-quality => { root.add-quality(); }
                 lora-text <=> root.lora-tags;
+                lora-suggestions: root.lora-suggest-c1;
+                lora-weights: root.lora-weights-c1;
+                lora-step(i, d) => { root.lora-step(0, i, d); }
                 prompt-ratio <=> root.lora-ratio-c1;
                 edited => { root.edited(); }
             }
@@ -859,8 +1232,12 @@ component PromptColumn inherits VerticalLayout {
                 title: "CHARACTER 2 (TOP-RIGHT)";
                 lora-title: "LORA C2";
                 stats: root.char2-stats;
+                stats-warn: root.char2-stats-warn;
                 text <=> root.char2-prompt;
                 lora-text <=> root.char2-lora-tags;
+                lora-suggestions: root.lora-suggest-c2;
+                lora-weights: root.lora-weights-c2;
+                lora-step(i, d) => { root.lora-step(1, i, d); }
                 prompt-ratio <=> root.lora-ratio-c2;
                 edited => { root.edited(); }
             }
@@ -878,7 +1255,6 @@ component PromptColumn inherits VerticalLayout {
         // Bottom Row of 2x2 (Character 3 | Unified V-Splitter | Character 4)
         HorizontalLayout {
             vertical-stretch: 1.0 - root.char4-top-ratio;
-            min-height: 85px;
             spacing: 0px;
 
             CharacterCard {
@@ -887,8 +1263,12 @@ component PromptColumn inherits VerticalLayout {
                 title: "CHARACTER 3 (BOTTOM-LEFT)";
                 lora-title: "LORA C3";
                 stats: root.char3-stats;
+                stats-warn: root.char3-stats-warn;
                 text <=> root.char3-prompt;
                 lora-text <=> root.char3-lora-tags;
+                lora-suggestions: root.lora-suggest-c3;
+                lora-weights: root.lora-weights-c3;
+                lora-step(i, d) => { root.lora-step(2, i, d); }
                 prompt-ratio <=> root.lora-ratio-c3;
                 edited => { root.edited(); }
             }
@@ -908,8 +1288,12 @@ component PromptColumn inherits VerticalLayout {
                 title: "CHARACTER 4 (BOTTOM-RIGHT)";
                 lora-title: "LORA C4";
                 stats: root.char4-stats;
+                stats-warn: root.char4-stats-warn;
                 text <=> root.char4-prompt;
                 lora-text <=> root.char4-lora-tags;
+                lora-suggestions: root.lora-suggest-c4;
+                lora-weights: root.lora-weights-c4;
+                lora-step(i, d) => { root.lora-step(3, i, d); }
                 prompt-ratio <=> root.lora-ratio-c4;
                 edited => { root.edited(); }
             }
@@ -927,7 +1311,7 @@ component PromptColumn inherits VerticalLayout {
     // =========================================================================
     // UNIFIED OUTPUT ROW: COPY PROMPT & NEGATIVE ON SAME LINE + 1 COLLAPSE BUTTON
     // =========================================================================
-    Rectangle {
+    if !root.zen : Rectangle {
         background: M3.surface-container;
         border-radius: 8px;
         border-width: 1px;
@@ -946,6 +1330,8 @@ component PromptColumn inherits VerticalLayout {
                 font-weight: 700;
                 color: M3.on-surface;
                 vertical-alignment: center;
+                overflow: elide;
+                horizontal-stretch: 1;
             }
 
             Rectangle { horizontal-stretch: 1; }
@@ -984,13 +1370,13 @@ component PromptColumn inherits VerticalLayout {
     // =========================================================================
     if !root.output-collapsed : HorizontalLayout {
         vertical-stretch: 1.0 - root.before-ratio;
-        min-height: 95px;
+        min-height: 64px;
         spacing: 0px;
         VerticalLayout {
             horizontal-stretch: 1;
             min-width: 220px;
             M3Card {
-                min-height: 95px;
+                min-height: 64px;
                 border-color: M3.success-container;
                 VerticalLayout {
                     padding: 10px;
@@ -998,11 +1384,13 @@ component PromptColumn inherits VerticalLayout {
                     HorizontalLayout {
                         spacing: 8px;
                         Text {
-                            text: root.after-view == 4 ? "AFTER — AI SECTION BLOCKS (DEEP AI SCAN)" : (root.after-view == 3 ? "AFTER — SECTION BLOCKS (MODULAR LAYOUT)" : (root.after-view == 2 ? "AFTER — DYNAMIC PROMPT" : (root.after-view == 1 ? "AFTER — AI IMPROVED" : "AFTER — CONDENSED & CONFLICT-FREE")));
+                            text: root.after-view == 4 ? "AFTER — AI SECTION BLOCKS (DEEP AI SCAN)" : (root.after-view == 3 ? "AFTER — SECTION BLOCKS (MODULAR LAYOUT)" : (root.after-view == 2 ? (root.rolled ? "AFTER — ROLLED PREVIEW (ONE PICK PER GROUP)" : "AFTER — DYNAMIC PROMPT") : (root.after-view == 1 ? "AFTER — AI IMPROVED" : "AFTER — CONDENSED & CONFLICT-FREE")));
                             font-size: 11px;
                             font-weight: 700;
                             color: M3.success;
                             vertical-alignment: center;
+                            overflow: elide;
+                            horizontal-stretch: 1;
                         }
                         HorizontalLayout {
                             spacing: 4px;
@@ -1031,9 +1419,18 @@ component PromptColumn inherits VerticalLayout {
                                 primary: root.after-view == 2;
                                 clicked => { root.after-view-changed(2); }
                             }
+                            if root.dynamic-enabled && root.after-view == 2 : PillButton {
+                                text: "🎲 Roll";
+                                primary: root.rolled;
+                                clicked => { root.roll(); }
+                            }
                         }
-                        Rectangle { horizontal-stretch: 1; }
-                        Text { text: root.after-stats; font-size: 11px; color: M3.success; vertical-alignment: center; }
+                        Text { text: root.after-stats; font-size: 11px; color: root.after-stats-warn ? M3.warning : M3.success; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; horizontal-alignment: right; }
+                        ComboBox {
+                            width: 112px;
+                            model: ["ComfyUI", "WebUI", "NovelAI", "Plain"];
+                            current-index <=> root.export-index;
+                        }
                         PillButton {
                             text: (root.after-view == 3 || root.after-view == 4) ? "📋 Copy Blocks" : "📋 Copy";
                             primary: true;
@@ -1090,19 +1487,19 @@ component PromptColumn inherits VerticalLayout {
             }
         }
         // Synced Vertical Splitter (shares root.side-width with 1-Char and 2-Char)
-        Splitter {
+        if root.negative-expanded && root.negative-available : Splitter {
             horizontal-bar: false;
             width: 10px;
             dragged(d) => {
                 root.side-width = max(180px, min(root.side-width - d, root.width - 260px));
             }
         }
-        VerticalLayout {
+        if root.negative-expanded && root.negative-available : VerticalLayout {
             preferred-width: root.side-width;
             min-width: 180px;
             horizontal-stretch: 0;
             M3Card {
-                min-height: 95px;
+                min-height: 64px;
                 border-color: M3.error-container;
                 VerticalLayout {
                     padding: 10px;
@@ -1115,11 +1512,17 @@ component PromptColumn inherits VerticalLayout {
                             font-weight: 700;
                             color: M3.error;
                             vertical-alignment: center;
+                            overflow: elide;
+                            horizontal-stretch: 1;
                         }
                         Rectangle { horizontal-stretch: 1; }
                         if root.negative-available : PillButton {
                             text: "📋 Copy";
                             clicked => { root.copy-negative(); }
+                        }
+                        PillButton {
+                            text: "▴";
+                            clicked => { root.negative-expanded = false; }
                         }
                     }
                     neg-scroll := ScrollView {
@@ -1148,6 +1551,32 @@ component PromptColumn inherits VerticalLayout {
             }
         }
     }
+    // collapsed negative (or Flux, which has none): one slim strip under After
+    if !root.output-collapsed && !(root.negative-expanded && root.negative-available) : Rectangle {
+        height: 26px;
+        border-radius: 8px;
+        border-width: 1px;
+        border-color: M3.error-container;
+        background: neg-strip-ta.has-hover && root.negative-available ? M3.surface-container-high : M3.surface-container;
+        HorizontalLayout {
+            padding-left: 10px;
+            padding-right: 10px;
+            spacing: 8px;
+            Text {
+                text: root.negative-available ? "▸ Negative · " + root.negative-tokens : "Negative · not used by this checkpoint";
+                font-size: 11px;
+                font-weight: 700;
+                color: root.negative-available ? M3.error : M3.on-surface-variant;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+                overflow: elide;
+            }
+        }
+        neg-strip-ta := TouchArea {
+            enabled: root.negative-available;
+            clicked => { root.negative-expanded = true; }
+        }
+    }
 }
 
 export component AppWindow inherits Window {
@@ -1160,7 +1589,52 @@ export component AppWindow inherits Window {
 
     // Theme & UI state
     in-out property <int> theme_index <=> M3.theme-index;
-    in-out property <bool> options_expanded: true;
+    in-out property <bool> options_expanded: false;
+    /// Recommended Negative open (saved) / Zen mode (saved: View, Options and Folders rows and the
+    /// output header hidden).
+    in-out property <bool> negative_expanded: false;
+    in-out property <bool> zen_mode: false;
+    in-out property <string> negative_tokens: "";
+    /// Status pill: "✓ Clean", "N conflicts" or "N fixes" (`render::issue_summary`); the app version.
+    in-out property <string> issue_summary: "✓ Clean";
+    in-out property <string> app_version: "";
+    /// Mini region preview (2-4 Characters tabs; `render::push_vrp_preview`).
+    in-out property <[VrpRegion]> vrp_preview: [];
+    in-out property <float> vrp_preview_aspect: 1.46;
+    /// The cards strip opened from its "clean" banner (not saved).
+    in-out property <bool> cards_peek: false;
+    /// Prompt history (`history.rs`): the overlay, its rows (newest first) and the pill's count.
+    in-out property <bool> history_open: false;
+    /// The 🎨 Palette drawer: lighting / atmosphere / style chips; a click appends the tag to the Scene box
+    /// (2-4 Characters) or Before (1 Character).
+    in-out property <bool> palette_open: false;
+    in-out property <[PaletteRow]> palette_rows: [];
+    callback palette_tag_clicked(string);
+    in-out property <[HistoryRow]> history_rows: [];
+    in-out property <int> history_count: 0;
+    callback history_open_requested();
+    callback history_stash_requested();
+    callback history_star_toggled(int);
+    callback history_restore_requested(int);
+    /// Narrow window (the minimum is 800 px): the top bar and the reference bar wrap onto a second row.
+    /// Set from Rust (`settings::update_narrow`): binding it to root.width loops through the window's
+    /// own layout info.
+    in-out property <bool> narrow: false;
+    property <[string]> checkpoint-names: ["Anima", "Pony V6", "Illustrious", "SDXL", "SD 1.5", "Flux"];
+    property <bool> cards-empty: root.change_cards.length == 0 && root.scene_summary == "";
+    /// Copy format next to After's Copy (saved; condenser::ExportFormat order).
+    in-out property <int> export_index: 0;
+    /// Option chips that differ from their defaults (shown on the collapsed Options toggle).
+    property <int> options_changed: (root.cleanup_enabled ? 0 : 1) + (root.resolve_conflicts_enabled ? 0 : 1)
+        + (root.clamp_weights_enabled ? 0 : 1) + (root.arranged_enabled ? 1 : 0) + (root.ref_adapter_mode ? 1 : 0)
+        + (root.natural_enabled ? 1 : 0) + (root.dynamic_enabled ? 1 : 0)
+        + (root.app_tab >= 1 && !root.char_break_enabled ? 1 : 0);
+    /// "✓ Copied" toast after a copy button (fades out).
+    property <bool> toast-on: false;
+    function show-copied() {
+        root.toast-on = true;
+        toast-timer.running = true;
+    }
     callback theme_changed();
 
     // Dropdowns
@@ -1176,11 +1650,16 @@ export component AppWindow inherits Window {
     in-out property <[string]> frame_labels: [];
     in-out property <int> frame_index: 0; // index into profiles::FRAMES
     in-out property <bool> dynamic_enabled: false;
+    in-out property <bool> fit_suggestions: true;
+    in-out property <bool> exaggerated_proportions: false;
     in-out property <bool> arranged_enabled: false;   // After as grouped lines
     in-out property <bool> ref_adapter_mode: false;   // Anima Ref Adapter: After keeps only the scene (the adapter copies the look)
     in-out property <bool> natural_enabled: false;    // natural-language sentences (NL checkpoints only)
     in-out property <int> detail_index: 1;     // 0 Faithful, 1 Balanced, 2 Rich (profiles::DetailLevel)
     in-out property <string> dynamic_note: "";
+    /// After shows a rolled preview of the Dynamic prompt (render() clears it).
+    in-out property <bool> after_rolled: false;
+    callback roll_requested();
     in-out property <[string]> model_labels: [];
     in-out property <int> model_index: 0;
     in-out property <bool> model_needs_download: false;
@@ -1242,6 +1721,23 @@ export component AppWindow inherits Window {
 
     // Ollama (local or another PC)
     in-out property <string> ollama_host: "localhost:11434";
+    /// LoRA folder for trigger-word suggestions (saved in settings).
+    in-out property <string> lora_folder: "";
+    in-out property <[string]> lora_suggest_c1: [];
+    in-out property <[string]> lora_suggest_c2: [];
+    in-out property <[string]> lora_suggest_c3: [];
+    in-out property <[string]> lora_suggest_c4: [];
+    in-out property <[LoraWeight]> lora_weights_c1: [];
+    in-out property <[LoraWeight]> lora_weights_c2: [];
+    in-out property <[LoraWeight]> lora_weights_c3: [];
+    in-out property <[LoraWeight]> lora_weights_c4: [];
+    /// A LoRA weight chip's − / + (character 0-3, LoRA index in its box, delta).
+    callback lora_weight_step(int, int, float);
+    callback pick_lora_folder_requested();
+    /// ComfyUI folder (saved; empty = $COMFYUI_PATH, else ~/ComfyUI). The LoRA folder defaults to its models/loras.
+    in-out property <string> comfyui_folder: "";
+    callback pick_comfyui_folder_requested();
+    callback install_comfyui_node_requested();   // writes the ComfyUI add-on into <ComfyUI>/custom_nodes
     in-out property <bool> ollama_connected: false;
     in-out property <bool> ollama_busy: false;
     in-out property <string> ollama_status: "Connecting to Ollama...";
@@ -1287,6 +1783,9 @@ export component AppWindow inherits Window {
     in-out property <float> before_ratio: 0.56;
     in-out property <length> side_width: 420px;
     in-out property <length> cards_strip_height: 155px;
+    /// The workspace's scroll position, and how far it can scroll (0 when it fits); the smoke test scrolls it.
+    in-out property <length> workspace_scroll_y: 0px;
+    out property <length> workspace_overflow: max(0px, workspace-scroll.content-height - workspace-scroll.visible-height);
     in-out property <bool> output_collapsed: false;
 
     // Live scene description (rule-based)
@@ -1303,12 +1802,22 @@ export component AppWindow inherits Window {
     in-out property <[StructureRow]> structure_rows;
 
     // Stats & status
-    in-out property <string> before_stats: "0 tokens / 0 chunks";
-    in-out property <string> after_stats: "0 tokens / 0 chunks";
+    in-out property <string> before_stats: "";
+    in-out property <string> after_stats: "";
+    in-out property <bool> before_stats_warn;
+    in-out property <bool> after_stats_warn;
+    in-out property <bool> char2_stats_warn;
+    in-out property <bool> char3_stats_warn;
+    in-out property <bool> char4_stats_warn;
     in-out property <string> hardware_badge: "Detecting GPU / VRAM...";
     in-out property <string> status_message: "Ready — paste a ComfyUI prompt.";
     in-out property <bool> ai_busy: false;
     in-out property <string> run_badge: "";
+    /// ComfyUI answers at 127.0.0.1:8188 (`live_bridge::start_probe`).
+    in-out property <bool> comfyui_online: false;
+    /// "⚡ Queue" (status bar, enabled while ComfyUI answers): writes live_prompt.json now and asks the
+    /// add-on to press Queue in the open ComfyUI tab (`live_bridge::wire_queue`).
+    callback queue_comfyui_requested();
 
     in-out property <[ChangeCardItem]> change_cards: [];
 
@@ -1370,6 +1879,7 @@ export component AppWindow inherits Window {
     callback translate_requested();
     callback translate_apply_requested(bool);   // true = replace the Before prompt
     callback undo_image_prompt_requested();
+    callback png_prompt_requested(); // the generation prompt saved in a PNG into Before (png_meta)
     callback download_tagger_requested();
     callback tag_threshold_changed();
     callback copy_output_requested();
@@ -1377,6 +1887,7 @@ export component AppWindow inherits Window {
     callback card_mode_changed(int, int); // (card_id, new_mode)
     callback after_view_changed(int);
     callback copy_recommended_negative_requested();
+    callback add_quality_requested();   // "+ Quality": the checkpoint's quality tags in front of Before
     callback zoom_in_requested();
     callback zoom_out_requested();
 
@@ -1386,6 +1897,7 @@ export component AppWindow inherits Window {
 
         // ==================== ROW 1: UNIFIED TOP APP BAR ====================
         M3Card {
+          VerticalLayout {
             HorizontalLayout {
                 padding-left: 10px;
                 padding-right: 10px;
@@ -1393,42 +1905,50 @@ export component AppWindow inherits Window {
                 padding-bottom: 6px;
                 spacing: 8px;
 
-                // Clean Character Tab Buttons (1 Character, 2 Characters, 3 Characters, 4 Characters)
-                PillButton {
-                    text: "1 Character";
-                    primary: root.app_tab == 0;
-                    clicked => { root.app_tab = 0; root.analyze_requested(); }
+                // The active characters (app_tab + 1), "✕" on the last one and "+ Add character" (max 4).
+                // ✕ only lowers the count: the box keeps its text (saved) and comes back on + Add.
+                for idx in root.app_tab + 1 : PillButton {
+                    text: root.app_tab == 0 ? "👤 1 Character" : "👤 " + (idx + 1);
+                    primary: true;
                 }
-                PillButton {
-                    text: "2 Characters";
-                    primary: root.app_tab == 1;
-                    clicked => { root.app_tab = 1; root.analyze_requested(); }
+                if root.app_tab > 0 : PillButton {
+                    text: "✕";
+                    clicked => { root.app_tab = root.app_tab - 1; root.analyze_requested(); }
                 }
-                PillButton {
-                    text: "3 Characters";
-                    primary: root.app_tab == 2;
-                    clicked => { root.app_tab = 2; root.analyze_requested(); }
-                }
-                PillButton {
-                    text: "4 Characters";
-                    primary: root.app_tab == 3;
-                    clicked => { root.app_tab = 3; root.analyze_requested(); }
+                if root.app_tab < 3 : PillButton {
+                    text: root.narrow ? "+ Add" : "+ Add character";
+                    clicked => { root.app_tab = root.app_tab + 1; root.analyze_requested(); }
                 }
 
                 if root.app_tab >= 1 : PillButton {
-                    text: "🗺 Copy VRP regions";
-                    clicked => { root.copy_vrp_requested(); }
+                    text: root.narrow ? "🗺 VRP" : "🗺 Copy VRP regions";
+                    clicked => { root.copy_vrp_requested(); root.show-copied(); }
                 }
                 if root.app_tab >= 1 : PillButton {
-                    text: "✎ Edit regions";
+                    text: root.narrow ? "✎" : "✎ Edit regions";
                     clicked => { root.edit_vrp_requested(); }
                 }
                 PillButton {
-                    text: "📖 Danbooru Words…";
+                    text: root.narrow ? "🕒 " + root.history_count : "🕒 History (" + root.history_count + ")";
+                    primary: root.history_open;
+                    clicked => { root.history_open_requested(); }
+                }
+                PillButton {
+                    text: "🎨";
+                    primary: root.palette_open;
+                    clicked => { root.palette_open = !root.palette_open; }
+                }
+                PillButton {
+                    text: root.zen_mode ? "⛶ Exit Zen" : "⛶ Zen";
+                    primary: root.zen_mode;
+                    clicked => { root.zen_mode = !root.zen_mode; }
+                }
+                PillButton {
+                    text: root.narrow ? "📖 Words" : "📖 Danbooru";
                     clicked => { root.translate_status = ""; root.translate_open = true; }
                 }
                 PillButton {
-                    text: root.ai_busy ? "Working…" : "✦ Run Deep AI Scan";
+                    text: root.ai_busy ? "Working…" : (root.narrow ? "✦ Deep Scan" : "✦ Run Deep AI Scan");
                     primary: true;
                     enabled: !root.ai_busy && root.ai_mode_index != 2 && root.ollama_connected && !root.model_needs_download;
                     clicked => { root.run_ai_scan_requested(); }
@@ -1445,1037 +1965,1166 @@ export component AppWindow inherits Window {
 
                 Rectangle { horizontal-stretch: 1; }
 
-                // Theme Dropdown Box
-                SectionLabel {
-                    text: "THEME:";
-                    vertical-alignment: center;
-                }
-                ComboBox {
-                    width: 195px;
-                    model: [
-                        "OLED Pitch Black (#000000)",
-                        "M3 Deep Violet (Default)",
-                        "OLED Cyber Emerald",
-                        "M3 Ocean Blue",
-                        "M3 Crimson Ember",
-                        "M3 Mocha Gold"
-                    ];
-                    current-index <=> M3.theme-index;
-                    selected => { root.theme_changed(); }
-                }
-
-                // Compact Ollama Host pill
-                SectionLabel {
-                    text: root.ollama_connected ? "● Ollama:" : "○ Ollama:";
-                    color: root.ollama_connected ? M3.success : M3.warning;
-                    vertical-alignment: center;
-                }
-                Rectangle {
-                    width: 135px;
-                    height: 28px;
-                    border-radius: 8px;
-                    border-width: 1px;
-                    border-color: host-input.has-focus ? M3.primary : M3.outline-variant;
-                    background: M3.surface-container;
-                    host-input := TextInput {
-                        x: 8px;
-                        width: parent.width - 16px;
-                        height: parent.height;
-                        vertical-alignment: center;
-                        single-line: true;
-                        font-size: 12px;
-                        color: M3.on-surface;
-                        text <=> root.ollama_host;
-                        accepted => { root.connect_ollama_requested(); }
-                    }
-                }
-                PillButton {
-                    text: root.ollama_busy ? "…" : "↻";
-                    enabled: !root.ollama_busy;
-                    clicked => { root.connect_ollama_requested(); }
+                if !root.narrow : HostThemeControls {
+                    host <=> root.ollama_host;
+                    connected: root.ollama_connected;
+                    busy: root.ollama_busy;
+                    connect => { root.connect_ollama_requested(); }
+                    theme-changed => { root.theme_changed(); }
                 }
             }
-        }
-
-        // ==================== ROW 2: TWO-BAR CHECKPOINT AREA + COLLAPSIBLE OPTIONS + BOOST & SHARED PROMPT ====================
-        M3Card {
-            VerticalLayout {
-                padding: 8px;
+            // narrow window: THEME and the Ollama host on their own row
+            if root.narrow : HorizontalLayout {
                 padding-left: 10px;
                 padding-right: 10px;
-                spacing: 6px;
-
-                // ---- BAR 1: Model | AI | Detail | LLM + Always-Visible IMAGE Controls (Outside Options!)
-                HorizontalLayout {
-                    spacing: 8px;
-
-                    SectionLabel { text: "Model:"; vertical-alignment: center; }
-                    ComboBox {
-                        horizontal-stretch: 1;
-                        min-width: 140px;
-                        model: [
-                            "Anima (Hybrid + NL)",
-                            "Pony Diffusion V6 XL",
-                            "Illustrious / NoobAI XL",
-                            "SDXL (Base / Finetunes)",
-                            "SD 1.5",
-                            "Flux (Natural Language)"
-                        ];
-                        current-index <=> root.checkpoint_index;
-                        selected => { root.analyze_requested(); }
-                    }
-
-                    SectionLabel { text: "AI:"; vertical-alignment: center; }
-                    ComboBox {
-                        horizontal-stretch: 1;
-                        min-width: 125px;
-                        model: [
-                            "GPU (Vulkan)",
-                            "CPU Only",
-                            "AI Off (Rules)"
-                        ];
-                        current-index <=> root.ai_mode_index;
-                        selected => { root.ai_settings_changed(); }
-                    }
-
-                    ComboBox {
-                        width: 110px;
-                        model: ["Faithful", "Balanced", "Rich"];
-                        current-index <=> root.detail_index;
-                        selected => { root.ai_settings_changed(); }
-                    }
-
-                    SectionLabel { text: "LLM:"; vertical-alignment: center; }
-                    ComboBox {
-                        horizontal-stretch: 1;
-                        min-width: 145px;
-                        model: root.model_labels;
-                        current-index <=> root.model_index;
-                        enabled: root.ai_mode_index != 2;
-                        selected => { root.ai_settings_changed(); }
-                    }
-
+                padding-bottom: 6px;
+                alignment: end;
+                HostThemeControls {
+                    host <=> root.ollama_host;
+                    connected: root.ollama_connected;
+                    busy: root.ollama_busy;
+                    connect => { root.connect_ollama_requested(); }
+                    theme-changed => { root.theme_changed(); }
                 }
+            }
+          }
+        }
 
-                // ---- BAR 2: View | Angle | Pose + Collapsible Options Toggle Button
-                HorizontalLayout {
-                    spacing: 8px;
-
-                    SectionLabel { text: "View:"; vertical-alignment: center; }
-                    ComboBox {
-                        horizontal-stretch: 1;
-                        model: [
-                            "None (Auto-Detect Framing)",
-                            "360 View / Turnaround",
-                            "Upper Body / Cowboy Shot",
-                            "Close-Up / Portrait",
-                            "Front View",
-                            "From Behind / Back View",
-                            "Side Profile",
-                            "Full Body"
-                        ];
-                        current-index <=> root.target_view_index;
-                        selected => { root.analyze_requested(); }
-                    }
-
-                    SectionLabel { text: "Angle:"; vertical-alignment: center; }
-                    ComboBox {
-                        horizontal-stretch: 1;
-                        model: root.angle_labels;
-                        current-index <=> root.angle_index;
-                        selected => { root.analyze_requested(); }
-                    }
-
-                    SectionLabel { text: "Pose:"; vertical-alignment: center; }
-                    ComboBox {
-                        horizontal-stretch: 1;
-                        model: root.pose_labels;
-                        current-index <=> root.pose_index;
-                        selected => { root.analyze_requested(); }
-                    }
-
-                    SectionLabel { text: "Bust:"; vertical-alignment: center; }
-                    ComboBox {
-                        horizontal-stretch: 1;
-                        model: root.bust_labels;
-                        current-index <=> root.bust_index;
-                        selected => { root.analyze_requested(); }
-                    }
-
-                    SectionLabel { text: "Frame:"; vertical-alignment: center; }
-                    ComboBox {
-                        horizontal-stretch: 1;
-                        model: root.frame_labels;
-                        current-index <=> root.frame_index;
-                        selected => { root.analyze_requested(); }
-                    }
-
-                    PillButton {
-                        text: (root.options_expanded ? "▾ Options" : "▸ Options");
-                        primary: root.options_expanded;
-                        clicked => { root.options_expanded = !root.options_expanded; }
-                    }
-                }
-
-                // ---- COLLAPSIBLE OPTIONS DRAWER (Contains ONLY the Option chips)
-                if root.options_expanded : HorizontalLayout {
+        // ==================== ROWS 2-4: OPTIONS + WORKSPACE (scroll when the window is too short) ====================
+        // They scroll as one when the window is shorter than they need (800×600 with the Options open), so the
+        // top bar above and the status bar below always stay in view; with room to spare they fill the height.
+        workspace-scroll := ScrollView {
+            vertical-stretch: 1;
+            content-y <=> root.workspace_scroll_y;
+            content-height: workspace-area.height;
+            workspace-area := Rectangle {
+                // a sized element is centered unless placed: keep it at the top of the viewport
+                x: 0;
+                y: 0;
+                width: workspace-scroll.visible-width;
+                height: max(workspace-scroll.visible-height, middle.min-height);
+                middle := VerticalLayout {
                     spacing: 6px;
-                    alignment: start;
-                    SectionLabel { text: "OPTIONS:"; vertical-alignment: center; }
-                    FilterChip {
-                        text: "Clean Bloat";
-                        checked <=> root.cleanup_enabled;
-                        toggled => { root.analyze_requested(); }
-                    }
-                    FilterChip {
-                        text: "Fix Conflicts";
-                        checked <=> root.resolve_conflicts_enabled;
-                        toggled => { root.analyze_requested(); }
-                    }
-                    FilterChip {
-                        text: "Clamp Weights";
-                        checked <=> root.clamp_weights_enabled;
-                        toggled => { root.analyze_requested(); }
-                    }
-                    FilterChip {
-                        text: "Arranged";
-                        checked <=> root.arranged_enabled;
-                        toggled => { root.analyze_requested(); }
-                    }
-                    FilterChip {
-                        text: "Ref Adapter";
-                        checked <=> root.ref_adapter_mode;
-                        toggled => { root.analyze_requested(); }
-                    }
-                    FilterChip {
-                        text: "Natural NL";
-                        enabled: root.translate_nl;
-                        checked <=> root.natural_enabled;
-                        toggled => { root.analyze_requested(); }
-                    }
-                    FilterChip {
-                        text: "Dynamic {a|b}";
-                        checked <=> root.dynamic_enabled;
-                        toggled => { root.analyze_requested(); }
-                    }
-                    if root.app_tab >= 1 : FilterChip {
-                        text: "BREAK Sep";
-                        enabled: root.break_supported;
-                        checked <=> root.char_break_enabled;
-                        toggled => { root.analyze_requested(); }
-                    }
-                }
-
-                // ---- ALWAYS-VISIBLE FULL-WIDTH BOOST ROW (Outside & below Options, same length as SHARED PROMPT)
-                HorizontalLayout {
-                    spacing: 8px;
-                    SectionLabel {
-                        width: 118px;
-                        text: "BOOST (" + Math.round(root.emphasis_weight * 100) / 100 + "x):";
-                        color: M3.success;
-                        vertical-alignment: center;
-                    }
-                    LineEdit {
-                        horizontal-stretch: 1;
-                        font-size: 12px;
-                        height: 30px;
-                        placeholder-text: "Tags in your prompt to emphasize, e.g. glasses, thick eyebrows";
-                        text <=> root.pinned_emphasis;
-                        edited => { root.analyze_requested(); }
-                    }
-                    Slider {
-                        width: 90px;
-                        minimum: 1.0;
-                        maximum: 1.5;
-                        value <=> root.emphasis_weight;
-                        changed => { root.analyze_requested(); }
-                    }
-                }
-
-                // ---- FULL-WIDTH SHARED PROMPT ROW (Matches BOOST length above it, available on 1-4 Characters)
-                HorizontalLayout {
-                    spacing: 8px;
-                    SectionLabel {
-                        width: 118px;
-                        text: "SHARED PROMPT:";
-                        color: M3.info;
-                        vertical-alignment: center;
-                    }
-                    LineEdit {
-                        horizontal-stretch: 1;
-                        font-size: 12px;
-                        height: 30px;
-                        placeholder-text: "Shared setting, camera, lighting & actions for all characters, e.g. eating ramen together, tavern table, warm lighting";
-                        text <=> root.scene_prompt;
-                        edited => { root.analyze_requested(); }
-                    }
-                }
-
-                // ---- SCENE & REFERENCE BAR + LOWERABLE DROPDOWN PANEL (Unified Reference Section)
-                VerticalLayout {
-                    spacing: 6px;
-                    padding-top: 2px;
-
-                    // 1. Sleek bar with visible previews (clickable to load or remove)
-                    Rectangle {
-                        background: M3.surface-container;
-                        border-radius: 10px;
-                        border-width: 1px;
-                        border-color: (root.scene_ref_loaded || root.image_loaded || root.char1_image_loaded) ? M3.info-container : M3.outline-variant;
-                        HorizontalLayout {
+                    // ==================== ROW 2: TWO-BAR CHECKPOINT AREA + COLLAPSIBLE OPTIONS + BOOST & SHARED PROMPT ====================
+                    M3Card {
+                        VerticalLayout {
+                            padding: 8px;
                             padding-left: 10px;
                             padding-right: 10px;
-                            padding-top: 5px;
-                            padding-bottom: 5px;
-                            spacing: 8px;
-                            alignment: center;
+                            spacing: 6px;
 
-                            // Scene Reference Thumbnail (or "+ Scene" slot if not loaded)
-                            Rectangle {
-                                width: 56px;
-                                height: 34px;
-                                border-radius: 6px;
-                                border-width: 1.5px;
-                                border-color: root.scene_ref_loaded ? M3.primary : M3.outline;
-                                clip: true;
-                                background: M3.surface-container-high;
-                                if root.scene_ref_loaded : Image {
-                                    source: root.scene_ref_thumb;
-                                    width: parent.width;
-                                    height: parent.height;
-                                    image-fit: cover;
+                            // ---- BAR 1: Model | AI | Detail | LLM + Always-Visible IMAGE Controls (Outside Options!)
+                            HorizontalLayout {
+                                spacing: 8px;
+
+                                SectionLabel { text: "Model:"; vertical-alignment: center; }
+                                ComboBox {
+                                    horizontal-stretch: 1;
+                                    min-width: 90px;
+                                    model: [
+                                        "Anima (Hybrid + NL)",
+                                        "Pony Diffusion V6 XL",
+                                        "Illustrious / NoobAI XL",
+                                        "SDXL (Base / Finetunes)",
+                                        "SD 1.5",
+                                        "Flux (Natural Language)"
+                                    ];
+                                    current-index <=> root.checkpoint_index;
+                                    selected => { root.analyze_requested(); }
                                 }
-                                if !root.scene_ref_loaded : Text {
-                                    text: "+ Scene";
-                                    font-size: 10px;
-                                    font-weight: 600;
-                                    color: M3.on-surface-variant;
-                                    horizontal-alignment: center;
-                                    vertical-alignment: center;
+
+                                SectionLabel { text: "AI:"; vertical-alignment: center; }
+                                ComboBox {
+                                    horizontal-stretch: 1;
+                                    min-width: 90px;
+                                    model: [
+                                        "GPU (Vulkan)",
+                                        "CPU Only",
+                                        "AI Off (Rules)"
+                                    ];
+                                    current-index <=> root.ai_mode_index;
+                                    selected => { root.ai_settings_changed(); }
                                 }
-                                if root.scene_ref_loaded && scene-thumb-ta.has-hover : Rectangle {
-                                    background: #000000b8;
-                                    Text {
-                                        text: "✕";
-                                        horizontal-alignment: center;
+
+                                ComboBox {
+                                    width: 110px;
+                                    model: ["Faithful", "Balanced", "Rich"];
+                                    current-index <=> root.detail_index;
+                                    selected => { root.ai_settings_changed(); }
+                                }
+
+                                SectionLabel { text: "LLM:"; vertical-alignment: center; }
+                                ComboBox {
+                                    horizontal-stretch: 1;
+                                    min-width: 145px;
+                                    model: root.model_labels;
+                                    current-index <=> root.model_index;
+                                    enabled: root.ai_mode_index != 2;
+                                    selected => { root.ai_settings_changed(); }
+                                }
+
+                            }
+
+                            // ---- BAR 2: View | Angle | Pose + Collapsible Options Toggle Button (hidden in Zen mode)
+                            if !root.zen_mode : HorizontalLayout {
+                                spacing: 8px;
+
+                                // first, so it stays reachable in a narrow window
+                                PillButton {
+                                    text: root.options_expanded ? "▾ Options"
+                                        : root.options_changed > 0 ? "▸ Options · " + root.options_changed : "▸ Options";
+                                    primary: root.options_expanded;
+                                    clicked => { root.options_expanded = !root.options_expanded; }
+                                }
+
+                                SectionLabel { text: "View:"; vertical-alignment: center; }
+                                ComboBox {
+                                    horizontal-stretch: 1;
+                                    min-width: 60px;
+                                    model: [
+                                        "None (Auto-Detect Framing)",
+                                        "360 View / Turnaround",
+                                        "Upper Body / Cowboy Shot",
+                                        "Close-Up / Portrait",
+                                        "Front View",
+                                        "From Behind / Back View",
+                                        "Side Profile",
+                                        "Full Body"
+                                    ];
+                                    current-index <=> root.target_view_index;
+                                    selected => { root.analyze_requested(); }
+                                }
+
+                                SectionLabel { text: "Angle:"; vertical-alignment: center; }
+                                ComboBox {
+                                    horizontal-stretch: 1;
+                                    min-width: 60px;
+                                    model: root.angle_labels;
+                                    current-index <=> root.angle_index;
+                                    selected => { root.analyze_requested(); }
+                                }
+
+                                SectionLabel { text: "Pose:"; vertical-alignment: center; }
+                                ComboBox {
+                                    horizontal-stretch: 1;
+                                    min-width: 60px;
+                                    model: root.pose_labels;
+                                    current-index <=> root.pose_index;
+                                    selected => { root.analyze_requested(); }
+                                }
+
+                                SectionLabel { text: "Bust:"; vertical-alignment: center; }
+                                ComboBox {
+                                    horizontal-stretch: 1;
+                                    min-width: 60px;
+                                    model: root.bust_labels;
+                                    current-index <=> root.bust_index;
+                                    selected => { root.analyze_requested(); }
+                                }
+
+                                SectionLabel { text: "Frame:"; vertical-alignment: center; }
+                                ComboBox {
+                                    horizontal-stretch: 1;
+                                    min-width: 60px;
+                                    model: root.frame_labels;
+                                    current-index <=> root.frame_index;
+                                    selected => { root.analyze_requested(); }
+                                }
+
+                            }
+
+                            // ---- COLLAPSIBLE OPTIONS DRAWER (the Option chips, then the folders row)
+                            if root.options_expanded && !root.zen_mode : HorizontalLayout {
+                                spacing: 6px;
+                                alignment: start;
+                                SectionLabel { text: "OPTIONS:"; vertical-alignment: center; }
+                                FilterChip {
+                                    text: "Clean Bloat";
+                                    checked <=> root.cleanup_enabled;
+                                    toggled => { root.analyze_requested(); }
+                                }
+                                FilterChip {
+                                    text: "Fix Conflicts";
+                                    checked <=> root.resolve_conflicts_enabled;
+                                    toggled => { root.analyze_requested(); }
+                                }
+                                FilterChip {
+                                    text: "Clamp Weights";
+                                    checked <=> root.clamp_weights_enabled;
+                                    toggled => { root.analyze_requested(); }
+                                }
+                                FilterChip {
+                                    text: "Arranged";
+                                    checked <=> root.arranged_enabled;
+                                    toggled => { root.analyze_requested(); }
+                                }
+                                if !root.narrow : MoreOptionChips {
+                                    fit-suggestions <=> root.fit_suggestions;
+                                    exaggerated-proportions <=> root.exaggerated_proportions;
+                                    ref-adapter <=> root.ref_adapter_mode;
+                                    natural-available: root.translate_nl;
+                                    natural <=> root.natural_enabled;
+                                    dynamic <=> root.dynamic_enabled;
+                                    show-break: root.app_tab >= 1;
+                                    break-supported: root.break_supported;
+                                    char-break <=> root.char_break_enabled;
+                                    toggled => { root.analyze_requested(); }
+                                }
+                            }
+                            // narrow window: the rest of the chips on their own row
+                            if root.options_expanded && !root.zen_mode && root.narrow : HorizontalLayout {
+                                spacing: 6px;
+                                alignment: start;
+                                MoreOptionChips {
+                                    fit-suggestions <=> root.fit_suggestions;
+                                    exaggerated-proportions <=> root.exaggerated_proportions;
+                                    ref-adapter <=> root.ref_adapter_mode;
+                                    natural-available: root.translate_nl;
+                                    natural <=> root.natural_enabled;
+                                    dynamic <=> root.dynamic_enabled;
+                                    show-break: root.app_tab >= 1;
+                                    break-supported: root.break_supported;
+                                    char-break <=> root.char_break_enabled;
+                                    toggled => { root.analyze_requested(); }
+                                }
+                            }
+                            if root.options_expanded && !root.zen_mode : HorizontalLayout {
+                                spacing: 6px;
+                                alignment: start;
+                                SectionLabel { text: "FOLDERS:"; vertical-alignment: center; }
+                                SectionLabel { text: "ComfyUI:"; vertical-alignment: center; }
+                                LineEdit {
+                                    width: 180px;
+                                    height: 30px;
+                                    font-size: 12px;
+                                    placeholder-text: "$COMFYUI_PATH or ~/ComfyUI";
+                                    text <=> root.comfyui_folder;
+                                    edited => { root.analyze_requested(); }
+                                }
+                                PillButton {
+                                    text: "📁";
+                                    clicked => { root.pick_comfyui_folder_requested(); }
+                                }
+                                PillButton {
+                                    text: "⚡ Install Node";
+                                    clicked => { root.install_comfyui_node_requested(); }
+                                }
+                                SectionLabel { text: "LoRA folder:"; vertical-alignment: center; }
+                                LineEdit {
+                                    width: 180px;
+                                    height: 30px;
+                                    font-size: 12px;
+                                    placeholder-text: "default: ComfyUI/models/loras";
+                                    text <=> root.lora_folder;
+                                    edited => { root.analyze_requested(); }
+                                }
+                                PillButton {
+                                    text: "📁";
+                                    clicked => { root.pick_lora_folder_requested(); }
+                                }
+                            }
+
+                            // ---- BOOST | SHARED PROMPT, side by side (each shrinks with the window; Slint can't wrap).
+                            // The Shared Prompt counts on every tab (`with_scene`), so it is always shown.
+                            HorizontalLayout {
+                                spacing: 14px;
+                                HorizontalLayout {
+                                    horizontal-stretch: 1;
+                                    min-width: 220px;
+                                    spacing: 6px;
+                                    SectionLabel {
+                                        width: 92px;
+                                        text: "BOOST " + Math.round(root.emphasis_weight * 100) / 100 + "x:";
+                                        color: M3.success;
                                         vertical-alignment: center;
+                                    }
+                                    LineEdit {
+                                        horizontal-stretch: 1;
+                                        min-width: 60px;
                                         font-size: 12px;
-                                        font-weight: 700;
-                                        color: M3.error;
+                                        height: 30px;
+                                        placeholder-text: "Tags to emphasize, e.g. glasses, thick eyebrows";
+                                        text <=> root.pinned_emphasis;
+                                        edited => { root.analyze_requested(); }
+                                    }
+                                    Slider {
+                                        width: 80px;
+                                        minimum: 1.0;
+                                        maximum: 1.5;
+                                        value <=> root.emphasis_weight;
+                                        changed => { root.analyze_requested(); }
                                     }
                                 }
-                                scene-thumb-ta := TouchArea {
-                                    mouse-cursor: MouseCursor.pointer;
-                                    clicked => {
-                                        if root.scene_ref_loaded {
-                                            root.remove_scene_ref_requested();
-                                        } else {
-                                            root.load_scene_ref_requested();
+                                HorizontalLayout {
+                                    horizontal-stretch: 1;
+                                    min-width: 220px;
+                                    spacing: 6px;
+                                    SectionLabel {
+                                        width: 108px;
+                                        text: "SHARED PROMPT:";
+                                        color: M3.info;
+                                        vertical-alignment: center;
+                                    }
+                                    LineEdit {
+                                        horizontal-stretch: 1;
+                                        min-width: 60px;
+                                        font-size: 12px;
+                                        height: 30px;
+                                        placeholder-text: "Setting, camera, lighting & actions for everyone, e.g. tavern table, warm lighting";
+                                        text <=> root.scene_prompt;
+                                        edited => { root.analyze_requested(); }
+                                    }
+                                }
+                            }
+
+                            // ---- SCENE & REFERENCE BAR + LOWERABLE DROPDOWN PANEL (Unified Reference Section)
+                            VerticalLayout {
+                                spacing: 6px;
+                                padding-top: 2px;
+
+                                // 1. Sleek bar with visible previews (clickable to load or remove)
+                                Rectangle {
+                                    background: M3.surface-container;
+                                    border-radius: 10px;
+                                    border-width: 1px;
+                                    border-color: (root.scene_ref_loaded || root.image_loaded || root.char1_image_loaded) ? M3.info-container : M3.outline-variant;
+                                  VerticalLayout {
+                                    HorizontalLayout {
+                                        padding-left: 10px;
+                                        padding-right: 10px;
+                                        padding-top: 5px;
+                                        padding-bottom: 5px;
+                                        spacing: 8px;
+                                        alignment: center;
+
+                                        // Scene Reference Thumbnail (or "+ Scene" slot if not loaded)
+                                        Rectangle {
+                                            width: 56px;
+                                            height: 34px;
+                                            border-radius: 6px;
+                                            border-width: 1.5px;
+                                            border-color: root.scene_ref_loaded ? M3.primary : M3.outline;
+                                            clip: true;
+                                            background: M3.surface-container-high;
+                                            if root.scene_ref_loaded : Image {
+                                                source: root.scene_ref_thumb;
+                                                width: parent.width;
+                                                height: parent.height;
+                                                image-fit: cover;
+                                            }
+                                            if !root.scene_ref_loaded : Text {
+                                                text: "+ Scene";
+                                                font-size: 10px;
+                                                font-weight: 600;
+                                                color: M3.on-surface-variant;
+                                                horizontal-alignment: center;
+                                                vertical-alignment: center;
+                                            }
+                                            if root.scene_ref_loaded && scene-thumb-ta.has-hover : Rectangle {
+                                                background: #000000b8;
+                                                Text {
+                                                    text: "✕";
+                                                    horizontal-alignment: center;
+                                                    vertical-alignment: center;
+                                                    font-size: 12px;
+                                                    font-weight: 700;
+                                                    color: M3.error;
+                                                }
+                                            }
+                                            scene-thumb-ta := TouchArea {
+                                                mouse-cursor: MouseCursor.pointer;
+                                                clicked => {
+                                                    if root.scene_ref_loaded {
+                                                        root.remove_scene_ref_requested();
+                                                    } else {
+                                                        root.load_scene_ref_requested();
+                                                    }
+                                                }
+                                            }
+                                        }
+
+                                        // Optional Split Image slot (full multi-person image)
+                                        if root.image_loaded : Rectangle {
+                                            width: 44px;
+                                            height: 34px;
+                                            border-radius: 6px;
+                                            clip: true;
+                                            background: M3.surface-container-high;
+                                            Image {
+                                                source: root.image_thumb;
+                                                width: parent.width;
+                                                height: parent.height;
+                                                image-fit: cover;
+                                            }
+                                            if split-ta.has-hover : Rectangle {
+                                                background: #000000b0;
+                                                Text { text: "✕"; font-size: 11px; font-weight: 700; color: #ffffff; }
+                                            }
+                                            split-ta := TouchArea {
+                                                mouse-cursor: MouseCursor.pointer;
+                                                clicked => { root.remove_image_requested(); }
+                                            }
+                                        }
+
+                                        // Character 1..4 image preview slots with hover ✕ to remove
+                                        if root.char1_image_loaded : Rectangle {
+                                            width: 28px;
+                                            height: 34px;
+                                            border-radius: 4px;
+                                            border-width: 1px;
+                                            border-color: M3.warning;
+                                            clip: true;
+                                            background: M3.surface-container-high;
+                                            Image { source: root.char1_image_thumb; width: parent.width; height: parent.height; image-fit: cover; }
+                                            if c1-ta.has-hover : Rectangle {
+                                                background: #000000b0;
+                                                Text { text: "✕"; font-size: 10px; font-weight: 700; color: M3.error; }
+                                            }
+                                            c1-ta := TouchArea {
+                                                mouse-cursor: MouseCursor.pointer;
+                                                clicked => { root.remove_char_image_requested(0); }
+                                            }
+                                        }
+                                        if !root.char1_image_loaded : PillButton {
+                                            text: "+ C1";
+                                            clicked => { root.char_image_requested(0); }
+                                        }
+
+                                        if root.app_tab >= 1 && root.char2_image_loaded : Rectangle {
+                                            width: 28px;
+                                            height: 34px;
+                                            border-radius: 4px;
+                                            border-width: 1px;
+                                            border-color: M3.info;
+                                            clip: true;
+                                            background: M3.surface-container-high;
+                                            Image { source: root.char2_image_thumb; width: parent.width; height: parent.height; image-fit: cover; }
+                                            if c2-ta.has-hover : Rectangle {
+                                                background: #000000b0;
+                                                Text { text: "✕"; font-size: 10px; font-weight: 700; color: M3.error; }
+                                            }
+                                            c2-ta := TouchArea {
+                                                mouse-cursor: MouseCursor.pointer;
+                                                clicked => { root.remove_char_image_requested(1); }
+                                            }
+                                        }
+                                        if root.app_tab >= 1 && !root.char2_image_loaded : PillButton {
+                                            text: "+ C2";
+                                            clicked => { root.char_image_requested(1); }
+                                        }
+
+                                        if root.app_tab >= 2 && root.char3_image_loaded : Rectangle {
+                                            width: 28px;
+                                            height: 34px;
+                                            border-radius: 4px;
+                                            border-width: 1px;
+                                            border-color: M3.success;
+                                            clip: true;
+                                            background: M3.surface-container-high;
+                                            Image { source: root.char3_image_thumb; width: parent.width; height: parent.height; image-fit: cover; }
+                                            if c3-ta.has-hover : Rectangle {
+                                                background: #000000b0;
+                                                Text { text: "✕"; font-size: 10px; font-weight: 700; color: M3.error; }
+                                            }
+                                            c3-ta := TouchArea {
+                                                mouse-cursor: MouseCursor.pointer;
+                                                clicked => { root.remove_char_image_requested(2); }
+                                            }
+                                        }
+                                        if root.app_tab >= 2 && !root.char3_image_loaded : PillButton {
+                                            text: "+ C3";
+                                            clicked => { root.char_image_requested(2); }
+                                        }
+
+                                        if root.app_tab >= 3 && root.char4_image_loaded : Rectangle {
+                                            width: 28px;
+                                            height: 34px;
+                                            border-radius: 4px;
+                                            border-width: 1px;
+                                            border-color: M3.tertiary;
+                                            clip: true;
+                                            background: M3.surface-container-high;
+                                            Image { source: root.char4_image_thumb; width: parent.width; height: parent.height; image-fit: cover; }
+                                            if c4-ta.has-hover : Rectangle {
+                                                background: #000000b0;
+                                                Text { text: "✕"; font-size: 10px; font-weight: 700; color: M3.error; }
+                                            }
+                                            c4-ta := TouchArea {
+                                                mouse-cursor: MouseCursor.pointer;
+                                                clicked => { root.remove_char_image_requested(3); }
+                                            }
+                                        }
+                                        if root.app_tab >= 3 && !root.char4_image_loaded : PillButton {
+                                            text: "+ C4";
+                                            clicked => { root.char_image_requested(3); }
+                                        }
+
+                                        // Zone 1 (cont.): load button + status
+                                        if !root.image_loaded : PillButton {
+                                            text: root.app_tab >= 1 ? "🖼 Split Image…" : "🖼 From Image…";
+                                            clicked => { root.load_image_requested(); }
+                                        }
+                                        if root.app_tab == 0 : PillButton {
+                                            text: "📄 From PNG…";
+                                            clicked => { root.png_prompt_requested(); }
+                                        }
+                                        if root.image_can_undo : PillButton {
+                                            text: "↶ Undo";
+                                            clicked => { root.undo_image_prompt_requested(); }
+                                        }
+                                        VerticalLayout {
+                                            horizontal-stretch: 1;
+                                            spacing: 1px;
+                                            alignment: center;
+                                            Text {
+                                                text: root.scene_ref_loaded ? "🌄 SCENE REFERENCE LOADED" : "🌄 REFERENCES & SCENE";
+                                                overflow: elide;
+                                                font-size: 11px;
+                                                font-weight: 700;
+                                                color: (root.scene_ref_loaded || root.image_loaded) ? M3.primary : M3.on-surface;
+                                            }
+                                            Text {
+                                                text: root.scene_ref_loaded
+                                                    ? (root.scene_ref_status != "" ? root.scene_ref_status : "Reference ready: pick what it's used for, then press the main button.")
+                                                    : (root.image_status != "" ? root.image_status : "Load a picture or a scene reference.");
+                                                font-size: 10px;
+                                                color: M3.on-surface-variant;
+                                                overflow: elide;
+                                            }
+                                        }
+
+                                        if !root.narrow : ScanZone {
+                                            image-use-ai <=> root.image_use_ai;
+                                            tagger-busy: root.tagger_busy;
+                                            scene-ref-loaded: root.scene_ref_loaded;
+                                            app-tab: root.app_tab;
+                                            reference-use-index <=> root.reference_use_index;
+                                            image-loaded: root.image_loaded;
+                                            images-pending: root.images_pending;
+                                            char1-image-loaded: root.char1_image_loaded;
+                                            image-advanced <=> root.image_advanced;
+                                            scene-panel-open <=> root.scene_panel_open;
+                                            settings-on: (root.image_identity_only ? 1 : 0) + (root.scene_body_shape ? 1 : 0) + (root.image_second_pass ? 1 : 0) + (root.enable_dual_pass ? 1 : 0);
+                                            image-mode-changed => { root.image_mode_changed(); }
+                                            transfer => { root.transfer_requested(); }
+                                            auto-scene => { root.auto_scene_requested(); }
+                                            read-image => { root.read_image_requested(); }
                                         }
                                     }
-                                }
-                            }
-
-                            // Optional Split Image slot (full multi-person image)
-                            if root.image_loaded : Rectangle {
-                                width: 44px;
-                                height: 34px;
-                                border-radius: 6px;
-                                clip: true;
-                                background: M3.surface-container-high;
-                                Image {
-                                    source: root.image_thumb;
-                                    width: parent.width;
-                                    height: parent.height;
-                                    image-fit: cover;
-                                }
-                                if split-ta.has-hover : Rectangle {
-                                    background: #000000b0;
-                                    Text { text: "✕"; font-size: 11px; font-weight: 700; color: #ffffff; }
-                                }
-                                split-ta := TouchArea {
-                                    mouse-cursor: MouseCursor.pointer;
-                                    clicked => { root.remove_image_requested(); }
-                                }
-                            }
-
-                            // Character 1..4 image preview slots with hover ✕ to remove
-                            if root.char1_image_loaded : Rectangle {
-                                width: 28px;
-                                height: 34px;
-                                border-radius: 4px;
-                                border-width: 1px;
-                                border-color: M3.warning;
-                                clip: true;
-                                background: M3.surface-container-high;
-                                Image { source: root.char1_image_thumb; width: parent.width; height: parent.height; image-fit: cover; }
-                                if c1-ta.has-hover : Rectangle {
-                                    background: #000000b0;
-                                    Text { text: "✕"; font-size: 10px; font-weight: 700; color: M3.error; }
-                                }
-                                c1-ta := TouchArea {
-                                    mouse-cursor: MouseCursor.pointer;
-                                    clicked => { root.remove_char_image_requested(0); }
-                                }
-                            }
-                            if !root.char1_image_loaded : PillButton {
-                                text: "+ C1";
-                                clicked => { root.char_image_requested(0); }
-                            }
-
-                            if root.app_tab >= 1 && root.char2_image_loaded : Rectangle {
-                                width: 28px;
-                                height: 34px;
-                                border-radius: 4px;
-                                border-width: 1px;
-                                border-color: M3.info;
-                                clip: true;
-                                background: M3.surface-container-high;
-                                Image { source: root.char2_image_thumb; width: parent.width; height: parent.height; image-fit: cover; }
-                                if c2-ta.has-hover : Rectangle {
-                                    background: #000000b0;
-                                    Text { text: "✕"; font-size: 10px; font-weight: 700; color: M3.error; }
-                                }
-                                c2-ta := TouchArea {
-                                    mouse-cursor: MouseCursor.pointer;
-                                    clicked => { root.remove_char_image_requested(1); }
-                                }
-                            }
-                            if root.app_tab >= 1 && !root.char2_image_loaded : PillButton {
-                                text: "+ C2";
-                                clicked => { root.char_image_requested(1); }
-                            }
-
-                            if root.app_tab >= 2 && root.char3_image_loaded : Rectangle {
-                                width: 28px;
-                                height: 34px;
-                                border-radius: 4px;
-                                border-width: 1px;
-                                border-color: M3.success;
-                                clip: true;
-                                background: M3.surface-container-high;
-                                Image { source: root.char3_image_thumb; width: parent.width; height: parent.height; image-fit: cover; }
-                                if c3-ta.has-hover : Rectangle {
-                                    background: #000000b0;
-                                    Text { text: "✕"; font-size: 10px; font-weight: 700; color: M3.error; }
-                                }
-                                c3-ta := TouchArea {
-                                    mouse-cursor: MouseCursor.pointer;
-                                    clicked => { root.remove_char_image_requested(2); }
-                                }
-                            }
-                            if root.app_tab >= 2 && !root.char3_image_loaded : PillButton {
-                                text: "+ C3";
-                                clicked => { root.char_image_requested(2); }
-                            }
-
-                            if root.app_tab >= 3 && root.char4_image_loaded : Rectangle {
-                                width: 28px;
-                                height: 34px;
-                                border-radius: 4px;
-                                border-width: 1px;
-                                border-color: M3.tertiary;
-                                clip: true;
-                                background: M3.surface-container-high;
-                                Image { source: root.char4_image_thumb; width: parent.width; height: parent.height; image-fit: cover; }
-                                if c4-ta.has-hover : Rectangle {
-                                    background: #000000b0;
-                                    Text { text: "✕"; font-size: 10px; font-weight: 700; color: M3.error; }
-                                }
-                                c4-ta := TouchArea {
-                                    mouse-cursor: MouseCursor.pointer;
-                                    clicked => { root.remove_char_image_requested(3); }
-                                }
-                            }
-                            if root.app_tab >= 3 && !root.char4_image_loaded : PillButton {
-                                text: "+ C4";
-                                clicked => { root.char_image_requested(3); }
-                            }
-
-                            // Zone 1 (cont.): load button + status
-                            if !root.image_loaded : PillButton {
-                                text: root.app_tab >= 1 ? "🖼 Split Image…" : "🖼 From Image…";
-                                clicked => { root.load_image_requested(); }
-                            }
-                            VerticalLayout {
-                                horizontal-stretch: 1;
-                                spacing: 1px;
-                                alignment: center;
-                                Text {
-                                    text: root.scene_ref_loaded ? "🌄 SCENE REFERENCE LOADED" : "🌄 REFERENCES & SCENE";
-                                    font-size: 11px;
-                                    font-weight: 700;
-                                    color: (root.scene_ref_loaded || root.image_loaded) ? M3.primary : M3.on-surface;
-                                }
-                                Text {
-                                    text: root.scene_ref_loaded
-                                        ? (root.scene_ref_status != "" ? root.scene_ref_status : "Reference ready: pick what it's used for, then press the main button.")
-                                        : (root.image_status != "" ? root.image_status : "Load a picture or a scene reference.");
-                                    font-size: 10px;
-                                    color: M3.on-surface-variant;
-                                    overflow: elide;
-                                }
-                            }
-
-                            Rectangle { width: 1px; height: 26px; background: M3.outline-variant; }
-
-                            // Zone 2: scan engine (+ what the reference is used for, 1 Character tab)
-                            PillButton {
-                                text: "⚡ Fast Tagger";
-                                primary: !root.image_use_ai;
-                                enabled: !root.tagger_busy;
-                                clicked => { root.image_use_ai = false; root.image_mode_changed(); }
-                            }
-                            PillButton {
-                                text: "🧠 Combined AI";
-                                primary: root.image_use_ai;
-                                enabled: !root.tagger_busy;
-                                clicked => { root.image_use_ai = true; root.image_mode_changed(); }
-                            }
-                            if root.scene_ref_loaded && root.app_tab == 0 : ComboBox {
-                                width: 160px;
-                                model: ["Scene & pose", "Identity transfer", "Outfit transfer", "Atmosphere"];
-                                current-index <=> root.reference_use_index;
-                            }
-
-                            Rectangle { width: 1px; height: 26px; background: M3.outline-variant; }
-
-                            // Zone 3: one main action, then the drawers
-                            PillButton {
-                                property <bool> transfer: root.scene_ref_loaded && root.app_tab == 0 && root.reference_use_index > 0;
-                                property <bool> auto-scene: root.scene_ref_loaded && !root.image_use_ai && !root.image_loaded && !root.images_pending && !root.char1_image_loaded;
-                                primary: true;
-                                text: root.tagger_busy ? "Scanning…" : (self.transfer ? "⇄ Transfer" : (self.auto-scene ? "⚡ Auto Scene" : "⚡ Scan Image"));
-                                enabled: !root.tagger_busy && (self.transfer || self.auto-scene || root.image_loaded || root.images_pending || root.scene_ref_loaded || root.char1_image_loaded);
-                                clicked => {
-                                    if self.transfer {
-                                        root.transfer_requested();
-                                    } else if self.auto-scene {
-                                        root.auto_scene_requested();
-                                    } else {
-                                        root.read_image_requested();
+                                    // narrow window: the scan engine, main action and drawers on their own row
+                                    if root.narrow : HorizontalLayout {
+                                        padding-left: 10px;
+                                        padding-right: 10px;
+                                        padding-bottom: 5px;
+                                        alignment: end;
+                                        ScanZone {
+                                            image-use-ai <=> root.image_use_ai;
+                                            tagger-busy: root.tagger_busy;
+                                            scene-ref-loaded: root.scene_ref_loaded;
+                                            app-tab: root.app_tab;
+                                            reference-use-index <=> root.reference_use_index;
+                                            image-loaded: root.image_loaded;
+                                            images-pending: root.images_pending;
+                                            char1-image-loaded: root.char1_image_loaded;
+                                            image-advanced <=> root.image_advanced;
+                                            scene-panel-open <=> root.scene_panel_open;
+                                            settings-on: (root.image_identity_only ? 1 : 0) + (root.scene_body_shape ? 1 : 0) + (root.image_second_pass ? 1 : 0) + (root.enable_dual_pass ? 1 : 0);
+                                            image-mode-changed => { root.image_mode_changed(); }
+                                            transfer => { root.transfer_requested(); }
+                                            auto-scene => { root.auto_scene_requested(); }
+                                            read-image => { root.read_image_requested(); }
+                                        }
                                     }
+                                  }
                                 }
-                            }
-                            // the fast per-character pose / scene read of the reference stays reachable when the
-                            // main button does something else
-                            if root.scene_ref_loaded && (root.image_use_ai || root.image_loaded || root.images_pending || root.char1_image_loaded || (root.app_tab == 0 && root.reference_use_index > 0)) : PillButton {
-                                text: "⚡ Auto Scene";
-                                enabled: !root.tagger_busy;
-                                clicked => { root.auto_scene_requested(); }
-                            }
-                            PillButton {
-                                property <int> on: (root.image_identity_only ? 1 : 0) + (root.scene_body_shape ? 1 : 0) + (root.image_second_pass ? 1 : 0) + (root.enable_dual_pass ? 1 : 0);
-                                text: (root.image_advanced ? "⚙ Settings ▴" : "⚙ Settings ▾") + (self.on > 0 ? " · " + self.on + " on" : "");
-                                primary: root.image_advanced;
-                                clicked => { root.image_advanced = !root.image_advanced; }
-                            }
-                            PillButton {
-                                text: root.scene_panel_open ? "Scene Panel ▴" : "Scene Panel ▾";
-                                primary: root.scene_panel_open;
-                                clicked => { root.scene_panel_open = !root.scene_panel_open; }
-                            }
-                        }
-                    }
 
-                    // Vision settings drawer ("⚙ Settings")
-                    if root.image_advanced : Rectangle {
-                        background: M3.surface-container;
-                        border-radius: 10px;
-                        border-width: 1px;
-                        border-color: M3.outline-variant;
-                        VerticalLayout {
-                            padding: 10px;
-                            spacing: 8px;
-                            HorizontalLayout {
-                                spacing: 10px;
-                                SectionLabel { text: "SENSITIVITY (THRESHOLD):"; vertical-alignment: center; }
-                                Slider {
-                                    horizontal-stretch: 1;
-                                    minimum: 0.15;
-                                    maximum: 0.60;
-                                    value <=> root.tag_threshold;
-                                    released => { root.tag_threshold_changed(); }
-                                }
-                                Text {
-                                    text: Math.round(root.tag_threshold * 100) / 100;
-                                    font-size: 12px;
-                                    color: M3.on-surface;
-                                    vertical-alignment: center;
-                                    min-width: 32px;
-                                }
-                                Text {
-                                    text: "lower = more tags";
-                                    font-size: 10px;
-                                    color: M3.on-surface-variant;
-                                    vertical-alignment: center;
-                                }
-                            }
-                            HorizontalLayout {
-                                spacing: 8px;
-                                alignment: start;
-                                SectionLabel { text: "FILTERS:"; vertical-alignment: center; }
-                                FilterChip {
-                                    text: "Identity Only";
-                                    checked <=> root.image_identity_only;
-                                    enabled: !root.tagger_busy;
-                                    toggled => { root.identity_changed(); }
-                                }
-                                if !root.enable_dual_pass : FilterChip {
-                                    text: "Scene Body Shape";
-                                    checked <=> root.scene_body_shape;
-                                    enabled: !root.tagger_busy;
-                                    toggled => { root.scene_body_shape_changed(); }
-                                }
-                                FilterChip {
-                                    text: "2nd Pass Visual Check";
-                                    checked <=> root.image_second_pass;
-                                    enabled: !root.tagger_busy && (!root.enable_dual_pass || root.use_llm_synthesis);
-                                    toggled => { root.second_pass_changed(); }
-                                }
-                                PillButton {
-                                    text: "↻ Flush Vision Cache";
-                                    enabled: !root.tagger_busy && (root.image_loaded || root.images_pending || root.scene_ref_loaded || root.char1_image_loaded);
-                                    clicked => { root.redo_image_requested(); }
-                                }
-                            }
-                            HorizontalLayout {
-                                spacing: 8px;
-                                alignment: start;
-                                SectionLabel { text: "ADVANCED:"; vertical-alignment: center; }
-                                FilterChip {
-                                    text: "Dual-Pass Vision";
-                                    checked <=> root.enable_dual_pass;
-                                    enabled: !root.tagger_busy;
-                                    toggled => { root.dual_pass_changed(); }
-                                }
-                                if root.enable_dual_pass : ComboBox {
-                                    width: 175px;
-                                    model: root.dual_pass_mode_labels;
-                                    current-index <=> root.dual_pass_mode_index;
-                                    enabled: !root.tagger_busy;
-                                    selected => { root.dual_pass_mode_changed(); }
-                                }
-                                if root.enable_dual_pass : FilterChip {
-                                    text: "LLM Synthesis";
-                                    checked <=> root.use_llm_synthesis;
-                                    enabled: !root.tagger_busy;
-                                    toggled => { root.llm_synthesis_changed(); }
-                                }
-                            }
-                        }
-                    }
-
-                    // Dual-pass / pipeline warnings notice area
-                    if root.pipeline_warnings != "" : Rectangle {
-                        background: #ffb4a924;
-                        border-radius: 6px;
-                        border-width: 1px;
-                        border-color: M3.error;
-                        HorizontalLayout {
-                            padding-left: 10px;
-                            padding-right: 10px;
-                            padding-top: 6px;
-                            padding-bottom: 6px;
-                            spacing: 8px;
-                            alignment: start;
-                            Text {
-                                text: "⚠ Pipeline Notice: " + root.pipeline_warnings;
-                                font-size: 11px;
-                                color: M3.error;
-                                overflow: elide;
-                                vertical-alignment: center;
-                            }
-                            Rectangle { horizontal-stretch: 1; }
-                            TouchArea {
-                                width: 20px;
-                                height: 20px;
-                                mouse-cursor: MouseCursor.pointer;
-                                clicked => { root.pipeline_warnings = ""; }
-                                Text {
-                                    text: "✕";
-                                    font-size: 12px;
-                                    font-weight: 700;
-                                    color: M3.error;
-                                    horizontal-alignment: center;
-                                    vertical-alignment: center;
-                                }
-                            }
-                        }
-                    }
-
-                    // 2. Lowerable Scene Inspector & Advanced Overrides Panel
-                    if root.scene_panel_open : Rectangle {
-                        background: M3.surface-container-high;
-                        border-radius: 12px;
-                        border-width: 1.5px;
-                        border-color: M3.primary;
-                        VerticalLayout {
-                            padding: 10px;
-                            spacing: 8px;
-
-                            // Scene Setting & Lighting Header row
-                            HorizontalLayout {
-                                spacing: 8px;
-                                alignment: center;
-                                Text {
-                                    text: "🌄 SCENE & LIGHTING (Live & Editable):";
-                                    font-size: 11px;
-                                    font-weight: 700;
-                                    color: M3.primary;
-                                    vertical-alignment: center;
-                                }
-                                Text {
-                                    text: "— Extends across horizontal bar, edits update output prompt";
-                                    font-size: 10px;
-                                    color: M3.on-surface-variant;
-                                    vertical-alignment: center;
-                                }
-                                Rectangle { horizontal-stretch: 1; }
-                                PillButton {
-                                    text: root.scene_adv_open ? "⚙ Advanced Settings ▴" : "⚙ Advanced Settings ▾";
-                                    primary: root.scene_adv_open;
-                                    clicked => { root.scene_adv_open = !root.scene_adv_open; }
-                                }
-                            }
-
-                            // Full-width bar extending across the horizontal container
-                            Rectangle {
-                                horizontal-stretch: 1;
-                                min-height: 48px;
-                                background: M3.surface-container-low;
-                                border-radius: 6px;
-                                border-width: 1.5px;
-                                border-color: M3.primary;
-
-                                VerticalLayout {
-                                    padding: 6px;
-                                    TextEdit {
-                                        horizontal-stretch: 1;
-                                        vertical-stretch: 1;
-                                        font-size: 11px;
-                                        wrap: word-wrap;
-                                        // two-way: a one-way `text:` stops following the property once
-                                        // you type in it, and later Auto Scene results wouldn't show
-                                        text <=> root.scene_override_setting;
-                                        edited => { root.scene_overrides_changed(); }
-                                    }
-                                }
-                            }
-
-                            // Horizontal character cards
-                            HorizontalLayout {
-                                spacing: 8px;
-                                min-height: 80px;
-                                for c[idx] in root.scene_panel_chars : Rectangle {
-                                    horizontal-stretch: 1;
+                                // Vision settings drawer ("⚙ Settings")
+                                if root.image_advanced : Rectangle {
                                     background: M3.surface-container;
-                                    border-radius: 8px;
+                                    border-radius: 10px;
                                     border-width: 1px;
                                     border-color: M3.outline-variant;
                                     VerticalLayout {
-                                        padding: 8px;
-                                        spacing: 6px;
+                                        padding: 10px;
+                                        spacing: 8px;
                                         HorizontalLayout {
-                                            spacing: 4px;
+                                            spacing: 10px;
+                                            SectionLabel { text: "SENSITIVITY (THRESHOLD):"; vertical-alignment: center; }
+                                            Slider {
+                                                horizontal-stretch: 1;
+                                                minimum: 0.15;
+                                                maximum: 0.60;
+                                                value <=> root.tag_threshold;
+                                                released => { root.tag_threshold_changed(); }
+                                            }
+                                            Text {
+                                                text: Math.round(root.tag_threshold * 100) / 100;
+                                                font-size: 12px;
+                                                color: M3.on-surface;
+                                                vertical-alignment: center;
+                                                min-width: 32px;
+                                            }
+                                            Text {
+                                                text: "lower = more tags";
+                                                font-size: 10px;
+                                                color: M3.on-surface-variant;
+                                                vertical-alignment: center;
+                                            }
+                                        }
+                                        HorizontalLayout {
+                                            spacing: 8px;
+                                            alignment: start;
+                                            SectionLabel { text: "FILTERS:"; vertical-alignment: center; }
+                                            FilterChip {
+                                                text: "Identity Only";
+                                                checked <=> root.image_identity_only;
+                                                enabled: !root.tagger_busy;
+                                                toggled => { root.identity_changed(); }
+                                            }
+                                            if !root.enable_dual_pass : FilterChip {
+                                                text: "Scene Body Shape";
+                                                checked <=> root.scene_body_shape;
+                                                enabled: !root.tagger_busy;
+                                                toggled => { root.scene_body_shape_changed(); }
+                                            }
+                                            FilterChip {
+                                                text: "2nd Pass Visual Check";
+                                                checked <=> root.image_second_pass;
+                                                enabled: !root.tagger_busy && (!root.enable_dual_pass || root.use_llm_synthesis);
+                                                toggled => { root.second_pass_changed(); }
+                                            }
+                                            PillButton {
+                                                text: "↻ Flush Vision Cache";
+                                                enabled: !root.tagger_busy && (root.image_loaded || root.images_pending || root.scene_ref_loaded || root.char1_image_loaded);
+                                                clicked => { root.redo_image_requested(); }
+                                            }
+                                        }
+                                        HorizontalLayout {
+                                            spacing: 8px;
+                                            alignment: start;
+                                            SectionLabel { text: "ADVANCED:"; vertical-alignment: center; }
+                                            FilterChip {
+                                                text: "Dual-Pass Vision";
+                                                checked <=> root.enable_dual_pass;
+                                                enabled: !root.tagger_busy;
+                                                toggled => { root.dual_pass_changed(); }
+                                            }
+                                            if root.enable_dual_pass : ComboBox {
+                                                width: 175px;
+                                                model: root.dual_pass_mode_labels;
+                                                current-index <=> root.dual_pass_mode_index;
+                                                enabled: !root.tagger_busy;
+                                                selected => { root.dual_pass_mode_changed(); }
+                                            }
+                                            if root.enable_dual_pass : FilterChip {
+                                                text: "LLM Synthesis";
+                                                checked <=> root.use_llm_synthesis;
+                                                enabled: !root.tagger_busy;
+                                                toggled => { root.llm_synthesis_changed(); }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // Dual-pass / pipeline warnings notice area
+                                if root.pipeline_warnings != "" : Rectangle {
+                                    background: #ffb4a924;
+                                    border-radius: 6px;
+                                    border-width: 1px;
+                                    border-color: M3.error;
+                                    HorizontalLayout {
+                                        padding-left: 10px;
+                                        padding-right: 10px;
+                                        padding-top: 6px;
+                                        padding-bottom: 6px;
+                                        spacing: 8px;
+                                        alignment: start;
+                                        Text {
+                                            text: "⚠ Pipeline Notice: " + root.pipeline_warnings;
+                                            font-size: 11px;
+                                            color: M3.error;
+                                            overflow: elide;
+                                            vertical-alignment: center;
+                                        }
+                                        Rectangle { horizontal-stretch: 1; }
+                                        TouchArea {
+                                            width: 20px;
+                                            height: 20px;
+                                            mouse-cursor: MouseCursor.pointer;
+                                            clicked => { root.pipeline_warnings = ""; }
+                                            Text {
+                                                text: "✕";
+                                                font-size: 12px;
+                                                font-weight: 700;
+                                                color: M3.error;
+                                                horizontal-alignment: center;
+                                                vertical-alignment: center;
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // 2. Lowerable Scene Inspector & Advanced Overrides Panel
+                                if root.scene_panel_open : Rectangle {
+                                    background: M3.surface-container-high;
+                                    border-radius: 12px;
+                                    border-width: 1.5px;
+                                    border-color: M3.primary;
+                                    VerticalLayout {
+                                        padding: 10px;
+                                        spacing: 8px;
+
+                                        // Scene Setting & Lighting Header row
+                                        HorizontalLayout {
+                                            spacing: 8px;
                                             alignment: center;
                                             Text {
-                                                text: c.title;
+                                                text: "🌄 SCENE & LIGHTING (Live & Editable):";
                                                 font-size: 11px;
                                                 font-weight: 700;
-                                                color: idx == 0 ? M3.warning : idx == 1 ? M3.info : idx == 2 ? M3.success : M3.tertiary;
+                                                color: M3.primary;
+                                                vertical-alignment: center;
+                                            }
+                                            Text {
+                                                text: "— Extends across horizontal bar, edits update output prompt";
+                                                font-size: 10px;
+                                                color: M3.on-surface-variant;
                                                 vertical-alignment: center;
                                             }
                                             Rectangle { horizontal-stretch: 1; }
-                                            if c.has_actions : PillButton {
-                                                text: "✕ Clear";
-                                                clicked => { root.scene_char_clear_requested(idx); }
+                                            PillButton {
+                                                text: root.scene_adv_open ? "⚙ Advanced Settings ▴" : "⚙ Advanced Settings ▾";
+                                                primary: root.scene_adv_open;
+                                                clicked => { root.scene_adv_open = !root.scene_adv_open; }
                                             }
                                         }
 
-                                        // per-character View | Angle | Pose
-                                        HorizontalLayout {
-                                            spacing: 4px;
-                                            ComboBox {
-                                                horizontal-stretch: 1;
-                                                min-width: 90px;
-                                                model: root.scene_view_labels;
-                                                current-index: c.view_index;
-                                                selected(val) => { root.scene_view_selected(idx, val); }
-                                            }
-                                            ComboBox {
-                                                horizontal-stretch: 1;
-                                                min-width: 90px;
-                                                model: root.scene_angle_labels;
-                                                current-index: c.angle_index;
-                                                selected(val) => { root.scene_angle_selected(idx, val); }
-                                            }
-                                            ComboBox {
-                                                horizontal-stretch: 1;
-                                                min-width: 90px;
-                                                model: root.scene_pose_labels;
-                                                current-index: c.pose_index;
-                                                selected(val) => { root.scene_pose_selected(idx, val); }
+                                        // Full-width bar extending across the horizontal container
+                                        Rectangle {
+                                            horizontal-stretch: 1;
+                                            min-height: 48px;
+                                            background: M3.surface-container-low;
+                                            border-radius: 6px;
+                                            border-width: 1.5px;
+                                            border-color: M3.primary;
+
+                                            VerticalLayout {
+                                                padding: 6px;
+                                                TextEdit {
+                                                    horizontal-stretch: 1;
+                                                    vertical-stretch: 1;
+                                                    font-size: 11px;
+                                                    wrap: word-wrap;
+                                                    // two-way: a one-way `text:` stops following the property once
+                                                    // you type in it, and later Auto Scene results wouldn't show
+                                                    text <=> root.scene_override_setting;
+                                                    edited => { root.scene_overrides_changed(); }
+                                                }
                                             }
                                         }
 
-                                        // Character Reference thumbnail preview / upload inside the card
+                                        // Horizontal character cards
                                         HorizontalLayout {
-                                            spacing: 6px;
-                                            alignment: start;
-                                            if (idx == 0 && root.char1_image_loaded) : Rectangle {
-                                                width: 28px; height: 36px; border-radius: 4px; clip: true;
-                                                Image { source: root.char1_image_thumb; width: parent.width; height: parent.height; image-fit: cover; }
-                                                if ic1-ta.has-hover : Rectangle {
-                                                    background: #000000b0;
-                                                    Text { text: "✕"; font-size: 10px; font-weight: 700; color: M3.error; }
-                                                }
-                                                ic1-ta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.remove_char_image_requested(0); } }
-                                            }
-                                            if (idx == 0 && !root.char1_image_loaded) : Rectangle {
-                                                width: 28px; height: 36px; border-radius: 4px;
-                                                background: M3.surface-container-low;
-                                                border-width: 1px; border-color: M3.outline-variant;
-                                                Text { text: "+"; font-size: 14px; font-weight: 700; color: M3.primary; }
-                                                TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.char_image_requested(0); } }
-                                            }
-                                            if (idx == 1 && root.char2_image_loaded) : Rectangle {
-                                                width: 28px; height: 36px; border-radius: 4px; clip: true;
-                                                Image { source: root.char2_image_thumb; width: parent.width; height: parent.height; image-fit: cover; }
-                                                if ic2-ta.has-hover : Rectangle {
-                                                    background: #000000b0;
-                                                    Text { text: "✕"; font-size: 10px; font-weight: 700; color: M3.error; }
-                                                }
-                                                ic2-ta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.remove_char_image_requested(1); } }
-                                            }
-                                            if (idx == 1 && !root.char2_image_loaded) : Rectangle {
-                                                width: 28px; height: 36px; border-radius: 4px;
-                                                background: M3.surface-container-low;
-                                                border-width: 1px; border-color: M3.outline-variant;
-                                                Text { text: "+"; font-size: 14px; font-weight: 700; color: M3.info; }
-                                                TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.char_image_requested(1); } }
-                                            }
-                                            if (idx == 2 && root.char3_image_loaded) : Rectangle {
-                                                width: 28px; height: 36px; border-radius: 4px; clip: true;
-                                                Image { source: root.char3_image_thumb; width: parent.width; height: parent.height; image-fit: cover; }
-                                                if ic3-ta.has-hover : Rectangle {
-                                                    background: #000000b0;
-                                                    Text { text: "✕"; font-size: 10px; font-weight: 700; color: M3.error; }
-                                                }
-                                                ic3-ta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.remove_char_image_requested(2); } }
-                                            }
-                                            if (idx == 2 && !root.char3_image_loaded) : Rectangle {
-                                                width: 28px; height: 36px; border-radius: 4px;
-                                                background: M3.surface-container-low;
-                                                border-width: 1px; border-color: M3.outline-variant;
-                                                Text { text: "+"; font-size: 14px; font-weight: 700; color: M3.success; }
-                                                TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.char_image_requested(2); } }
-                                            }
-                                            if (idx == 3 && root.char4_image_loaded) : Rectangle {
-                                                width: 28px; height: 36px; border-radius: 4px; clip: true;
-                                                Image { source: root.char4_image_thumb; width: parent.width; height: parent.height; image-fit: cover; }
-                                                if ic4-ta.has-hover : Rectangle {
-                                                    background: #000000b0;
-                                                    Text { text: "✕"; font-size: 10px; font-weight: 700; color: M3.error; }
-                                                }
-                                                ic4-ta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.remove_char_image_requested(3); } }
-                                            }
-                                            if (idx == 3 && !root.char4_image_loaded) : Rectangle {
-                                                width: 28px; height: 36px; border-radius: 4px;
-                                                background: M3.surface-container-low;
-                                                border-width: 1px; border-color: M3.outline-variant;
-                                                Text { text: "+"; font-size: 14px; font-weight: 700; color: M3.tertiary; }
-                                                TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.char_image_requested(3); } }
-                                            }
-
-                                            Rectangle {
+                                            spacing: 8px;
+                                            min-height: 80px;
+                                            for c[idx] in root.scene_panel_chars : Rectangle {
                                                 horizontal-stretch: 1;
-                                                min-height: 48px;
-                                                background: M3.surface-container-low;
-                                                border-radius: 6px;
+                                                background: M3.surface-container;
+                                                border-radius: 8px;
                                                 border-width: 1px;
                                                 border-color: M3.outline-variant;
-
                                                 VerticalLayout {
-                                                    padding: 4px;
-                                                    TextEdit {
-                                                        text: c.actions;
-                                                        font-size: 11px;
-                                                        wrap: word-wrap;
-                                                        horizontal-stretch: 1;
-                                                        vertical-stretch: 1;
-                                                        edited => {
-                                                            root.scene_char_text_edited(idx, self.text);
+                                                    padding: 8px;
+                                                    spacing: 6px;
+                                                    HorizontalLayout {
+                                                        spacing: 4px;
+                                                        alignment: center;
+                                                        Text {
+                                                            text: c.title;
+                                                            font-size: 11px;
+                                                            font-weight: 700;
+                                                            color: idx == 0 ? M3.warning : idx == 1 ? M3.info : idx == 2 ? M3.success : M3.tertiary;
+                                                            vertical-alignment: center;
+                                                        }
+                                                        Rectangle { horizontal-stretch: 1; }
+                                                        if c.has_actions : PillButton {
+                                                            text: "✕ Clear";
+                                                            clicked => { root.scene_char_clear_requested(idx); }
+                                                        }
+                                                    }
+
+                                                    // per-character View | Angle | Pose
+                                                    HorizontalLayout {
+                                                        spacing: 4px;
+                                                        ComboBox {
+                                                            horizontal-stretch: 1;
+                                                            min-width: 90px;
+                                                            model: root.scene_view_labels;
+                                                            current-index: c.view_index;
+                                                            selected(val) => { root.scene_view_selected(idx, val); }
+                                                        }
+                                                        ComboBox {
+                                                            horizontal-stretch: 1;
+                                                            min-width: 90px;
+                                                            model: root.scene_angle_labels;
+                                                            current-index: c.angle_index;
+                                                            selected(val) => { root.scene_angle_selected(idx, val); }
+                                                        }
+                                                        ComboBox {
+                                                            horizontal-stretch: 1;
+                                                            min-width: 90px;
+                                                            model: root.scene_pose_labels;
+                                                            current-index: c.pose_index;
+                                                            selected(val) => { root.scene_pose_selected(idx, val); }
+                                                        }
+                                                    }
+
+                                                    // Character Reference thumbnail preview / upload inside the card
+                                                    HorizontalLayout {
+                                                        spacing: 6px;
+                                                        alignment: start;
+                                                        if (idx == 0 && root.char1_image_loaded) : Rectangle {
+                                                            width: 28px; height: 36px; border-radius: 4px; clip: true;
+                                                            Image { source: root.char1_image_thumb; width: parent.width; height: parent.height; image-fit: cover; }
+                                                            if ic1-ta.has-hover : Rectangle {
+                                                                background: #000000b0;
+                                                                Text { text: "✕"; font-size: 10px; font-weight: 700; color: M3.error; }
+                                                            }
+                                                            ic1-ta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.remove_char_image_requested(0); } }
+                                                        }
+                                                        if (idx == 0 && !root.char1_image_loaded) : Rectangle {
+                                                            width: 28px; height: 36px; border-radius: 4px;
+                                                            background: M3.surface-container-low;
+                                                            border-width: 1px; border-color: M3.outline-variant;
+                                                            Text { text: "+"; font-size: 14px; font-weight: 700; color: M3.primary; }
+                                                            TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.char_image_requested(0); } }
+                                                        }
+                                                        if (idx == 1 && root.char2_image_loaded) : Rectangle {
+                                                            width: 28px; height: 36px; border-radius: 4px; clip: true;
+                                                            Image { source: root.char2_image_thumb; width: parent.width; height: parent.height; image-fit: cover; }
+                                                            if ic2-ta.has-hover : Rectangle {
+                                                                background: #000000b0;
+                                                                Text { text: "✕"; font-size: 10px; font-weight: 700; color: M3.error; }
+                                                            }
+                                                            ic2-ta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.remove_char_image_requested(1); } }
+                                                        }
+                                                        if (idx == 1 && !root.char2_image_loaded) : Rectangle {
+                                                            width: 28px; height: 36px; border-radius: 4px;
+                                                            background: M3.surface-container-low;
+                                                            border-width: 1px; border-color: M3.outline-variant;
+                                                            Text { text: "+"; font-size: 14px; font-weight: 700; color: M3.info; }
+                                                            TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.char_image_requested(1); } }
+                                                        }
+                                                        if (idx == 2 && root.char3_image_loaded) : Rectangle {
+                                                            width: 28px; height: 36px; border-radius: 4px; clip: true;
+                                                            Image { source: root.char3_image_thumb; width: parent.width; height: parent.height; image-fit: cover; }
+                                                            if ic3-ta.has-hover : Rectangle {
+                                                                background: #000000b0;
+                                                                Text { text: "✕"; font-size: 10px; font-weight: 700; color: M3.error; }
+                                                            }
+                                                            ic3-ta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.remove_char_image_requested(2); } }
+                                                        }
+                                                        if (idx == 2 && !root.char3_image_loaded) : Rectangle {
+                                                            width: 28px; height: 36px; border-radius: 4px;
+                                                            background: M3.surface-container-low;
+                                                            border-width: 1px; border-color: M3.outline-variant;
+                                                            Text { text: "+"; font-size: 14px; font-weight: 700; color: M3.success; }
+                                                            TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.char_image_requested(2); } }
+                                                        }
+                                                        if (idx == 3 && root.char4_image_loaded) : Rectangle {
+                                                            width: 28px; height: 36px; border-radius: 4px; clip: true;
+                                                            Image { source: root.char4_image_thumb; width: parent.width; height: parent.height; image-fit: cover; }
+                                                            if ic4-ta.has-hover : Rectangle {
+                                                                background: #000000b0;
+                                                                Text { text: "✕"; font-size: 10px; font-weight: 700; color: M3.error; }
+                                                            }
+                                                            ic4-ta := TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.remove_char_image_requested(3); } }
+                                                        }
+                                                        if (idx == 3 && !root.char4_image_loaded) : Rectangle {
+                                                            width: 28px; height: 36px; border-radius: 4px;
+                                                            background: M3.surface-container-low;
+                                                            border-width: 1px; border-color: M3.outline-variant;
+                                                            Text { text: "+"; font-size: 14px; font-weight: 700; color: M3.tertiary; }
+                                                            TouchArea { mouse-cursor: MouseCursor.pointer; clicked => { root.char_image_requested(3); } }
+                                                        }
+
+                                                        Rectangle {
+                                                            horizontal-stretch: 1;
+                                                            min-height: 48px;
+                                                            background: M3.surface-container-low;
+                                                            border-radius: 6px;
+                                                            border-width: 1px;
+                                                            border-color: M3.outline-variant;
+
+                                                            VerticalLayout {
+                                                                padding: 4px;
+                                                                TextEdit {
+                                                                    text: c.actions;
+                                                                    font-size: 11px;
+                                                                    wrap: word-wrap;
+                                                                    horizontal-stretch: 1;
+                                                                    vertical-stretch: 1;
+                                                                    edited => {
+                                                                        root.scene_char_text_edited(idx, self.text);
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+
+                                                    // Quick Reassign / Move buttons
+                                                    HorizontalLayout {
+                                                        spacing: 4px;
+                                                        alignment: start;
+                                                        if idx == 0 && root.app_tab >= 1 && c.has_actions : PillButton {
+                                                            text: "→ Move to C2";
+                                                            clicked => { root.scene_action_move_requested(0, 1); }
+                                                        }
+                                                        if idx == 1 && c.has_actions : PillButton {
+                                                            text: "← Move to C1";
+                                                            clicked => { root.scene_action_move_requested(1, 0); }
+                                                        }
+                                                        if idx == 1 && root.app_tab >= 2 && c.has_actions : PillButton {
+                                                            text: "→ Move to C3";
+                                                            clicked => { root.scene_action_move_requested(1, 2); }
+                                                        }
+                                                        if idx == 2 && c.has_actions : PillButton {
+                                                            text: "← Move to C2";
+                                                            clicked => { root.scene_action_move_requested(2, 1); }
                                                         }
                                                     }
                                                 }
                                             }
                                         }
 
-                                        // Quick Reassign / Move buttons
-                                        HorizontalLayout {
-                                            spacing: 4px;
-                                            alignment: start;
-                                            if idx == 0 && root.app_tab >= 1 && c.has_actions : PillButton {
-                                                text: "→ Move to C2";
-                                                clicked => { root.scene_action_move_requested(0, 1); }
+                                        // Advanced Settings Drawer (Prompt Overrides)
+                                        if root.scene_adv_open : Rectangle {
+                                            background: M3.surface-container;
+                                            border-radius: 8px;
+                                            border-width: 1px;
+                                            border-color: M3.secondary-container;
+                                            VerticalLayout {
+                                                padding: 8px;
+                                                spacing: 6px;
+                                                Text {
+                                                    text: "⚙ ADVANCED PROMPT OVERRIDES:";
+                                                    font-size: 11px;
+                                                    font-weight: 700;
+                                                    color: M3.tertiary;
+                                                }
+                                                HorizontalLayout {
+                                                    spacing: 8px;
+                                                    SectionLabel { text: "Scene:"; vertical-alignment: center; }
+                                                    LineEdit {
+                                                        horizontal-stretch: 1;
+                                                        font-size: 11px;
+                                                        placeholder-text: "Custom scene setting override tags...";
+                                                        text <=> root.scene_override_setting;
+                                                        edited => { root.scene_overrides_changed(); }
+                                                    }
+                                                    SectionLabel { text: "Exclude:"; vertical-alignment: center; }
+                                                    LineEdit {
+                                                        horizontal-stretch: 1;
+                                                        font-size: 11px;
+                                                        placeholder-text: "Tags to strip (e.g. solo, watermark)...";
+                                                        text <=> root.scene_override_exclude;
+                                                        edited => { root.scene_overrides_changed(); }
+                                                    }
+                                                }
+                                                HorizontalLayout {
+                                                    spacing: 8px;
+                                                    SectionLabel { text: "C1 Pose:"; vertical-alignment: center; }
+                                                    LineEdit {
+                                                        horizontal-stretch: 1;
+                                                        font-size: 11px;
+                                                        placeholder-text: "Char 1 pose override...";
+                                                        text <=> root.scene_override_c1;
+                                                        edited => { root.scene_overrides_changed(); }
+                                                    }
+                                                    if root.app_tab >= 1 : SectionLabel { text: "C2 Pose:"; vertical-alignment: center; }
+                                                    if root.app_tab >= 1 : LineEdit {
+                                                        horizontal-stretch: 1;
+                                                        font-size: 11px;
+                                                        placeholder-text: "Char 2 pose override...";
+                                                        text <=> root.scene_override_c2;
+                                                        edited => { root.scene_overrides_changed(); }
+                                                    }
+                                                    if root.app_tab >= 2 : SectionLabel { text: "C3 Pose:"; vertical-alignment: center; }
+                                                    if root.app_tab >= 2 : LineEdit {
+                                                        horizontal-stretch: 1;
+                                                        font-size: 11px;
+                                                        placeholder-text: "Char 3 pose override...";
+                                                        text <=> root.scene_override_c3;
+                                                        edited => { root.scene_overrides_changed(); }
+                                                    }
+                                                    if root.app_tab >= 3 : SectionLabel { text: "C4 Pose:"; vertical-alignment: center; }
+                                                    if root.app_tab >= 3 : LineEdit {
+                                                        horizontal-stretch: 1;
+                                                        font-size: 11px;
+                                                        placeholder-text: "Char 4 pose override...";
+                                                        text <=> root.scene_override_c4;
+                                                        edited => { root.scene_overrides_changed(); }
+                                                    }
+                                                }
                                             }
-                                            if idx == 1 && c.has_actions : PillButton {
-                                                text: "← Move to C1";
-                                                clicked => { root.scene_action_move_requested(1, 0); }
-                                            }
-                                            if idx == 1 && root.app_tab >= 2 && c.has_actions : PillButton {
-                                                text: "→ Move to C3";
-                                                clicked => { root.scene_action_move_requested(1, 2); }
-                                            }
-                                            if idx == 2 && c.has_actions : PillButton {
-                                                text: "← Move to C2";
-                                                clicked => { root.scene_action_move_requested(2, 1); }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-
-                            // Advanced Settings Drawer (Prompt Overrides)
-                            if root.scene_adv_open : Rectangle {
-                                background: M3.surface-container;
-                                border-radius: 8px;
-                                border-width: 1px;
-                                border-color: M3.secondary-container;
-                                VerticalLayout {
-                                    padding: 8px;
-                                    spacing: 6px;
-                                    Text {
-                                        text: "⚙ ADVANCED PROMPT OVERRIDES:";
-                                        font-size: 11px;
-                                        font-weight: 700;
-                                        color: M3.tertiary;
-                                    }
-                                    HorizontalLayout {
-                                        spacing: 8px;
-                                        SectionLabel { text: "Scene:"; vertical-alignment: center; }
-                                        LineEdit {
-                                            horizontal-stretch: 1;
-                                            font-size: 11px;
-                                            placeholder-text: "Custom scene setting override tags...";
-                                            text <=> root.scene_override_setting;
-                                            edited => { root.scene_overrides_changed(); }
-                                        }
-                                        SectionLabel { text: "Exclude:"; vertical-alignment: center; }
-                                        LineEdit {
-                                            horizontal-stretch: 1;
-                                            font-size: 11px;
-                                            placeholder-text: "Tags to strip (e.g. solo, watermark)...";
-                                            text <=> root.scene_override_exclude;
-                                            edited => { root.scene_overrides_changed(); }
-                                        }
-                                    }
-                                    HorizontalLayout {
-                                        spacing: 8px;
-                                        SectionLabel { text: "C1 Pose:"; vertical-alignment: center; }
-                                        LineEdit {
-                                            horizontal-stretch: 1;
-                                            font-size: 11px;
-                                            placeholder-text: "Char 1 pose override...";
-                                            text <=> root.scene_override_c1;
-                                            edited => { root.scene_overrides_changed(); }
-                                        }
-                                        if root.app_tab >= 1 : SectionLabel { text: "C2 Pose:"; vertical-alignment: center; }
-                                        if root.app_tab >= 1 : LineEdit {
-                                            horizontal-stretch: 1;
-                                            font-size: 11px;
-                                            placeholder-text: "Char 2 pose override...";
-                                            text <=> root.scene_override_c2;
-                                            edited => { root.scene_overrides_changed(); }
-                                        }
-                                        if root.app_tab >= 2 : SectionLabel { text: "C3 Pose:"; vertical-alignment: center; }
-                                        if root.app_tab >= 2 : LineEdit {
-                                            horizontal-stretch: 1;
-                                            font-size: 11px;
-                                            placeholder-text: "Char 3 pose override...";
-                                            text <=> root.scene_override_c3;
-                                            edited => { root.scene_overrides_changed(); }
-                                        }
-                                        if root.app_tab >= 3 : SectionLabel { text: "C4 Pose:"; vertical-alignment: center; }
-                                        if root.app_tab >= 3 : LineEdit {
-                                            horizontal-stretch: 1;
-                                            font-size: 11px;
-                                            placeholder-text: "Char 4 pose override...";
-                                            text <=> root.scene_override_c4;
-                                            edited => { root.scene_overrides_changed(); }
                                         }
                                     }
                                 }
                             }
                         }
                     }
-                }
-            }
-        }
 
-        // ==================== ROW 3 & 4: WORKSPACE (LIVE SCENE STRIP + MULTI-CHARACTER GRIDS + AFTER/NEGATIVE) ====================
-        top := VerticalLayout {
-            vertical-stretch: 1;
-            spacing: 0px;
-            CardsPanel {
-                preferred-height: root.cards_strip_height;
-                min-height: 95px;
-                vertical-stretch: 0;
-                cards: root.change_cards;
-                live-headline: root.live_headline;
-                live-details: root.live_details;
-                live-missing: root.live_missing;
-                scene-summary: root.scene_summary;
-                scene-details: root.scene_details;
-                scene-issues: root.scene_issues;
-                show-ai-button: root.ai_improved_available && (root.after_view == 0 || root.after_view == 3);
-                mode-changed(id, mode) => { root.card_mode_changed(id, mode); }
-                show-ai => { if root.after_view == 3 { root.after_view_changed(4); } else { root.after_view_changed(1); } }
-            }
-            Splitter {
-                height: 10px;
-                dragged(d) => {
-                    root.cards_strip_height = max(95px, min(root.cards_strip_height + d, top.height - 260px));
+                    // ==================== ROW 3 & 4: WORKSPACE (LIVE SCENE STRIP + MULTI-CHARACTER GRIDS + AFTER/NEGATIVE) ====================
+                    top := VerticalLayout {
+                        vertical-stretch: 1;
+                        spacing: 0px;
+                        // nothing to show (no cards, no AI scene): a slim banner instead of the strip; it opens the
+                        // strip (live scene card) on click, and the freed height goes to the prompt rows
+                        if root.cards-empty : Rectangle {
+                            height: 26px;
+                            border-radius: 8px;
+                            background: banner-ta.has-hover ? M3.surface-container-high : M3.surface-container;
+                            banner-ta := TouchArea {
+                                clicked => { root.cards_peek = !root.cards_peek; }
+                            }
+                            HorizontalLayout {
+                                padding-left: 10px;
+                                padding-right: 10px;
+                                spacing: 8px;
+                                Text {
+                                    text: root.raw_prompt == "" && root.app_tab == 0 ? "Paste a prompt to scan it" : "✓ Prompt clean, no conflicts";
+                                    font-size: 11px;
+                                    font-weight: 700;
+                                    color: M3.success;
+                                    vertical-alignment: center;
+                                }
+                                Text {
+                                    text: root.live_headline;
+                                    font-size: 11px;
+                                    color: M3.on-surface-variant;
+                                    vertical-alignment: center;
+                                    horizontal-stretch: 1;
+                                    overflow: elide;
+                                }
+                                if root.app_tab >= 1 : RegionPreview {
+                                    width: 39px;
+                                    height: 26px;
+                                    regions: root.vrp_preview;
+                                    aspect: root.vrp_preview_aspect;
+                                    clicked => { root.edit_vrp_requested(); }
+                                }
+                                Text {
+                                    text: root.cards_peek ? "Hide scene ▴" : "Show scene ▾";
+                                    font-size: 11px;
+                                    color: M3.primary;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
+                        if !root.cards-empty || root.cards_peek : HorizontalLayout {
+                          preferred-height: root.cards_strip_height;
+                          min-height: 72px;
+                          vertical-stretch: 0;
+                          spacing: 6px;
+                          if root.app_tab >= 1 : VerticalLayout {
+                            alignment: start;
+                            spacing: 4px;
+                            RegionPreview {
+                                width: 120px;
+                                height: 80px;
+                                regions: root.vrp_preview;
+                                aspect: root.vrp_preview_aspect;
+                                clicked => { root.edit_vrp_requested(); }
+                            }
+                            Text {
+                                text: "✎ regions";
+                                font-size: 10px;
+                                color: M3.on-surface-variant;
+                                horizontal-alignment: center;
+                            }
+                          }
+                          CardsPanel {
+                            horizontal-stretch: 1;
+                            cards: root.change_cards;
+                            live-headline: root.live_headline;
+                            live-details: root.live_details;
+                            live-missing: root.live_missing;
+                            scene-summary: root.scene_summary;
+                            scene-details: root.scene_details;
+                            scene-issues: root.scene_issues;
+                            show-ai-button: root.ai_improved_available && (root.after_view == 0 || root.after_view == 3);
+                            mode-changed(id, mode) => { root.card_mode_changed(id, mode); }
+                            show-ai => { if root.after_view == 3 { root.after_view_changed(4); } else { root.after_view_changed(1); } }
+                          }
+                        }
+                        if !root.cards-empty || root.cards_peek : Splitter {
+                            height: 10px;
+                            dragged(d) => {
+                                root.cards_strip_height = max(72px, min(root.cards_strip_height + d, top.height - 200px));
+                            }
+                        }
+                        PromptColumn {
+                            vertical-stretch: 1;
+                            raw-prompt <=> root.raw_prompt;
+                            lora-tags <=> root.lora_tags;
+                            before-stats: root.before_stats;
+                            after-stats: root.after_stats;
+                            before-stats-warn: root.before_stats_warn;
+                            after-stats-warn: root.after_stats_warn;
+                            char2-stats-warn: root.char2_stats_warn;
+                            char3-stats-warn: root.char3_stats_warn;
+                            char4-stats-warn: root.char4_stats_warn;
+                            condensed-plain: root.condensed_prompt;
+                            after-view: root.after_view;
+                            ai-improved-available: root.ai_improved_available;
+                            dynamic-enabled: root.dynamic_enabled;
+                            dynamic-note: root.dynamic_note;
+                            rolled: root.after_rolled;
+                            ai-dropped: root.ai_dropped;
+                            substituted-list: root.substituted_list;
+                            added-list: root.added_list;
+                            category-breakdown: root.category_breakdown;
+                            structure-rows: root.structure_rows;
+                            char-count: root.app_tab + 1;
+                            char2-prompt <=> root.char2_prompt;
+                            char3-prompt <=> root.char3_prompt;
+                            char4-prompt <=> root.char4_prompt;
+                            char2-lora-tags <=> root.char2_lora_tags;
+                            char3-lora-tags <=> root.char3_lora_tags;
+                            char4-lora-tags <=> root.char4_lora_tags;
+                            lora-suggest-c1: root.lora_suggest_c1;
+                            lora-suggest-c2: root.lora_suggest_c2;
+                            lora-suggest-c3: root.lora_suggest_c3;
+                            lora-suggest-c4: root.lora_suggest_c4;
+                            lora-weights-c1: root.lora_weights_c1;
+                            lora-weights-c2: root.lora_weights_c2;
+                            lora-weights-c3: root.lora_weights_c3;
+                            lora-weights-c4: root.lora_weights_c4;
+                            lora-step(c, i, d) => { root.lora_weight_step(c, i, d); }
+                            char2-stats: root.char2_stats;
+                            char3-stats: root.char3_stats;
+                            char4-stats: root.char4_stats;
+                            before-ratio <=> root.before_ratio;
+                            side-width <=> root.side_width;
+                            negative-plain: root.negative_text;
+                            negative-note: root.negative_note;
+                            negative-available: root.negative_text != "";
+                            negative-expanded <=> root.negative_expanded;
+                            quality-available: root.checkpoint_index != 5;
+                            add-quality => { root.add_quality_requested(); }
+                            negative-tokens: root.negative_tokens;
+                            zen: root.zen_mode;
+                            edited => { root.analyze_requested(); }
+                            after-view-changed(v) => { root.after_view_changed(v); }
+                            roll => { root.roll_requested(); }
+                            copy => { root.copy_output_requested(); root.show-copied(); }
+                            copy-section-blocks => { root.copy_section_blocks_requested(); root.show-copied(); }
+                            copy-negative => { root.copy_recommended_negative_requested(); root.show-copied(); }
+                            output-collapsed <=> root.output_collapsed;
+                            export-index <=> root.export_index;
+                        }
+                    }
                 }
-            }
-            PromptColumn {
-                vertical-stretch: 1;
-                raw-prompt <=> root.raw_prompt;
-                lora-tags <=> root.lora_tags;
-                before-stats: root.before_stats;
-                after-stats: root.after_stats;
-                condensed-plain: root.condensed_prompt;
-                after-view: root.after_view;
-                ai-improved-available: root.ai_improved_available;
-                dynamic-enabled: root.dynamic_enabled;
-                dynamic-note: root.dynamic_note;
-                ai-dropped: root.ai_dropped;
-                substituted-list: root.substituted_list;
-                added-list: root.added_list;
-                category-breakdown: root.category_breakdown;
-                structure-rows: root.structure_rows;
-                char-count: root.app_tab + 1;
-                char2-prompt <=> root.char2_prompt;
-                char3-prompt <=> root.char3_prompt;
-                char4-prompt <=> root.char4_prompt;
-                char2-lora-tags <=> root.char2_lora_tags;
-                char3-lora-tags <=> root.char3_lora_tags;
-                char4-lora-tags <=> root.char4_lora_tags;
-                char2-stats: root.char2_stats;
-                char3-stats: root.char3_stats;
-                char4-stats: root.char4_stats;
-                before-ratio <=> root.before_ratio;
-                side-width <=> root.side_width;
-                negative-plain: root.negative_text;
-                negative-note: root.negative_note;
-                negative-available: root.negative_text != "";
-                edited => { root.analyze_requested(); }
-                after-view-changed(v) => { root.after_view_changed(v); }
-                copy => { root.copy_output_requested(); }
-                copy-section-blocks => { root.copy_section_blocks_requested(); }
-                copy-negative => { root.copy_recommended_negative_requested(); }
-                output-collapsed <=> root.output_collapsed;
             }
         }
 
@@ -2495,18 +3144,59 @@ export component AppWindow inherits Window {
                     color: M3.on-surface;
                     overflow: elide;
                     horizontal-stretch: 1;
+                    vertical-alignment: center;
                 }
-                if root.run_badge != "" : Text {
-                    text: root.run_badge;
-                    font-size: 11px;
-                    font-weight: 700;
-                    color: M3.success;
+                PillButton {
+                    text: "⚡ Queue";
+                    enabled: root.comfyui_online;
+                    clicked => { root.queue_comfyui_requested(); }
                 }
-                Text {
-                    text: root.hardware_badge;
-                    font-size: 11px;
-                    font-weight: 700;
-                    color: M3.primary;
+                // one pill: checkpoint · version · token estimate · verdict · last run · hardware
+                Rectangle {
+                    border-radius: 10px;
+                    background: M3.surface-container-high;
+                    HorizontalLayout {
+                        padding-left: 10px;
+                        padding-right: 10px;
+                        padding-top: 2px;
+                        padding-bottom: 2px;
+                        spacing: 6px;
+                        Text {
+                            text: root.checkpoint-names[root.checkpoint_index] + (root.app_version != "" ? " · v" + root.app_version : "")
+                                + (root.after_stats != "" ? " · " + root.after_stats : "") + " ·";
+                            font-size: 11px;
+                            color: M3.on-surface;
+                            vertical-alignment: center;
+                        }
+                        Text {
+                            text: root.issue_summary;
+                            font-size: 11px;
+                            font-weight: 700;
+                            color: root.issue_summary == "✓ Clean" ? M3.success : M3.warning;
+                            vertical-alignment: center;
+                        }
+                        if root.run_badge != "" : Text {
+                            text: "· " + root.run_badge;
+                            font-size: 11px;
+                            font-weight: 700;
+                            color: M3.success;
+                            vertical-alignment: center;
+                        }
+                        Text {
+                            text: root.comfyui_online ? "· ComfyUI ●" : "· ComfyUI ○";
+                            font-size: 11px;
+                            font-weight: 700;
+                            color: root.comfyui_online ? M3.success : M3.on-surface-variant;
+                            vertical-alignment: center;
+                        }
+                        if root.hardware_badge != "" : Text {
+                            text: "· " + root.hardware_badge;
+                            font-size: 11px;
+                            font-weight: 700;
+                            color: M3.primary;
+                            vertical-alignment: center;
+                        }
+                    }
                 }
                 HorizontalLayout {
                     spacing: 5px;
@@ -2574,7 +3264,7 @@ export component AppWindow inherits Window {
                     PillButton {
                         text: "🗺 Copy VRP regions";
                         primary: true;
-                        clicked => { root.copy_vrp_requested(); }
+                        clicked => { root.copy_vrp_requested(); root.show-copied(); }
                     }
                     PillButton {
                         text: "✕ Close";
@@ -2636,6 +3326,174 @@ export component AppWindow inherits Window {
                                     moved => {
                                         root.vrp_region_resized(i, (self.mouse-x - self.pressed-x) / vrp-canvas.width, (self.mouse-y - self.pressed-y) / vrp-canvas.height);
                                     }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ==================== 🎨 PALETTE ====================
+    if root.palette_open : Rectangle {
+        x: 0;
+        y: 0;
+        width: root.width;
+        height: root.height;
+        background: #00000080;
+        TouchArea { clicked => { root.palette_open = false; } }
+        Rectangle {
+            width: min(parent.width - 32px, 640px);
+            height: min(parent.height - 32px, palette-layout.preferred-height);
+            border-radius: 16px;
+            background: M3.surface-container;
+            clip: true;
+            TouchArea { }
+            palette-layout := VerticalLayout {
+                padding: 16px;
+                spacing: 6px;
+                alignment: start;
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text {
+                        text: "🎨 Palette";
+                        font-size: 16px;
+                        font-weight: 700;
+                        color: M3.on-surface;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                    }
+                    PillButton {
+                        text: "✕ Close";
+                        clicked => { root.palette_open = false; }
+                    }
+                }
+                Text {
+                    text: root.app_tab >= 1 ? "A click adds the tag to the Scene box (shared by every character)." : "A click adds the tag to the end of Before. Tags already there are skipped.";
+                    font-size: 12px;
+                    color: M3.on-surface-variant;
+                    wrap: word-wrap;
+                }
+                for row in root.palette_rows : HorizontalLayout {
+                    spacing: 4px;
+                    alignment: start;
+                    Text {
+                        width: 78px;
+                        text: row.title;
+                        font-size: 11px;
+                        font-weight: 700;
+                        color: M3.primary;
+                        vertical-alignment: center;
+                    }
+                    for tag in row.tags : Rectangle {
+                        height: 24px;
+                        min-width: pal-label.preferred-width + 16px;
+                        border-radius: 12px;
+                        border-width: 1px;
+                        border-color: M3.outline-variant;
+                        background: pal-ta.has-hover ? M3.secondary-container : M3.surface-container-high;
+                        accessible-role: button;
+                        accessible-label: "+ " + tag;
+                        pal-label := Text { text: "+ " + tag; font-size: 11px; color: M3.on-surface; }
+                        pal-ta := TouchArea {
+                            mouse-cursor: MouseCursor.pointer;
+                            clicked => { root.palette_tag_clicked(tag); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ==================== PROMPT HISTORY ====================
+    if root.history_open : Rectangle {
+        x: 0;
+        y: 0;
+        width: root.width;
+        height: root.height;
+        background: #000000b0;
+        TouchArea { clicked => { root.history_open = false; } }
+        Rectangle {
+            width: min(parent.width - 32px, 620px);
+            height: min(parent.height - 32px, 560px);
+            border-radius: 16px;
+            background: M3.surface-container;
+            clip: true;
+            TouchArea { }
+            VerticalLayout {
+                padding: 18px;
+                spacing: 8px;
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text {
+                        text: "Prompt history";
+                        font-size: 18px;
+                        font-weight: 700;
+                        color: M3.on-surface;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                        overflow: elide;
+                    }
+                    PillButton {
+                        text: "⭐ Stash";
+                        primary: true;
+                        clicked => { root.history_stash_requested(); }
+                    }
+                    PillButton {
+                        text: "✕ Close";
+                        clicked => { root.history_open = false; }
+                    }
+                }
+                Text {
+                    text: "Saved after a 2.5 s typing pause: the 15 latest plus up to 10 starred (kept for good). Restore puts your current text at the top first, so it can be undone.";
+                    font-size: 12px;
+                    color: M3.on-surface-variant;
+                    wrap: word-wrap;
+                }
+                if root.history_rows.length == 0 : Text {
+                    text: "Nothing yet: type a prompt, or press ⭐ Stash.";
+                    font-size: 13px;
+                    color: M3.on-surface-variant;
+                }
+                hist-scroll := ScrollView {
+                    vertical-stretch: 1;
+                    VerticalLayout {
+                        width: hist-scroll.visible-width;
+                        spacing: 4px;
+                        alignment: start;
+                        for row[i] in root.history_rows : Rectangle {
+                            height: 36px;
+                            border-radius: 8px;
+                            background: M3.surface-container-high;
+                            HorizontalLayout {
+                                padding-left: 8px;
+                                padding-right: 8px;
+                                spacing: 8px;
+                                alignment: stretch;
+                                PillButton {
+                                    text: row.starred ? "★" : "☆";
+                                    primary: row.starred;
+                                    clicked => { root.history_star_toggled(i); }
+                                }
+                                Text {
+                                    text: row.when;
+                                    font-size: 11px;
+                                    color: M3.on-surface-variant;
+                                    vertical-alignment: center;
+                                    min-width: 64px;
+                                }
+                                Text {
+                                    text: row.label + (row.chars > 1 ? "  · " + row.chars + " characters" : "");
+                                    font-size: 12px;
+                                    color: M3.on-surface;
+                                    vertical-alignment: center;
+                                    horizontal-stretch: 1;
+                                    overflow: elide;
+                                }
+                                PillButton {
+                                    text: "Restore";
+                                    clicked => { root.history_restore_requested(i); }
                                 }
                             }
                         }
@@ -2753,6 +3611,33 @@ export component AppWindow inherits Window {
                     }
                 }
             }
+        }
+    }
+
+    toast-timer := Timer {
+        interval: 1200ms;
+        running: false;
+        triggered => {
+            root.toast-on = false;
+            self.running = false;
+        }
+    }
+
+    // "✓ Copied" toast: on top of everything, lets clicks through (no TouchArea)
+    Rectangle {
+        x: (root.width - self.width) / 2;
+        y: root.height - self.height - 56px;
+        width: toast-label.preferred-width + 32px;
+        height: 32px;
+        border-radius: 16px;
+        background: M3.primary;
+        opacity: root.toast-on ? 0.95 : 0;
+        animate opacity { duration: 250ms; }
+        toast-label := Text {
+            text: "✓ Copied";
+            font-size: 13px;
+            font-weight: 700;
+            color: M3.on-primary;
         }
     }
 }

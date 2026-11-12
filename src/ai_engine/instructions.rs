@@ -534,6 +534,8 @@ pub fn build_ai_system_and_user_prompt_for(raw_prompt: &str, config: &ScanConfig
     for (list, idx, what) in [
         (crate::profiles::CAMERA_ANGLES, config.camera_angle, "camera angle"),
         (crate::profiles::POSES, config.pose, "pose"),
+        (crate::profiles::BUSTS, config.bust, "bust size"),
+        (crate::profiles::FRAMES, config.frame, "body frame"),
     ] {
         if let Some((label, tags)) = list.get(idx).filter(|_| idx > 0) {
             context.push(format!(
@@ -544,7 +546,7 @@ pub fn build_ai_system_and_user_prompt_for(raw_prompt: &str, config: &ScanConfig
     }
     if small {
         // shorter for small models, but never at the cost of the user's own choices
-        // (LoRA tags, Keep list, angle / pose picks): only generic lines go
+        // (LoRA tags, Keep list, angle / pose / bust / frame picks): only generic lines go
         let generic_view = config.target_view == crate::profiles::TargetView::None;
         context.retain(|c| {
             !c.starts_with("Cleanup:")

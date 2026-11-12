@@ -15,6 +15,39 @@ pub(crate) fn enforce_checkpoint_rules(out: &mut AiJsonOutput, checkpoint: Check
     out.dynamic_prompt = ensure_quality_tags(&out.dynamic_prompt, checkpoint);
 }
 
+/// The Bust / Frame dropdown picks, enforced on the reply's rewrite and dynamic version (silently, like the
+/// LoRA conflicts): `analyzer::apply_body_choices` on the whole text, or on the multi-character tabs on each
+/// BREAK part that describes a character (shared scene parts are left alone; every character gets the
+/// picks, as in the rule path). Runs after `enforce_checkpoint_rules`.
+pub(crate) fn enforce_body_choices(out: &mut AiJsonOutput, config: &ScanConfig) {
+    if config.bust == 0 && config.frame == 0 {
+        return;
+    }
+    out.improved_prompt = body_choices_in(&out.improved_prompt, config);
+    out.dynamic_prompt = body_choices_in(&out.dynamic_prompt, config);
+}
+
+pub(crate) fn body_choices_in(text: &str, config: &ScanConfig) -> String {
+    if text.trim().is_empty() {
+        return text.to_string();
+    }
+    let exaggerate = config.exaggerated_proportions.then_some(config.checkpoint);
+    let apply = |t: &str| crate::analyzer::apply_body_choices_with(t, config.bust, config.frame, exaggerate);
+    if !config.two_char {
+        return apply(text);
+    }
+    let parts = crate::two::split_breaks(text);
+    let chars: Vec<bool> = parts.iter().map(|p| crate::two::describes_a_character(p)).collect();
+    if parts.len() < 2 || !chars.contains(&true) {
+        return apply(text);
+    }
+    let fixed: Vec<String> = parts.iter().zip(&chars).map(|(p, &c)| if c { apply(p) } else { p.clone() }).collect();
+    if fixed == parts {
+        return text.to_string();
+    }
+    fixed.join(",\nBREAK\n")
+}
+
 /// Removes what a model copies out of its instructions instead of writing a tag:
 /// `[UNANCHORED_LIMBS_FLAG resolved: hands in lap]` becomes `hands in lap`, a bare `*_FLAG`
 /// goes, and so do placeholder tags such as `[framing]`, `{none}` or

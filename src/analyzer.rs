@@ -28,6 +28,8 @@ pub enum ChangeAction {
     Recommendation,
     /// Bust or frame set by the Bust / Frame dropdowns.
     ProportionChoice,
+    /// A generic tag a more specific one already implies (`swimsuit` next to `bikini`).
+    ImpliedTag,
 }
 
 impl ChangeAction {
@@ -46,8 +48,9 @@ impl ChangeAction {
             Self::AiRewrite => "AI SUGGESTION",
             Self::AngleChoice => "CAMERA ANGLE",
             Self::PoseChoice => "POSE",
-            Self::Recommendation => "CHAIN RECOMMENDATIONS",
+            Self::Recommendation => "FIT & DYNAMICS",
             Self::ProportionChoice => "BODY PROPORTION",
+            Self::ImpliedTag => "IMPLIED TAG",
         }
     }
 }
@@ -75,6 +78,10 @@ pub struct ScanConfig {
     pub cleanup_enabled: bool,
     pub resolve_conflicts_enabled: bool,
     pub clamp_weights_enabled: bool,
+    /// Suggest fabric fit and dynamic poses for existing garments/anatomy.
+    pub fit_suggestions: bool,
+    /// Allow exaggerated/stylized cartoon proportions for shortstack (bypasses anatomy conflict rules, drops bad anatomy from negative).
+    pub exaggerated_proportions: bool,
     /// Index into `profiles::CAMERA_ANGLES` (0 = none).
     pub camera_angle: usize,
     /// Index into `profiles::POSES` (0 = none).
@@ -105,6 +112,37 @@ pub struct ScanConfig {
     pub more_chars: Vec<(String, String)>,
     /// How much the deep scan may enrich the prompt.
     pub detail: crate::profiles::DetailLevel,
+}
+
+impl Default for ScanConfig {
+    fn default() -> Self {
+        Self {
+            checkpoint: CheckpointProfile::Anima,
+            target_view: TargetView::None,
+            pinned_emphasis_raw: String::new(),
+            emphasis_weight: 1.25,
+            cleanup_enabled: true,
+            resolve_conflicts_enabled: true,
+            clamp_weights_enabled: true,
+            fit_suggestions: true,
+            exaggerated_proportions: false,
+            camera_angle: 0,
+            pose: 0,
+            bust: 0,
+            frame: 0,
+            dynamic: false,
+            lora_tags_raw: String::new(),
+            arranged: false,
+            natural: false,
+            two_char: false,
+            char2_prompt_raw: String::new(),
+            char2_lora_tags_raw: String::new(),
+            char_break: false,
+            scene_prompt_raw: String::new(),
+            more_chars: Vec::new(),
+            detail: crate::profiles::DetailLevel::Balanced,
+        }
+    }
 }
 
 impl ScanConfig {
@@ -1060,17 +1098,9 @@ pub fn get_proportion_recommendations(tier: ProportionTier) -> &'static Proporti
             clothing_interaction: &[
                 "loose_shirt",
                 "baggy_clothes",
-                "flat_chest_grab",
-                "sarashi",
-                "bandeau",
-                "open_shirt",
-                "oversized_shirt",
             ],
             pose_and_physics: &[
                 "collarbone",
-                "visible_ribs",
-                "pectorals",
-                "arms_crossed_over_chest",
             ],
             auto_negative_lock: &[
                 "breasts",
@@ -1088,34 +1118,22 @@ pub fn get_proportion_recommendations(tier: ProportionTier) -> &'static Proporti
             core_reinforcers: &["a_cup", "b_cup", "perky_breasts", "petite_breasts"],
             clothing_interaction: &[
                 "tight_shirt",
-                "crop_top",
-                "sports_bra",
-                "micro_bikini",
-                "slight_cleavage",
-                "unbuttoned_shirt",
             ],
-            pose_and_physics: &["collarbone", "slender", "arched_back"],
+            pose_and_physics: &["collarbone", "arched_back"],
             auto_negative_lock: &[
                 "flat_chest",
                 "large_breasts",
                 "huge_breasts",
                 "deep_cleavage",
                 "sagging_breasts",
-                "boob_shelf",
             ],
         },
         ProportionTier::MediumBreasts => &ProportionRecommendations {
             tier: ProportionTier::MediumBreasts,
             primary_name: "medium_breasts",
             core_reinforcers: &["c_cup", "d_cup", "proportionate_body", "full_breasts"],
-            clothing_interaction: &[
-                "cleavage",
-                "fitted_shirt",
-                "sweater",
-                "bikini",
-                "cleavage_cutout",
-            ],
-            pose_and_physics: &["hourglass_figure", "perky_breasts", "bouncing_breasts"],
+            clothing_interaction: &[],
+            pose_and_physics: &["perky_breasts"],
             auto_negative_lock: &[
                 "flat_chest",
                 "small_breasts",
@@ -1132,21 +1150,9 @@ pub fn get_proportion_recommendations(tier: ProportionTier) -> &'static Proporti
                 "taut_shirt",
                 "taut_clothes",
                 "button_gap",
-                "cleavage_cutout",
-                "underboob",
-                "sideboob",
-                "virgin_killer_sweater",
-                "keyhole_turtleneck",
-                "strap_between_breasts",
-                "seatbelt_between_breasts",
-                "boob_pocket",
             ],
             pose_and_physics: &[
-                "bouncing_breasts",
-                "jiggling",
-                "arms_crossed_under_breasts",
                 "framed_breasts",
-                "breast_press",
                 "leaning_forward",
             ],
             auto_negative_lock: &[
@@ -1161,26 +1167,13 @@ pub fn get_proportion_recommendations(tier: ProportionTier) -> &'static Proporti
             primary_name: "huge_breasts",
             core_reinforcers: &["g_cup", "h_cup", "heavy_breasts", "voluptuous", "deep_cleavage"],
             clothing_interaction: &[
-                "boob_shelf",
+                "taut_shirt",
                 "taut_clothes",
                 "button_gap",
-                "popping_button",
-                "impossible_shirt",
-                "vacuum_shirt",
-                "underboob_cutout",
-                "overflowing_breasts",
-                "cropped_sweater",
-                "micro_bikini",
+                "popped_button",
             ],
             pose_and_physics: &[
-                "sagging_breasts",
-                "hanging_breasts",
-                "breast_rest",
-                "breasts_on_table",
-                "holding_own_breasts",
-                "arms_under_breasts",
-                "breast_curtains",
-                "heavy_breathing",
+                "leaning_forward",
             ],
             auto_negative_lock: &[
                 "flat_chest",
@@ -1202,29 +1195,14 @@ pub fn get_proportion_recommendations(tier: ProportionTier) -> &'static Proporti
                 "voluptuous",
             ],
             clothing_interaction: &[
-                "bursting_breasts",
-                "tearing_clothes",
-                "popping_button",
-                "button_strain",
-                "impossible_clothes",
-                "boob_shelf",
-                "underboob",
-                "sideboob",
-                "unbuttoned_shirt",
-                "open_clothes",
-                "string_bikini",
+                "taut_shirt",
+                "taut_clothes",
+                "button_gap",
+                "popped_button",
             ],
             pose_and_physics: &[
-                "supporting_own_breasts",
-                "two-handed_breast_hold",
-                "breasts_on_table",
-                "breast_rest",
-                "sagging_breasts",
-                "heavy_breasts",
-                "veiny_breasts",
-                "shiny_skin",
-                "back_pain",
                 "leaning_forward",
+                "hands_on_own_chest",
             ],
             auto_negative_lock: &[
                 "flat_chest",
@@ -1253,39 +1231,10 @@ pub fn get_proportion_recommendations(tier: ProportionTier) -> &'static Proporti
             ],
             clothing_interaction: &[
                 "skindentation",
-                "thighhighs",
-                "garter_straps",
-                "thigh_strap",
-                "tight_shorts",
-                "denim_shorts",
-                "pelvic_curtain",
-                "hip_vent",
-                "side_slit",
-                "high_side_slit",
-                "highleg_panties",
-                "highleg_bikini",
-                "highleg_leotard",
-                "low-rise_shorts",
-                "low-rise_pants",
-                "whale_tail",
-                "hip_chain",
-                "waist_chain",
-                "bodycon_dress",
-                "pencil_skirt",
-                "taut_skirt",
-                "bike_shorts",
             ],
             pose_and_physics: &[
-                "hips_cocked",
-                "hip_sway",
                 "contrapposto",
-                "weight_on_one_leg",
-                "hands_on_hips",
-                "thigh_squish",
-                "sitting",
-                "crossed_legs",
-                "wide_stance",
-                "hips_pushed_back",
+                "hands_on_own_hips",
             ],
             auto_negative_lock: &[
                 "thin_legs",
@@ -1313,24 +1262,11 @@ pub fn get_proportion_recommendations(tier: ProportionTier) -> &'static Proporti
                 "six_pack",
             ],
             clothing_interaction: &[
-                "sports_bra",
-                "crop_top",
-                "midriff",
-                "tank_top",
-                "gym_shorts",
-                "spats",
-                "boxing_gloves",
-                "hand_wraps",
+                "taut_shirt",
+                "taut_clothes",
             ],
             pose_and_physics: &[
                 "flexing",
-                "biceps",
-                "obliques",
-                "broad_shoulders",
-                "sweat",
-                "shiny_skin",
-                "fighting_stance",
-                "confident_smile",
             ],
             auto_negative_lock: &[
                 "chubby",
@@ -2021,8 +1957,6 @@ pub fn check_pose_conflict(
                 | "on side"
                 | "all fours"
                 | "top-down bottom-up"
-                | "bent over"
-                | "leaning forward"
                 | "squatting"
                 | "crouching"
                 | "kneeling"
@@ -2087,6 +2021,155 @@ pub fn check_pinned_visibility_conflict(
     None
 }
 
+pub fn is_two_hand_pose(norm: &str) -> bool {
+    matches!(
+        norm,
+        "hands on hips"
+            | "hands on own hips"
+            | "hands on waist"
+            | "crossed arms"
+            | "arms crossed"
+            | "arms at sides"
+            | "hands in pockets"
+            | "heart hands"
+            | "praying"
+            | "own hands together"
+            | "arms behind head"
+            | "hands behind head"
+            | "arms behind back"
+            | "hands behind back"
+            | "two-handed breast hold"
+            | "grabbing own breast"
+            | "breast hold"
+            | "holding breasts"
+            | "breast grab"
+            | "hands on own chest"
+            | "arms up"
+            | "hands up"
+            | "stretching"
+            | "holding own hair"
+            | "twintails grab"
+    )
+}
+
+pub fn is_one_hand_gesture(norm: &str) -> bool {
+    matches!(
+        norm,
+        "peace sign"
+            | "v"
+            | "double v"
+            | "waving"
+            | "salute"
+            | "hand on hip"
+            | "hand on own hip"
+            | "pointing"
+            | "thumbs up"
+            | "hand to mouth"
+            | "finger to mouth"
+            | "shushing"
+            | "adjusting eyewear"
+            | "adjusting glasses"
+            | "chin rest"
+            | "reaching towards viewer"
+            | "outstretched arm"
+            | "outstretched hand"
+            | "beckoning"
+    ) || (norm.starts_with("holding ") && !matches!(norm, "holding hands" | "holding own hair"))
+}
+
+pub fn posture_group(norm: &str) -> Option<&'static str> {
+    match norm {
+        "standing" | "standing upright" | "straight posture" | "standing on one leg" => Some("standing"),
+        "sitting" | "indian style" | "hugging knees" => Some("sitting"),
+        "kneeling" => Some("kneeling"),
+        // seiza / wariza are sitting on the knees: both a kind of sitting and of kneeling
+        "seiza" | "wariza" => Some("seated_kneel"),
+        "squatting" | "crouching" => Some("squatting"),
+        "lying" | "on back" | "on stomach" | "on side" => Some("lying"),
+        "all fours" | "top-down bottom-up" => Some("all_fours"),
+        _ => None,
+    }
+}
+
+/// Whether two posture groups can't both be true for one person. The same group never conflicts, and
+/// seiza / wariza (`seated_kneel`) agree with plain sitting or kneeling: those pairs are implications
+/// (the generic tag gets an ImpliedTag card instead).
+pub fn postures_conflict(a: &str, b: &str) -> bool {
+    if a == b {
+        return false;
+    }
+    let seated_kneel_ok = |x: &str, y: &str| x == "seated_kneel" && (y == "sitting" || y == "kneeling");
+    !(seated_kneel_ok(a, b) || seated_kneel_ok(b, a))
+}
+
+/// Leg positions or postures that can't go with a leg position (`crossed legs`, `spread legs`…):
+/// seiza / wariza fold the legs under, standing on one leg lifts one.
+pub fn leg_cross_conflict(posture: &str, leg_group: &str) -> bool {
+    match posture {
+        "seiza" | "wariza" => matches!(leg_group, "crossed" | "spread"),
+        "standing on one leg" => matches!(leg_group, "spread" | "together" | "wide"),
+        _ => false,
+    }
+}
+
+/// Boot heights are mutually exclusive on one person (one_per_part's rule for image reads).
+pub fn boot_height(norm: &str) -> Option<&'static str> {
+    match norm {
+        "thigh boots" | "thighhigh boots" | "thigh-high boots" => Some("thigh"),
+        "knee boots" | "knee-high boots" => Some("knee"),
+        "ankle boots" => Some("ankle"),
+        _ => None,
+    }
+}
+
+pub fn leg_stance_group(norm: &str) -> Option<&'static str> {
+    match norm {
+        "crossed legs" => Some("crossed"),
+        "spread legs" | "legs spread" | "legs apart" => Some("spread"),
+        "feet together" => Some("together"),
+        "pigeon-toed" => Some("pigeon"),
+        "wide stance" => Some("wide"),
+        _ => None,
+    }
+}
+
+pub fn is_footwear(norm: &str) -> bool {
+    !crate::ai_engine::is_unworn_footwear(norm) && matches!(
+        norm,
+        "shoes"
+            | "boots"
+            | "loafers"
+            | "sneakers"
+            | "sandals"
+            | "high heels"
+            | "slippers"
+            | "footwear"
+            | "geta"
+            | "zori"
+            | "uwabaki"
+            | "mary janes"
+            | "ballet slippers"
+    ) || norm.ends_with(" shoes")
+        || norm.ends_with(" boots")
+        || norm.ends_with(" sneakers")
+        || norm.ends_with(" sandals")
+        || norm.ends_with(" heels")
+        || norm.ends_with(" loafers")
+}
+
+/// Poses that hold the legs apart, so the thighs separate (a thigh gap is natural then).
+pub fn legs_apart(norm: &str) -> bool {
+    matches!(norm, "spread legs" | "legs spread" | "legs apart" | "wide stance" | "squatting" | "knees apart")
+}
+
+pub fn is_barefoot(norm: &str) -> bool {
+    matches!(norm, "barefoot" | "bare feet" | "bare foot" | "no shoes")
+}
+
+pub fn is_barefoot_exception(norm: &str) -> bool {
+    crate::ai_engine::is_unworn_footwear(norm)
+}
+
 pub fn analyze_with_rules(tokens: &[PromptToken], config: &ScanConfig) -> RuleAnalysisResult {
     let effective_view = detect_effective_view(tokens, config.target_view);
 
@@ -2125,10 +2208,20 @@ pub fn analyze_with_rules(tokens: &[PromptToken], config: &ScanConfig) -> RuleAn
         )
     });
 
+    let is_multi_person = tokens.iter().any(|t| {
+        matches!(
+            t.normalized.as_str(),
+            "2girls" | "3girls" | "4girls" | "5girls" | "6+girls" | "multiple girls"
+            | "2boys" | "3boys" | "4boys" | "5boys" | "6+boys" | "multiple boys"
+            | "2others" | "3others" | "multiple others"
+        )
+    }) || (tokens.iter().filter(|t| matches!(t.normalized.as_str(), "1girl" | "1boy" | "1other")).count() > 1);
+    // with several people one can stand while another sits, or one waves while another crosses her arms,
+    // so the prompt's own poses never conflict then; a Pose dropdown pick still applies
     let standing_upright_active = is_pose_standing_upright
-        || (config.pose == 0 && prompt_has_standing);
+        || (config.pose == 0 && prompt_has_standing && !is_multi_person);
     let arms_down_or_hips_active = is_pose_arms_down_or_hips
-        || (config.pose == 0 && prompt_has_arms_down_or_hips);
+        || (config.pose == 0 && prompt_has_arms_down_or_hips && !is_multi_person);
 
     // Parse user's pinned emphasis parts
     // Pinned parts only boost tags already in the prompt; they are never added.
@@ -2145,6 +2238,132 @@ pub fn analyze_with_rules(tokens: &[PromptToken], config: &ScanConfig) -> RuleAn
                 .join(" ")
         })
         .collect();
+
+    let mut pose_conflict_reasons: std::collections::HashMap<String, &'static str> = std::collections::HashMap::new();
+
+    if !is_multi_person {
+        // 1. Two-Hand Budget
+        let hand_tokens: Vec<&PromptToken> = tokens.iter().filter(|t| is_two_hand_pose(&t.normalized) || is_one_hand_gesture(&t.normalized)).collect();
+        if !hand_tokens.is_empty() {
+            let two_hand_winner = hand_tokens.iter().find(|t| is_two_hand_pose(&t.normalized) && (t.weight > 1.0 || is_pose_arms_down_or_hips))
+                .or_else(|| hand_tokens.iter().find(|t| is_two_hand_pose(&t.normalized)))
+                .or_else(|| hand_tokens.iter().find(|t| t.weight > 1.0))
+                .or_else(|| hand_tokens.first());
+
+            if let Some(winner) = two_hand_winner {
+                if is_two_hand_pose(&winner.normalized) || is_pose_arms_down_or_hips {
+                    for t in &hand_tokens {
+                        if t.normalized != winner.normalized {
+                            pose_conflict_reasons.insert(
+                                t.normalized.clone(),
+                                "Hands are already occupied by a two-handed pose. Conflicting hand pose exceeds the human 2-hand limit.",
+                            );
+                        }
+                    }
+                } else {
+                    let mut allowed_count = 0;
+                    for t in &hand_tokens {
+                        if allowed_count < 2 {
+                            allowed_count += 1;
+                        } else {
+                            pose_conflict_reasons.insert(
+                                t.normalized.clone(),
+                                "Human anatomy limit (2 hands) already reached. Third hand gesture causes deformed extra arms.",
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Postures (Mutually exclusive body locations)
+        let posture_tokens: Vec<&PromptToken> = tokens.iter().filter(|t| posture_group(&t.normalized).is_some()).collect();
+        if posture_tokens.len() > 1 {
+            let win_posture = posture_tokens.iter().find(|t| t.weight > 1.0 || (is_pose_standing_upright && posture_group(&t.normalized) == Some("standing")))
+                .or_else(|| posture_tokens.first())
+                .unwrap();
+            let win_grp = posture_group(&win_posture.normalized).unwrap();
+            for t in &posture_tokens {
+                if postures_conflict(posture_group(&t.normalized).unwrap(), win_grp) {
+                    pose_conflict_reasons.insert(
+                        t.normalized.clone(),
+                        "Forces grounded, seated, or contradictory spine postures.",
+                    );
+                }
+            }
+        }
+
+        // 3. Leg Positions (Mutually exclusive leg stances)
+        let leg_tokens: Vec<&PromptToken> = tokens.iter().filter(|t| leg_stance_group(&t.normalized).is_some()).collect();
+        if leg_tokens.len() > 1 {
+            let win_leg = leg_tokens.iter().find(|t| t.weight > 1.0).or_else(|| leg_tokens.first()).unwrap();
+            let win_grp = leg_stance_group(&win_leg.normalized).unwrap();
+            for t in &leg_tokens {
+                if leg_stance_group(&t.normalized).unwrap() != win_grp {
+                    pose_conflict_reasons.insert(
+                        t.normalized.clone(),
+                        "Leg stance directly contradicts an active leg pose.",
+                    );
+                }
+            }
+        }
+
+        // 3b. Postures that fold or lift the legs vs a leg position (seiza + crossed legs)
+        for p in tokens.iter().filter(|t| matches!(t.normalized.as_str(), "seiza" | "wariza" | "standing on one leg")) {
+            for l in tokens.iter() {
+                if let Some(grp) = leg_stance_group(&l.normalized) {
+                    if leg_cross_conflict(&p.normalized, grp) {
+                        // a weighted tag beats an unweighted one; otherwise the first written wins
+                        let posture_wins = match (p.weight > 1.0, l.weight > 1.0) {
+                            (true, false) => true,
+                            (false, true) => false,
+                            _ => p.original_index < l.original_index,
+                        };
+                        let drop = if posture_wins { l } else { p };
+                        pose_conflict_reasons
+                            .entry(drop.normalized.clone())
+                            .or_insert("This leg position can't go with the posture: seiza / wariza fold the legs under, standing on one leg lifts one.");
+                    }
+                }
+            }
+        }
+
+        // 3c. One boot height per person (first written wins, weighted beats unweighted)
+        let boots: Vec<&PromptToken> = tokens.iter().filter(|t| boot_height(&t.normalized).is_some()).collect();
+        if boots.len() > 1 {
+            let win = boots.iter().find(|t| t.weight > 1.0).or_else(|| boots.first()).unwrap();
+            let win_h = boot_height(&win.normalized).unwrap();
+            for t in &boots {
+                if boot_height(&t.normalized).unwrap() != win_h {
+                    pose_conflict_reasons.insert(t.normalized.clone(), "Boots can only have one height: thigh, knee or ankle boots.");
+                }
+            }
+        }
+
+        // 3d. A typed `thigh gap` next to thick thighs / wide hips: full thighs touch unless the legs are apart
+        if tokens.iter().any(|t| t.normalized == "thigh gap")
+            && tokens.iter().any(|t| matches!(t.normalized.as_str(), "thick thighs" | "wide hips"))
+            && !tokens.iter().any(|t| legs_apart(&t.normalized))
+        {
+            pose_conflict_reasons.insert(
+                "thigh gap".to_string(),
+                "'thigh gap' contradicts thick thighs: full thighs touch unless the legs are apart (spread legs, wide stance…).",
+            );
+        }
+
+        // 4. Barefoot vs Footwear
+        let has_footwear = tokens.iter().find(|t| is_footwear(&t.normalized));
+        let has_barefoot = tokens.iter().find(|t| is_barefoot(&t.normalized));
+        let has_exception = tokens.iter().any(|t| is_barefoot_exception(&t.normalized));
+        if let (Some(_fw), Some(bf)) = (has_footwear, has_barefoot) {
+            if !has_exception {
+                pose_conflict_reasons.insert(
+                    bf.normalized.clone(),
+                    "Cannot be simultaneously barefoot and wearing footwear.",
+                );
+            }
+        }
+    }
 
     let mut changes: Vec<PromptChange> = Vec::new();
     let mut next_change_id = 0usize;
@@ -2269,12 +2488,21 @@ pub fn analyze_with_rules(tokens: &[PromptToken], config: &ScanConfig) -> RuleAn
             }
         }
 
-        // 3.2 Check Pose Conflict (resting arms vs arm gestures, upright standing vs grounded/bent poses)
-        if let Some((reason, alt, framing_alt)) = check_pose_conflict(
+        // 3.2 Check Pose Conflict (resting arms vs arm gestures, upright standing vs grounded/bent poses, two-hand budget, postures, footwear)
+        let legacy_check = check_pose_conflict(
             &tok.normalized,
             arms_down_or_hips_active,
             standing_upright_active,
-        ) {
+        );
+        let custom_reason = if legacy_check.is_none() {
+            pose_conflict_reasons.get(&tok.normalized).copied()
+        } else {
+            None
+        };
+
+        if let Some(reason) = legacy_check.map(|(r, _, _)| r).or(custom_reason) {
+            let alt = legacy_check.map(|(_, a, _)| a).unwrap_or("");
+            let framing_alt = legacy_check.map(|(_, _, f)| f).unwrap_or("");
             changes.push(PromptChange {
                 id: next_change_id,
                 original: tok.raw.clone(),
@@ -2488,10 +2716,54 @@ pub fn analyze_with_rules(tokens: &[PromptToken], config: &ScanConfig) -> RuleAn
         next_change_id += 1;
     }
 
+    // "Exaggerated": a pear or shortstack figure has narrow shoulders. There's no Danbooru tag for it, so it's
+    // only added where the checkpoint reads plain words (Anima / SDXL / Flux); it belongs to the Frame pick.
+    if config.exaggerated_proportions
+        && matches!(crate::condenser::frame_label(config.frame), "pear" | "shortstack")
+        && config.checkpoint.supports_natural_language()
+        && !processed_tokens.iter().any(|t| t.normalized == "narrow shoulders")
+    {
+        let mut t = crate::parser::parse_prompt("narrow shoulders").remove(0);
+        t.added = true;
+        t.original_index = 940;
+        t.category = TokenCategory::FramingPose;
+        dropdown_body.push(t.clone());
+        processed_tokens.push(t);
+    }
+
     // The LoRA box beats a Bust / Frame choice too, so those aren't protected below.
     let loras = crate::parser::parse_prompt(&config.lora_tags_raw);
     dropdown_body.retain(|d| !loras.iter().any(|l| l.normalized == d.normalized || tags_conflict(&l.normalized, &d.normalized)));
     let is_dropdown = |n: &str| dropdown_body.iter().any(|d| d.normalized == n);
+
+    let has_shortstack = processed_tokens.iter().any(|tok| tok.normalized == "shortstack")
+        || is_dropdown("shortstack");
+    if config.exaggerated_proportions && has_shortstack {
+        if !processed_tokens.iter().any(|t| t.normalized == "exaggerated proportions") {
+            let t = PromptToken {
+                raw: "exaggerated proportions".to_string(),
+                text: "exaggerated proportions".to_string(),
+                normalized: "exaggerated proportions".to_string(),
+                weight: 1.0,
+                had_runaway_weight: false,
+                replaced: false,
+                added: true,
+                original_index: 941,
+                category: TokenCategory::CharacterBody,
+            };
+            processed_tokens.push(t);
+            changes.push(PromptChange {
+                id: next_change_id,
+                original: String::new(),
+                action: ChangeAction::ProportionChoice,
+                reason: "Exaggerated proportions enabled for shortstack to bypass realistic human anatomy constraints.".to_string(),
+                suggested_alternative: "exaggerated proportions".to_string(),
+                framing_alternative: String::new(),
+                mode: 0,
+            });
+            next_change_id += 1;
+        }
+    }
 
     // LoRA tags (their own box) go into the output word for word (`insert_lora_block`).
     // Here the prompt's own copies are dropped, and tags that contradict one are
@@ -2771,7 +3043,7 @@ pub fn analyze_with_rules(tokens: &[PromptToken], config: &ScanConfig) -> RuleAn
             if t.normalized == tier_tok.normalized || is_dropdown(&t.normalized) {
                 continue;
             }
-            if has_shortstack && (t.normalized == "petite" || t.normalized == "short") {
+            if has_shortstack && (config.exaggerated_proportions || t.normalized == "petite" || t.normalized == "short") {
                 continue;
             }
             if let Some((reason, action)) = breast_tier_conflicts(tier, &t.normalized) {
@@ -2866,14 +3138,20 @@ pub fn analyze_with_rules(tokens: &[PromptToken], config: &ScanConfig) -> RuleAn
     // 8. Body Proportion Conflicts: Thick/Curvy vs Slender/Petite Lower
     let has_shortstack_lower = processed_tokens.iter().any(|t| t.normalized == "shortstack")
         || is_dropdown("shortstack");
-    let first_thick_idx = processed_tokens.iter().position(|t| is_thick_curvy_lower_tag(&t.normalized));
-    let first_slender_idx = processed_tokens.iter().position(|t| {
-        if has_shortstack_lower && (t.normalized == "petite" || t.normalized == "short") {
-            false
-        } else {
-            is_slender_petite_lower_tag(&t.normalized)
-        }
-    });
+    let (first_thick_idx, first_slender_idx) = if config.exaggerated_proportions && has_shortstack_lower {
+        (None, None)
+    } else {
+        (
+            processed_tokens.iter().position(|t| is_thick_curvy_lower_tag(&t.normalized)),
+            processed_tokens.iter().position(|t| {
+                if has_shortstack_lower && (t.normalized == "petite" || t.normalized == "short") {
+                    false
+                } else {
+                    is_slender_petite_lower_tag(&t.normalized)
+                }
+            }),
+        )
+    };
 
     let proportion_lower_winner = match (first_thick_idx, first_slender_idx) {
         (Some(th), Some(sl)) => {
@@ -2890,9 +3168,14 @@ pub fn analyze_with_rules(tokens: &[PromptToken], config: &ScanConfig) -> RuleAn
 
     if let Some((is_thick, winner_tok)) = proportion_lower_winner {
         let mut conflicts: Vec<(PromptToken, &'static str)> = Vec::new();
+        let spread = processed_tokens.iter().any(|t| legs_apart(&t.normalized));
         for t in &processed_tokens {
             if is_thick {
                 if is_thick_curvy_lower_tag(&t.normalized) {
+                    continue;
+                }
+                // spread legs separate even thick thighs, so a thigh gap fits that pose
+                if spread && t.normalized == "thigh gap" {
                     continue;
                 }
                 if is_thick_curvy_conflict(&t.normalized) {
@@ -2989,8 +3272,51 @@ pub fn analyze_with_rules(tokens: &[PromptToken], config: &ScanConfig) -> RuleAn
         }
     }
 
+    // A generic tag next to a more specific one that implies it (`swimsuit` + `bikini`, `sword` +
+    // `holding sword`): the generic one goes, with a card to keep it. Weighted / pinned tags stay.
+    if config.cleanup_enabled {
+        let norms: Vec<String> = processed_tokens.iter().map(|t| t.normalized.clone()).collect();
+        let mut drop: Vec<usize> = Vec::new();
+        for (i, t) in processed_tokens.iter().enumerate() {
+            if (t.weight - 1.0).abs() > f32::EPSILON || t.category == TokenCategory::PinnedEmphasis || t.added {
+                continue;
+            }
+            let Some(child) = norms.iter().enumerate().find(|(j, o)| *j != i && implies(o, &t.normalized)).map(|(j, _)| j) else {
+                continue;
+            };
+            changes.push(PromptChange {
+                id: next_change_id,
+                original: t.text.clone(),
+                action: ChangeAction::ImpliedTag,
+                reason: format!(
+                    "'{}' already means '{}', so the generic tag only repeats it.",
+                    processed_tokens[child].text, t.text
+                ),
+                suggested_alternative: String::new(),
+                framing_alternative: String::new(),
+                mode: 0,
+            });
+            next_change_id += 1;
+            drop.push(i);
+        }
+        let mut i = 0;
+        processed_tokens.retain(|_| {
+            let keep = !drop.contains(&i);
+            i += 1;
+            keep
+        });
+    }
+
     // 8.5 Mutually Exclusive Taxonomy Groups Resolution (Mexes Danbooru Taxonomy)
-    resolve_exclusive_taxonomy_groups(&mut processed_tokens, &mut changes, &mut next_change_id, config.resolve_conflicts_enabled);
+    let has_shortstack_taxonomy = processed_tokens.iter().any(|tok| tok.normalized == "shortstack")
+        || is_dropdown("shortstack");
+    resolve_exclusive_taxonomy_groups(
+        &mut processed_tokens,
+        &mut changes,
+        &mut next_change_id,
+        config.resolve_conflicts_enabled,
+        config.exaggerated_proportions && has_shortstack_taxonomy,
+    );
 
     // Two sizes for the same body part (or two hair lengths) can't both be right:
     // keep the one written first, with a card to bring the other back.
@@ -3038,8 +3364,8 @@ pub fn analyze_with_rules(tokens: &[PromptToken], config: &ScanConfig) -> RuleAn
         // "large breasts". "short" keeps a height difference without that pull.
         // Not for a Bust / Frame choice, and "shortstack" means short and curvy, so its petite stays.
         let curvy = processed_tokens.iter().any(|t| is_big_body_tag(&t.normalized));
-        let shortstack = processed_tokens.iter().any(|t| t.normalized == "shortstack");
-        if curvy {
+        let shortstack = processed_tokens.iter().any(|t| t.normalized == "shortstack") || is_dropdown("shortstack");
+        if curvy && !(shortstack && config.exaggerated_proportions) {
             for t in processed_tokens.iter_mut() {
                 if !SLENDER_TAGS.contains(&t.normalized.as_str())
                     || is_dropdown(&t.normalized)
@@ -3084,37 +3410,117 @@ pub fn analyze_with_rules(tokens: &[PromptToken], config: &ScanConfig) -> RuleAn
         }
     }
 
-    // 10. Proportion Chain Recommendations
-    let prop_tiers = detect_all_proportion_tiers(&processed_tokens);
-    for (tier, tier_tok) in prop_tiers {
-        let rec = get_proportion_recommendations(tier);
-        let clothing_str = rec.clothing_interaction.join(", ");
-        let pose_str = rec.pose_and_physics.join(", ");
-        let neg_str = rec.auto_negative_lock.join(", ");
-
-        // Top 2 clothing and top 2 pose/physics tags as quick suggested companion addition
-        let mut top_companions = Vec::new();
-        for c in rec.clothing_interaction.iter().take(2) {
-            top_companions.push(c.replace('_', " "));
-        }
-        for p in rec.pose_and_physics.iter().take(2) {
-            top_companions.push(p.replace('_', " "));
-        }
-        let suggested_alt = top_companions.join(", ");
-
+    // The hips lock puts `thigh gap` in the negative (condenser::recommended_negative), except with the legs apart:
+    // say so, so a missing `thigh gap` in the negative isn't a surprise
+    if processed_tokens.iter().any(|t| matches!(t.normalized.as_str(), "thick thighs" | "wide hips"))
+        && processed_tokens.iter().any(|t| legs_apart(&t.normalized))
+    {
         changes.push(PromptChange {
             id: next_change_id,
             original: String::new(),
-            action: ChangeAction::Recommendation,
-            reason: format!(
-                "Reinforce '{}':\n• Clothing: {}\n• Pose/Physics: {}\n• Auto-Negative Locks: {}",
-                tier_tok.text, clothing_str, pose_str, neg_str
-            ),
-            suggested_alternative: suggested_alt,
+            action: ChangeAction::ProportionChoice,
+            reason: "Legs apart: 'thigh gap' is left out of the negative, so it doesn't fight the pose (spread thighs separate).".to_string(),
+            suggested_alternative: String::new(),
             framing_alternative: String::new(),
-            mode: 2, // Informational by default; user can click 'Add It' to insert suggested companion tags
+            mode: 0,
         });
         next_change_id += 1;
+    }
+
+    // "Exaggerated": the Bust / Frame picks get their emphasis (`body_emphasis`). Set after the clamp,
+    // on purpose: the user picked them, and a typed weight that's already higher stays.
+    if config.exaggerated_proportions {
+        let bust_tags: Vec<String> = crate::profiles::BUSTS
+            .get(config.bust)
+            .filter(|_| config.bust > 0)
+            .map(|(_, tags)| crate::parser::parse_prompt(tags).into_iter().map(|t| t.normalized).collect())
+            .unwrap_or_default();
+        for t in processed_tokens.iter_mut().filter(|t| is_dropdown(&t.normalized)) {
+            let w = body_emphasis(config.checkpoint, &t.normalized, bust_tags.contains(&t.normalized), config.frame);
+            if w > t.weight {
+                t.weight = w;
+            }
+        }
+    }
+
+    // 10. Proportion Chain Recommendations
+    if config.fit_suggestions {
+        let prop_tiers = detect_all_proportion_tiers(&processed_tokens);
+        let has_shirt = processed_tokens.iter().any(|t| {
+            matches!(
+                t.normalized.as_str(),
+                "shirt" | "blouse" | "top" | "sweater" | "turtleneck" | "jacket" | "uniform" | "school uniform" | "dress shirt"
+            )
+        });
+        let has_legwear = processed_tokens.iter().any(|t| {
+            matches!(
+                t.normalized.as_str(),
+                "thighhighs" | "kneehighs" | "socks" | "stockings" | "pantyhose" | "legwear"
+            ) || ["thighhighs", "kneehighs", "socks", "stockings", "pantyhose", "legwear"]
+                .iter()
+                .any(|w| t.normalized.ends_with(&format!(" {w}")))
+        });
+
+        for (tier, tier_tok) in prop_tiers {
+            let rec = get_proportion_recommendations(tier);
+
+            // Filter clothing tags to only match garments currently worn in prompt
+            let valid_clothing: Vec<&str> = rec.clothing_interaction.iter().copied().filter(|c| {
+                if *c == "skindentation" {
+                    has_legwear
+                } else if c.contains("shirt") || c.contains("clothes") || c.contains("button") {
+                    has_shirt
+                } else {
+                    false
+                }
+            }).collect();
+
+            let pretty = |v: &[&str]| v.iter().map(|t| t.replace('_', " ")).collect::<Vec<_>>().join(", ");
+            let clothing_str = pretty(&valid_clothing);
+            let pose_str = pretty(rec.pose_and_physics);
+
+            // auto-negative lock filtering: if shortstack is present, do not negative-lock "petite"
+            let is_shortstack = processed_tokens.iter().any(|t| t.normalized == "shortstack");
+            let neg_list: Vec<&str> = rec.auto_negative_lock.iter().copied().filter(|n| {
+                if is_shortstack && *n == "petite" {
+                    false
+                } else {
+                    true
+                }
+            }).collect();
+            let neg_str = pretty(&neg_list);
+
+            let mut top_companions = Vec::new();
+            for c in valid_clothing.iter().take(2) {
+                top_companions.push(c.replace('_', " "));
+            }
+            for p in rec.pose_and_physics.iter().take(2) {
+                top_companions.push(p.replace('_', " "));
+            }
+            let suggested_alt = top_companions.join(", ");
+
+            if !suggested_alt.is_empty() {
+                changes.push(PromptChange {
+                    id: next_change_id,
+                    original: String::new(),
+                    action: ChangeAction::Recommendation,
+                    reason: {
+                        // only the lines that have something (fit tags exist only for clothes in the prompt)
+                        let mut r = format!("Reinforce '{}':", tier_tok.text);
+                        for (label, v) in [("Fit", &clothing_str), ("Pose", &pose_str), ("Negative locks", &neg_str)] {
+                            if !v.is_empty() {
+                                r.push_str(&format!("\n• {label}: {v}"));
+                            }
+                        }
+                        r
+                    },
+                    suggested_alternative: suggested_alt,
+                    framing_alternative: String::new(),
+                    mode: 2, // Informational by default; user can click 'Add It' to insert suggested companion tags
+                });
+                next_change_id += 1;
+            }
+        }
     }
 
     // 11. Front-View Camera Angle Protection Card
@@ -3185,7 +3591,9 @@ pub fn analyze_with_rules(tokens: &[PromptToken], config: &ScanConfig) -> RuleAn
     }
 
     // 14. Combo Synergy Recommendation Cards (Mexes Danbooru Taxonomy & 8_combo_synergy_matrix)
-    generate_combo_synergy_cards(&processed_tokens, &mut changes, &mut next_change_id);
+    if config.fit_suggestions {
+        generate_combo_synergy_cards(&processed_tokens, &mut changes, &mut next_change_id);
+    }
 
     RuleAnalysisResult {
         processed_tokens,
@@ -3196,7 +3604,14 @@ pub fn analyze_with_rules(tokens: &[PromptToken], config: &ScanConfig) -> RuleAn
 
 /// The same body-type fix for text the AI wrote: within one character's tags, a slender
 /// tag next to a big chest / hips goes ("petite" becomes "short").
+#[cfg(test)]
 pub fn fix_body_type(tokens: Vec<PromptToken>) -> Vec<PromptToken> {
+    fix_body_type_keeping(tokens, &[])
+}
+
+/// `fix_body_type`, but tags in `keep` (normalized: the Bust / Frame dropdown picks, `chosen_body_tags`)
+/// are never changed, the same protection the rule path gives them.
+pub fn fix_body_type_keeping(tokens: Vec<PromptToken>, keep: &[String]) -> Vec<PromptToken> {
     if !tokens.iter().any(|t| is_big_body_tag(&t.normalized)) {
         return tokens;
     }
@@ -3205,7 +3620,10 @@ pub fn fix_body_type(tokens: Vec<PromptToken>) -> Vec<PromptToken> {
     tokens
         .into_iter()
         .filter_map(|mut t| {
-            if !SLENDER_TAGS.contains(&t.normalized.as_str()) || (shortstack && t.normalized == "petite") {
+            if !SLENDER_TAGS.contains(&t.normalized.as_str())
+                || (shortstack && t.normalized == "petite")
+                || keep.contains(&t.normalized)
+            {
                 return Some(t);
             }
             if t.normalized != "petite" {
@@ -3217,6 +3635,107 @@ pub fn fix_body_type(tokens: Vec<PromptToken>) -> Vec<PromptToken> {
             Some(t)
         })
         .collect()
+}
+
+/// The Bust / Frame dropdown picks' tags (normalized), minus any the LoRA box overrides (the LoRA box beats
+/// a dropdown, as in `analyze_with_rules`).
+pub fn chosen_body_tags(config: &ScanConfig) -> Vec<String> {
+    let loras = crate::parser::parse_prompt(&config.lora_tags_raw);
+    [(crate::profiles::BUSTS, config.bust), (crate::profiles::FRAMES, config.frame)]
+        .into_iter()
+        .filter_map(|(list, i)| list.get(i).filter(|_| i > 0))
+        .flat_map(|(_, tags)| crate::parser::parse_prompt(tags))
+        .map(|t| t.normalized)
+        .filter(|n| !loras.iter().any(|l| l.normalized == *n || tags_conflict(&l.normalized, n)))
+        .collect()
+}
+
+/// Puts the Bust / Frame dropdown picks into AI text (one character's tags): the text's own tags of that
+/// list go (for a bust, any other breast size too), the chosen tags are added once at the end, then the
+/// body-type fix runs without touching them. Returns the text unchanged when nothing had to change.
+/// The weight an "Exaggerated" Bust / Frame pick gets (1.0 = none). Measured by the user on Anima, where
+/// `(gigantic breasts:2.5)` gave the wanted size and several heavy weights at once broke the anatomy, so only
+/// the bust and the frame's key tags are emphasized. CLIP checkpoints burn above ~1.5, so they get less;
+/// Flux ignores weights.
+pub fn body_emphasis(checkpoint: crate::profiles::CheckpointProfile, tag: &str, is_bust: bool, frame: usize) -> f32 {
+    use crate::profiles::CheckpointProfile as C;
+    let key_frame_tag = matches!(tag, "shortstack" | "wide hips" | "thick thighs" | "muscular female");
+    let label = crate::condenser::frame_label(frame);
+    match checkpoint {
+        C::Flux => 1.0,
+        // the waist cinch of the figures that have one (an hourglass leans on it most), and Muscular's abs
+        C::Anima if tag == "narrow waist" && label == "hourglass" => 1.3,
+        _ if tag == "narrow waist" && matches!(label, "shortstack" | "pear" | "hourglass") => 1.2,
+        _ if tag == "abs" && label == "muscular" => 1.2,
+        C::Anima if is_bust => 2.5,
+        C::Anima if tag == "shortstack" => 1.4,
+        C::Anima if key_frame_tag => 1.5,
+        _ if is_bust => 1.4,
+        _ if key_frame_tag => 1.2,
+        _ => 1.0,
+    }
+}
+
+#[cfg(test)]
+pub fn apply_body_choices(text: &str, bust: usize, frame: usize) -> String {
+    apply_body_choices_with(text, bust, frame, None)
+}
+
+/// `apply_body_choices` with the "Exaggerated" emphasis (`body_emphasis`) for `exaggerate = Some(checkpoint)`.
+pub fn apply_body_choices_with(
+    text: &str,
+    bust: usize,
+    frame: usize,
+    exaggerate: Option<crate::profiles::CheckpointProfile>,
+) -> String {
+    let mut tokens = crate::parser::parse_prompt(text);
+    let before: Vec<String> = tokens.iter().map(|t| t.raw.clone()).collect();
+    let mut keep: Vec<String> = Vec::new();
+    for (list, idx, is_bust) in [(crate::profiles::BUSTS, bust, true), (crate::profiles::FRAMES, frame, false)] {
+        let Some((_, tags)) = list.get(idx).filter(|_| idx > 0) else { continue };
+        let group = crate::profiles::group_tags(list);
+        let chosen = crate::parser::parse_prompt(tags);
+        let is_chosen = |n: &str| chosen.iter().any(|c| c.normalized == n);
+        let unwanted = |n: &str| (group.iter().any(|g| g == n) || (is_bust && detect_breast_tier(n).is_some())) && !is_chosen(n);
+        // a dynamic group `{large breasts|huge breasts}` loses its unwanted options (and goes when none is left)
+        for t in tokens.iter_mut() {
+            let Some(inner) = t.raw.trim().strip_prefix('{').and_then(|r| r.strip_suffix('}')) else { continue };
+            let opts: Vec<&str> = inner.split('|').collect();
+            let kept: Vec<&str> = opts.iter().copied().filter(|o| !unwanted(&crate::parser::parse_prompt(o).first().map(|p| p.normalized.clone()).unwrap_or_default())).collect();
+            if kept.len() == opts.len() {
+                continue;
+            }
+            let raw = match kept.len() {
+                0 => String::new(),
+                1 => kept[0].trim().to_string(),
+                _ => format!("{{{}}}", kept.join("|")),
+            };
+            *t = crate::parser::parse_prompt(&raw).into_iter().next().unwrap_or_else(|| PromptToken { raw: String::new(), ..t.clone() });
+        }
+        tokens.retain(|t| !t.raw.is_empty() && !unwanted(&t.normalized));
+        let chosen_norms: Vec<String> = chosen.iter().map(|c| c.normalized.clone()).collect();
+        for c in chosen {
+            keep.push(c.normalized.clone());
+            if !tokens.iter().any(|t| t.normalized == c.normalized) {
+                tokens.push(c);
+            }
+        }
+        if let Some(cp) = exaggerate {
+            for t in tokens.iter_mut().filter(|t| chosen_norms.contains(&t.normalized)) {
+                let w = body_emphasis(cp, &t.normalized, is_bust, frame);
+                if w > t.weight {
+                    t.weight = w;
+                    t.raw = t.format_for_output(true);
+                }
+            }
+        }
+    }
+    let tokens = fix_body_type_keeping(tokens, &keep);
+    let after: Vec<String> = tokens.iter().map(|t| t.raw.clone()).collect();
+    if after == before {
+        return text.to_string();
+    }
+    after.join(", ")
 }
 
 /// Body-type tags that pull toward a small, slender figure.
@@ -3355,6 +3874,69 @@ pub fn tags_conflict(keep: &str, tag: &str) -> bool {
 /// "flat chest" / "huge breasts", "short hair" / "long hair". Colors don't count
 /// (multicolored or streaked hair really has two), and "long hair" + "very long hair"
 /// is how Danbooru tags it, so that pair is fine.
+/// "+ Quality": puts the checkpoint's quality tags (`canonical_quality_tags`) that Before lacks in
+/// front of it. An explicit button, so it isn't the "never add tags" rule's business. No rating tags.
+pub fn add_quality_tags(prompt: &str, checkpoint: crate::profiles::CheckpointProfile) -> (String, Vec<&'static str>) {
+    // "score_9", "score 9", "(score_9:1.1)" and "[score_9]" are the same tag
+    let norm = |t: &str| t.trim().trim_matches(['(', ')', '[', ']']).split(':').next().unwrap_or("").trim().to_lowercase().replace('_', " ");
+    let present: Vec<String> = prompt.split([',', '\n']).map(norm).collect();
+    let missing: Vec<&'static str> =
+        checkpoint.canonical_quality_tags().iter().copied().filter(|q| !present.contains(&norm(q))).collect();
+    if missing.is_empty() {
+        return (prompt.to_string(), missing);
+    }
+    let rest = prompt.trim_start();
+    let text = if rest.is_empty() { missing.join(", ") } else { format!("{}, {rest}", missing.join(", ")) };
+    (text, missing)
+}
+
+/// Generic tag → the specific tags that imply it: (generic, exact children, child suffixes). Only
+/// clear parent / child pairs; a suffix child is `<words> <suffix>` (`witch hat`, `red bikini`).
+const IMPLIED_PARENTS: &[(&str, &[&str], &[&str])] = &[
+    ("swimsuit", &["bikini", "bikini top", "bikini bottom", "bikini top only"], &[" swimsuit", " bikini"]),
+    ("bikini", &[], &[" bikini"]),
+    ("sword", &["katana"], &[" sword"]),
+    ("weapon", &["sword", "katana", "gun", "rifle", "handgun"], &[" weapon", " sword", " gun"]),
+    ("gun", &["handgun", "rifle", "assault rifle", "shotgun"], &[" gun"]),
+    ("hat", &[], &[" hat"]),
+    ("horns", &[], &[" horns"]),
+    ("wings", &[], &[" wings"]),
+    ("glasses", &[], &[" glasses"]),
+    ("dress", &[], &[" dress"]),
+    ("skirt", &["miniskirt"], &[" skirt"]),
+    ("shirt", &[], &[" shirt"]),
+    ("jacket", &[], &[" jacket"]),
+    ("boots", &[], &[" boots"]),
+    ("gloves", &[], &[" gloves"]),
+    ("thighhighs", &[], &[" thighhighs"]),
+    ("footwear", &["shoes", "boots", "loafers", "sneakers", "sandals", "high heels", "slippers", "geta", "zori", "uwabaki", "mary janes"], &[" footwear", " shoes", " boots"]),
+    ("shoes", &["loafers", "sneakers", "sandals", "high heels", "slippers", "geta", "zori", "ballet slippers", "mary janes", "uwabaki"], &[" shoes"]),
+    ("sitting", &["seiza", "wariza", "indian style"], &[]),
+    ("kneeling", &["seiza"], &[]),
+    ("supporting own breasts", &["two-handed breast hold", "grabbing own breast", "breast hold", "hands on own chest"], &[]),
+];
+
+/// Whether the tag `child` implies the generic tag `generic` (`bikini` → `swimsuit`, `holding sword`
+/// → `sword`, `witch hat` → `hat`). Absent / removed items imply nothing (`no hat`, `unworn hat`), and
+/// "holding …" implies only weapons (a held hat isn't a worn one).
+pub fn implies(child: &str, generic: &str) -> bool {
+    if child == generic {
+        return false;
+    }
+    let Some((_, exact, suffixes)) = IMPLIED_PARENTS.iter().find(|(g, _, _)| *g == generic) else {
+        return false;
+    };
+    if ["no ", "without ", "unworn ", "removed ", "missing ", "broken "].iter().any(|p| child.starts_with(p)) {
+        return false;
+    }
+    let weapon = matches!(generic, "sword" | "weapon" | "gun");
+    if child.starts_with("holding ") && !weapon {
+        return false;
+    }
+    let base = child.strip_prefix("holding ").filter(|_| weapon).unwrap_or(child);
+    exact.contains(&base) || suffixes.iter().any(|s| child.ends_with(s)) || (weapon && base == generic)
+}
+
 pub fn size_conflict(a: &str, b: &str) -> bool {
     attribute_conflict(a, b, &[SIZE_WORDS, LENGTH_WORDS])
 }
@@ -3408,8 +3990,8 @@ pub fn insert_lora_block(text: &str, config: &ScanConfig, strip_conflicts: bool)
 /// minus tags that contradict them).
 pub fn without_lora_tags(text: &str, config: &ScanConfig, strip_conflicts: bool) -> Vec<PromptToken> {
     let tokens = strip_lora_tokens(crate::parser::parse_prompt(text), &config.lora_tags_raw, strip_conflicts);
-    // AI text gets the same body-type fix the rule cards apply
-    if strip_conflicts { fix_body_type(tokens) } else { tokens }
+    // AI text gets the same body-type fix the rule cards apply (never on a Bust / Frame pick)
+    if strip_conflicts { fix_body_type_keeping(tokens, &chosen_body_tags(config)) } else { tokens }
 }
 
 /// `tokens` minus copies of the tags in `lora_raw` (and, with `strip_conflicts`, minus
@@ -3448,6 +4030,7 @@ pub fn resolve_exclusive_taxonomy_groups(
     changes: &mut Vec<PromptChange>,
     next_change_id: &mut usize,
     resolve_conflicts: bool,
+    bypass_proportions: bool,
 ) {
     // 1. Stature: Tall vs Short
     const TALL_TAGS: &[&str] = &["tall female", "tall", "long legs"];
@@ -3480,62 +4063,66 @@ pub fn resolve_exclusive_taxonomy_groups(
     }
 
     // 2. Hip & Thigh scale: Curvy/Thick vs Thin/Narrow
-    const CURVY_LOWER: &[&str] = &["wide hips", "thick thighs", "plump thighs"];
-    const THIN_LOWER: &[&str] = &["narrow hips", "thin legs", "skinny legs", "stick legs"];
-    let has_curvy_lower = tokens.iter().find(|t| CURVY_LOWER.contains(&t.normalized.as_str())).cloned();
-    if let Some(curvy_tok) = has_curvy_lower {
-        let losers: Vec<PromptToken> = tokens
-            .iter()
-            .filter(|t| THIN_LOWER.contains(&t.normalized.as_str()))
-            .cloned()
-            .collect();
-        for loser in losers {
-            if resolve_conflicts {
-                tokens.retain(|t| t.normalized != loser.normalized);
+    if !bypass_proportions {
+        const CURVY_LOWER: &[&str] = &["wide hips", "thick thighs", "plump thighs"];
+        const THIN_LOWER: &[&str] = &["narrow hips", "thin legs", "skinny legs", "stick legs"];
+        let has_curvy_lower = tokens.iter().find(|t| CURVY_LOWER.contains(&t.normalized.as_str())).cloned();
+        if let Some(curvy_tok) = has_curvy_lower {
+            let losers: Vec<PromptToken> = tokens
+                .iter()
+                .filter(|t| THIN_LOWER.contains(&t.normalized.as_str()))
+                .cloned()
+                .collect();
+            for loser in losers {
+                if resolve_conflicts {
+                    tokens.retain(|t| t.normalized != loser.normalized);
+                }
+                changes.push(PromptChange {
+                    id: *next_change_id,
+                    original: loser.text.clone(),
+                    action: ChangeAction::SizeConflict,
+                    reason: format!(
+                        "'{}' conflicts with dominant '{}' in exclusive hip_thigh_scale taxonomy.",
+                        loser.text, curvy_tok.text
+                    ),
+                    suggested_alternative: String::new(),
+                    framing_alternative: String::new(),
+                    mode: if resolve_conflicts { 0 } else { 2 },
+                });
+                *next_change_id += 1;
             }
-            changes.push(PromptChange {
-                id: *next_change_id,
-                original: loser.text.clone(),
-                action: ChangeAction::SizeConflict,
-                reason: format!(
-                    "'{}' conflicts with dominant '{}' in exclusive hip_thigh_scale taxonomy.",
-                    loser.text, curvy_tok.text
-                ),
-                suggested_alternative: String::new(),
-                framing_alternative: String::new(),
-                mode: if resolve_conflicts { 0 } else { 2 },
-            });
-            *next_change_id += 1;
         }
     }
 
     // 3. Body Frame: Curvy/Full vs Slender/Skinny
-    const CURVY_FRAME: &[&str] = &["shortstack", "plump", "chubby", "curvy", "voluptuous"];
-    const SLENDER_FRAME: &[&str] = &["slender", "skinny"];
-    let has_curvy_frame = tokens.iter().find(|t| CURVY_FRAME.contains(&t.normalized.as_str())).cloned();
-    if let Some(curvy_tok) = has_curvy_frame {
-        let losers: Vec<PromptToken> = tokens
-            .iter()
-            .filter(|t| SLENDER_FRAME.contains(&t.normalized.as_str()))
-            .cloned()
-            .collect();
-        for loser in losers {
-            if resolve_conflicts {
-                tokens.retain(|t| t.normalized != loser.normalized);
+    if !bypass_proportions {
+        const CURVY_FRAME: &[&str] = &["shortstack", "plump", "chubby", "curvy", "voluptuous"];
+        const SLENDER_FRAME: &[&str] = &["slender", "skinny"];
+        let has_curvy_frame = tokens.iter().find(|t| CURVY_FRAME.contains(&t.normalized.as_str())).cloned();
+        if let Some(curvy_tok) = has_curvy_frame {
+            let losers: Vec<PromptToken> = tokens
+                .iter()
+                .filter(|t| SLENDER_FRAME.contains(&t.normalized.as_str()))
+                .cloned()
+                .collect();
+            for loser in losers {
+                if resolve_conflicts {
+                    tokens.retain(|t| t.normalized != loser.normalized);
+                }
+                changes.push(PromptChange {
+                    id: *next_change_id,
+                    original: loser.text.clone(),
+                    action: ChangeAction::SizeConflict,
+                    reason: format!(
+                        "'{}' conflicts with dominant '{}' in exclusive body_frame taxonomy.",
+                        loser.text, curvy_tok.text
+                    ),
+                    suggested_alternative: String::new(),
+                    framing_alternative: String::new(),
+                    mode: if resolve_conflicts { 0 } else { 2 },
+                });
+                *next_change_id += 1;
             }
-            changes.push(PromptChange {
-                id: *next_change_id,
-                original: loser.text.clone(),
-                action: ChangeAction::SizeConflict,
-                reason: format!(
-                    "'{}' conflicts with dominant '{}' in exclusive body_frame taxonomy.",
-                    loser.text, curvy_tok.text
-                ),
-                suggested_alternative: String::new(),
-                framing_alternative: String::new(),
-                mode: if resolve_conflicts { 0 } else { 2 },
-            });
-            *next_change_id += 1;
         }
     }
 }
@@ -3555,79 +4142,47 @@ pub const COMBO_SYNERGY_RULES: &[ComboSynergyRule] = &[
         anatomy_any: &["large breasts", "huge breasts", "gigantic breasts", "hyper breasts", "enormous breasts"],
         garment_any: &["shirt", "blouse", "collared shirt", "dress shirt", "cardigan", "vest", "button-up"],
         pose_any: &[],
-        recommend_tags: &["button gap", "popping button", "taut shirt", "button strain"],
-        reason: "Full bust volume with a buttoned shirt creates natural fabric tension. Recommend adding button gap, popping button, or taut shirt.",
+        recommend_tags: &["button gap", "popped button", "taut shirt"],
+        reason: "Full bust volume with a buttoned shirt creates natural fabric tension. Recommend adding button gap, popped button, or taut shirt.",
     },
     ComboSynergyRule {
-        name: "Bust & Knit Sweater Shelf",
+        name: "Bust & Knit Sweater Tension",
         anatomy_any: &["large breasts", "huge breasts", "gigantic breasts", "enormous breasts"],
-        garment_any: &["sweater", "turtleneck", "ribbed sweater", "virgin killer sweater", "knit sweater"],
+        garment_any: &["sweater", "turtleneck", "knit sweater"],
         pose_any: &[],
-        recommend_tags: &["boob shelf", "taut clothes", "framed breasts", "cleavage cutout"],
-        reason: "Full bust volume with a knit sweater forms a defined shelf profile. Recommend boob shelf, taut clothes, or framed breasts.",
+        recommend_tags: &["taut clothes", "framed breasts"],
+        reason: "Full bust volume with a knit sweater forms defined contours. Recommend taut clothes or framed breasts.",
     },
     ComboSynergyRule {
         name: "Curvy Thighs & Legwear Indentation",
         anatomy_any: &["thick thighs", "wide hips", "plump thighs", "curvy"],
-        garment_any: &["thighhighs", "kneehighs", "pantyhose", "garter straps", "thigh strap", "stockings"],
+        garment_any: &["thighhighs", "kneehighs", "pantyhose", "stockings"],
         pose_any: &[],
-        recommend_tags: &["skindentation", "thigh squish", "taut legwear"],
+        recommend_tags: &["skindentation"],
         reason: "Curvy thighs paired with snug legwear naturally produce skindentation and thigh squish.",
-    },
-    ComboSynergyRule {
-        name: "Curvy Hips & Snug Shorts",
-        anatomy_any: &["thick thighs", "wide hips", "huge ass", "curvy"],
-        garment_any: &["shorts", "denim shorts", "hotpants", "micro shorts", "booty shorts"],
-        pose_any: &[],
-        recommend_tags: &["tight shorts", "muffin top", "low-rise shorts", "frayed shorts"],
-        reason: "Curvy hips and thighs with shorts create snug fit contours. Recommend tight shorts or low-rise shorts.",
     },
     ComboSynergyRule {
         name: "Hourglass & High-Slit Dress",
         anatomy_any: &["wide hips", "broad hips", "pear shaped", "huge hips", "narrow waist wide hips", "hourglass figure"],
-        garment_any: &["china dress", "qipao", "cheongsam", "dress", "skirt", "bodycon dress"],
+        garment_any: &["china dress", "qipao", "cheongsam", "slit dress", "slit skirt"],
         pose_any: &[],
-        recommend_tags: &["hip vent", "high side slit", "side slit", "pelvic curtain", "bodycon dress"],
-        reason: "Hourglass proportions with a dress or qipao benefit from high side slits and tailored contours.",
-    },
-    ComboSynergyRule {
-        name: "Hourglass & High-Leg Cut",
-        anatomy_any: &["wide hips", "broad hips", "hourglass figure", "thick thighs"],
-        garment_any: &["bikini", "swimsuit", "leotard", "bodysuit", "panties", "underwear"],
-        pose_any: &[],
-        recommend_tags: &["highleg bikini", "highleg panties", "highleg leotard", "side-tie bikini", "hip chain"],
-        reason: "Curvy silhouette with swimwear or leotard looks best with highleg cuts and side-tie accents.",
-    },
-    ComboSynergyRule {
-        name: "Curvy Hips & Fitted Jeans",
-        anatomy_any: &["wide hips", "narrow waist wide hips", "curvy"],
-        garment_any: &["pants", "jeans", "shorts", "denim shorts"],
-        pose_any: &[],
-        recommend_tags: &["tight shorts", "muffin top", "low-rise shorts", "frayed shorts"],
-        reason: "Curvy hips paired with denim emphasize waist-to-hip taper. Recommend tight shorts or low-rise cut.",
+        recommend_tags: &["side slit", "hip vent"],
+        reason: "Hourglass proportions with a slit dress or qipao benefit from side slits and tailored contours.",
     },
     ComboSynergyRule {
         name: "Pronounced Hips & Posture Synergy",
         anatomy_any: &["wide hips", "pronounced hips", "broad hips", "narrow waist wide hips"],
         garment_any: &[],
         pose_any: &["standing", "front view", "full body", "cowboy shot"],
-        recommend_tags: &["hips cocked", "hand on hip", "hands on hips", "contrapposto", "hip sway"],
-        reason: "Accentuate hip proportions with classic weight-shifted posture. Recommend contrapposto or hand on hip.",
-    },
-    ComboSynergyRule {
-        name: "Hourglass Midsection Accessories",
-        anatomy_any: &["wide hips", "narrow waist wide hips"],
-        garment_any: &[],
-        pose_any: &[],
-        recommend_tags: &["hip chain", "waist chain", "belly chain", "hip holster", "hip bag"],
-        reason: "Highlight hourglass midsection with waist accessories. Recommend waist chain, hip chain, or belly chain.",
+        recommend_tags: &["contrapposto", "hand on own hip", "hands on own hips"],
+        reason: "Accentuate hip proportions with classic weight-shifted posture. Recommend contrapposto or hand on own hip.",
     },
     ComboSynergyRule {
         name: "Petite Stature & Weapon Framing",
         anatomy_any: &["short", "petite", "loli"],
         garment_any: &["staff", "polearm", "huge weapon", "giant weapon", "scythe", "greatsword", "sword"],
         pose_any: &[],
-        recommend_tags: &["upper body", "cowboy shot", "cropped weapon", "head in frame"],
+        recommend_tags: &["upper body", "cowboy shot"],
         reason: "Petite stature with large weapons can be dwarfed in wide shots. Recommend cowboy shot or upper body to keep head in frame.",
     },
 ];
@@ -3638,12 +4193,17 @@ pub fn generate_combo_synergy_cards(
     next_change_id: &mut usize,
 ) {
     let norms: Vec<&str> = tokens.iter().map(|t| t.normalized.as_str()).collect();
-    let has_any = |list: &[&str]| -> bool {
-        list.is_empty() || list.iter().any(|target| norms.iter().any(|n| *n == *target || n.contains(target)))
+    let tag_matches = |norm: &str, target: &str| -> bool {
+        norm == target || norm.split_whitespace().any(|w| w == target)
     };
+    let has_any = |list: &[&str]| -> bool {
+        list.is_empty() || list.iter().any(|target| norms.iter().any(|n| tag_matches(n, target)))
+    };
+    // body tags must be the whole tag: whole-word matching let "short" fire on "short hair" / "short sleeves"
+    let has_body = |list: &[&str]| -> bool { list.is_empty() || list.iter().any(|target| norms.iter().any(|n| n == target)) };
 
     for rule in COMBO_SYNERGY_RULES {
-        let match_anatomy = has_any(rule.anatomy_any);
+        let match_anatomy = has_body(rule.anatomy_any);
         let match_garment = has_any(rule.garment_any);
         let match_pose = has_any(rule.pose_any);
 
@@ -3651,7 +4211,7 @@ pub fn generate_combo_synergy_cards(
             let missing: Vec<&str> = rule
                 .recommend_tags
                 .iter()
-                .filter(|rec| !norms.iter().any(|n| *n == **rec || n.contains(*rec)))
+                .filter(|rec| !norms.iter().any(|n| tag_matches(n, rec)))
                 .copied()
                 .collect();
 
@@ -3689,6 +4249,8 @@ mod tests {
             cleanup_enabled: true,
             resolve_conflicts_enabled: true,
             clamp_weights_enabled: true,
+            fit_suggestions: true,
+            exaggerated_proportions: false,
 
             camera_angle: 0,
 
@@ -3709,6 +4271,220 @@ mod tests {
         let res = analyze_with_rules(&toks, config);
         let out = build_condensed_output(prompt, &res.processed_tokens, &res.changes, config);
         (res, out.final_prompt)
+    }
+
+    #[test]
+    fn exaggerated_picks_are_emphasized_per_checkpoint() {
+        use crate::profiles::CheckpointProfile as C;
+        let out_for = |cp: C, exaggerated: bool, prompt: &str| {
+            let mut c = cfg(TargetView::None);
+            c.checkpoint = cp;
+            c.bust = 6; // gigantic breasts
+            c.frame = 2; // shortstack
+            c.exaggerated_proportions = exaggerated;
+            run(prompt, &c).1
+        };
+        let anima = out_for(C::Anima, true, "1girl, smile");
+        assert!(anima.contains("(gigantic breasts:2.5)") && anima.contains("(shortstack:1.4)") && anima.contains("(wide hips:1.5)"), "{anima}");
+        // the waist cinch gets a light 1.2 (the user's plan); curvy and petite stay plain
+        assert!(anima.contains("(narrow waist:1.2)") && !anima.contains("(curvy:") && !anima.contains("(petite:"), "{anima}");
+        let pony = out_for(C::PonyV6, true, "1girl, smile");
+        assert!(pony.contains("(gigantic breasts:1.4)") && pony.contains("(shortstack:1.2)"), "{pony}");
+        // off: plain tags
+        let plain = out_for(C::Anima, false, "1girl, smile");
+        assert!(plain.contains("gigantic breasts") && !plain.contains("(gigantic breasts:"), "{plain}");
+        // a typed weight that's already higher stays (and the clamp doesn't cut the emphasis)
+        let typed = out_for(C::Anima, true, "1girl, (gigantic breasts:3)");
+        assert!(typed.contains("(gigantic breasts:2.5)") || typed.contains("(gigantic breasts:3)"), "{typed}");
+        // the AI views get the same emphasis
+        let ai = apply_body_choices_with("1girl, large breasts, slender", 6, 2, Some(C::Anima));
+        assert!(ai.contains("(gigantic breasts:2.5)") && !ai.contains("large breasts"), "{ai}");
+        assert_eq!(body_emphasis(C::Flux, "gigantic breasts", true, 2), 1.0);
+    }
+
+    #[test]
+    fn exaggerated_frame_reinforcement_follows_the_plan() {
+        use crate::profiles::CheckpointProfile as C;
+        let both = |cp: C, frame: usize, bust: usize, exaggerated: bool| {
+            let mut c = cfg(TargetView::None);
+            c.checkpoint = cp;
+            c.frame = frame;
+            c.bust = bust;
+            c.exaggerated_proportions = exaggerated;
+            let out = run("1girl, smile", &c).1;
+            let neg = crate::condenser::recommended_negative(&c, &out);
+            (out, neg)
+        };
+        // Pear (4) on Anima: narrow shoulders + waist cinch, shoulder / top-heavy guards, the 17-term error guard
+        let (out, neg) = both(C::Anima, 4, 0, true);
+        assert!(out.contains("narrow shoulders") && out.contains("(narrow waist:1.2)"), "{out}");
+        for t in ["broad shoulders", "wide shoulders", "V-taper", "top-heavy", "anatomical nonsense", "fused breasts"] {
+            assert!(neg.contains(t), "{t}: {neg}");
+        }
+        // Pear on Pony: no narrow shoulders (CLIP doesn't read the words), guards there, only the short error guard
+        let (out, neg) = both(C::PonyV6, 4, 0, true);
+        assert!(!out.contains("narrow shoulders") && neg.contains("broad shoulders") && neg.contains("malformed hands"), "{out} | {neg}");
+        assert!(!neg.contains("anatomical nonsense"), "{neg}");
+        // Hourglass (5) on Anima: a stronger waist; Muscular (6): abs and its negatives
+        assert!(both(C::Anima, 5, 0, true).0.contains("(narrow waist:1.3)"));
+        let (out, neg) = both(C::Anima, 6, 0, true);
+        assert!(out.contains("(abs:1.2)") && neg.contains("noodle arms") && neg.contains("soft body"), "{out} | {neg}");
+        // Flat chest (bust 1) + Petite (1): the flat guard, and no "mature female"
+        let (_, neg) = both(C::Anima, 1, 1, true);
+        assert!(neg.contains("breast press") && neg.contains("cleavage") && neg.contains("giantess"), "{neg}");
+        assert!(!neg.contains("mature female"), "{neg}");
+        // off: none of it
+        for frame in 0..=6 {
+            let (out, neg) = both(C::Anima, frame, 6, false);
+            assert!(!out.contains("narrow shoulders") && !out.contains("(narrow waist:") && !out.contains("(abs:"), "{frame}: {out}");
+            assert!(!neg.contains("broad shoulders") && !neg.contains("extra limbs") && !neg.contains("V-taper"), "{frame}: {neg}");
+        }
+    }
+
+    #[test]
+    fn thigh_gap_goes_with_thick_thighs_only_when_the_legs_are_apart() {
+        let config = cfg(TargetView::None);
+        let gap_cards = |p: &str| run(p, &config).0.changes.iter().filter(|c| c.original == "thigh gap").count();
+        assert_eq!(gap_cards("1girl, thick thighs, thigh gap"), 1);
+        assert_eq!(gap_cards("1girl, thick thighs, thigh gap, spread legs"), 0);
+        // the hips lock leaves "thigh gap" out of the negative with the legs apart, and says so
+        let neg = |p: &str| crate::condenser::recommended_negative(&config, p);
+        assert!(neg("1girl, thick thighs").contains("thigh gap"));
+        assert!(!neg("1girl, thick thighs, spread legs").contains("thigh gap"));
+        let (res, _) = run("1girl, thick thighs, wide stance", &config);
+        assert!(res.changes.iter().any(|c| c.reason.starts_with("Legs apart")));
+    }
+
+    #[test]
+    fn every_suggested_tag_is_a_real_danbooru_tag() {
+        // what a FIT & DYNAMICS card can offer (core_reinforcers are never offered on a card)
+        let Some(home) = std::env::var_os("HOME") else { return };
+        let csv = std::path::Path::new(&home).join(".local/share/prompt-condenser/wd-eva02-large-tagger-v3/selected_tags.csv");
+        let Ok(text) = std::fs::read_to_string(csv) else { return };
+        let known: HashSet<String> = text.lines().skip(1).filter_map(|l| l.split(',').nth(1)).map(|n| n.replace('_', " ")).collect();
+        let mut offered: Vec<&str> = COMBO_SYNERGY_RULES.iter().flat_map(|r| r.recommend_tags.iter().copied()).collect();
+        for tier in [
+            ProportionTier::FlatChest, ProportionTier::SmallBreasts, ProportionTier::MediumBreasts, ProportionTier::LargeBreasts,
+            ProportionTier::HugeBreasts, ProportionTier::GiganticBreasts, ProportionTier::ThickThighsAndHips, ProportionTier::MuscularFemale,
+        ] {
+            let rec = get_proportion_recommendations(tier);
+            offered.extend(rec.clothing_interaction.iter().chain(rec.pose_and_physics).copied());
+        }
+        let unknown: Vec<&str> = offered.into_iter().filter(|t| !known.contains(&t.replace('_', " "))).collect();
+        assert!(unknown.is_empty(), "suggested tags that aren't Danbooru tags: {unknown:?}");
+    }
+
+    #[test]
+    fn posture_leg_and_boot_conflicts_follow_the_rules() {
+        let config = cfg(TargetView::None);
+        let cards = |p: &str| {
+            let (res, out) = run(p, &config);
+            let c: Vec<(String, ChangeAction)> = res.changes.iter().map(|c| (c.original.clone(), c.action)).collect();
+            (c, out)
+        };
+        // seiza is a kind of sitting: the generic tag goes, never the specific one
+        let (c, out) = cards("1girl, sitting, seiza");
+        assert!(c.contains(&("sitting".into(), ChangeAction::ImpliedTag)) && out.contains("seiza"), "{c:?} {out}");
+        // seiza folds the legs under; standing on one leg lifts one
+        let (c, _) = cards("1girl, seiza, crossed legs");
+        assert!(c.contains(&("crossed legs".into(), ChangeAction::PoseConflict)), "{c:?}");
+        let (c, _) = cards("1girl, standing on one leg, spread legs");
+        assert!(c.contains(&("spread legs".into(), ChangeAction::PoseConflict)), "{c:?}");
+        // normal combinations stay
+        for p in ["1girl, sitting, crossed legs", "1girl, standing, leaning forward", "1girl, sitting, leaning forward", "1girl, squatting, spread legs"] {
+            let (c, _) = cards(p);
+            assert!(!c.iter().any(|(_, a)| *a == ChangeAction::PoseConflict), "{p}: {c:?}");
+        }
+        // one boot height, the first written wins
+        let (c, out) = cards("1girl, thigh boots, knee boots");
+        assert!(c.contains(&("knee boots".into(), ChangeAction::PoseConflict)) && out.contains("thigh boots"), "{c:?}");
+        // several people: one can stand while another sits, one waves while another crosses her arms
+        for p in ["2girls, standing, sitting", "2girls, crossed arms, waving, v", "1girl, 1boy, standing, kneeling"] {
+            let (c, _) = cards(p);
+            assert!(!c.iter().any(|(_, a)| *a == ChangeAction::PoseConflict), "{p}: {c:?}");
+        }
+        // footwear that isn't worn doesn't cancel barefoot
+        for p in ["1girl, barefoot, shoes removed", "1girl, barefoot, unworn shoes", "1girl, barefoot, holding shoes"] {
+            let (c, _) = cards(p);
+            assert!(!c.iter().any(|(o, _)| o == "barefoot"), "{p}: {c:?}");
+        }
+        let (c, _) = cards("1girl, barefoot, sneakers");
+        assert!(c.iter().any(|(o, _)| o == "barefoot"), "{c:?}");
+    }
+
+    #[test]
+    fn body_type_card_lists_only_what_applies() {
+        let config = cfg(TargetView::None);
+        let (res, _) = run("1girl, gigantic breasts", &config);
+        let card = res.changes.iter().find(|c| c.reason.starts_with("Reinforce")).expect("body-type card");
+        assert!(!card.reason.contains("Clothing") && !card.reason.contains("Fit:") && !card.reason.contains('_'), "{}", card.reason);
+        // striped thighhighs count as legwear, so the fit tag is offered
+        let (res, _) = run("1girl, wide hips, striped thighhighs", &config);
+        assert!(res.changes.iter().any(|c| c.reason.starts_with("Reinforce") && c.suggested_alternative.contains("skindentation")));
+        // the switch turns every FIT & DYNAMICS card off
+        let mut off = config.clone();
+        off.fit_suggestions = false;
+        let (res, _) = run("1girl, gigantic breasts, shirt, wide hips, thighhighs", &off);
+        assert!(!res.changes.iter().any(|c| c.action == ChangeAction::Recommendation));
+    }
+
+    #[test]
+    fn generic_tags_implied_by_specific_ones_get_a_card() {
+        let tags = |out: &str| out.split(", ").map(str::to_string).collect::<Vec<_>>();
+        let (res, out) = run("1girl, bikini, swimsuit, holding sword, sword, witch hat, hat, beach", &cfg(TargetView::None));
+        let implied: Vec<&str> =
+            res.changes.iter().filter(|c| c.action == ChangeAction::ImpliedTag).map(|c| c.original.as_str()).collect();
+        assert_eq!(implied, ["swimsuit", "sword", "hat"]);
+        let t = tags(&out);
+        for kept in ["bikini", "holding sword", "witch hat", "beach"] {
+            assert!(t.contains(&kept.to_string()), "{kept} kept: {out}");
+        }
+        for gone in ["swimsuit", "sword", "hat"] {
+            assert!(!t.contains(&gone.to_string()), "{gone} pruned: {out}");
+        }
+        // Keep Original brings the generic tag back
+        let config = cfg(TargetView::None);
+        let prompt = "1girl, red bikini, bikini";
+        let mut res = analyze_with_rules(&parse_prompt(prompt), &config);
+        let card = res.changes.iter_mut().find(|c| c.action == ChangeAction::ImpliedTag).unwrap();
+        card.mode = 2;
+        let out = build_condensed_output(prompt, &res.processed_tokens, &res.changes, &config).final_prompt;
+        assert!(tags(&out).contains(&"bikini".to_string()), "{out}");
+        // weighted generic tags, "holding" non-weapons, absent items and unrelated pairs stay
+        for prompt in ["1girl, bikini, (swimsuit:1.2)", "1girl, holding hat, hat", "1girl, no hat, hat", "1girl, hair bow, bow", "1girl, sunglasses, glasses"] {
+            let (res, _) = run(prompt, &cfg(TargetView::None));
+            assert!(!res.changes.iter().any(|c| c.action == ChangeAction::ImpliedTag), "{prompt}");
+        }
+        // Clean Bloat off: nothing pruned
+        let mut off = cfg(TargetView::None);
+        off.cleanup_enabled = false;
+        assert!(!run("1girl, bikini, swimsuit", &off).0.changes.iter().any(|c| c.action == ChangeAction::ImpliedTag));
+    }
+
+    #[test]
+    fn implication_table_is_safe() {
+        assert!(implies("one-piece swimsuit", "swimsuit"));
+        assert!(implies("school swimsuit", "swimsuit"));
+        assert!(implies("katana", "sword"));
+        assert!(implies("holding weapon", "weapon"));
+        assert!(implies("straw hat", "hat"));
+        assert!(!implies("hat ribbon", "hat"));
+        assert!(!implies("dress shirt", "dress"));
+        assert!(!implies("unworn hat", "hat"));
+        assert!(!implies("swimsuit", "swimsuit"));
+        assert!(!implies("ponytail", "tail"));
+    }
+
+    #[test]
+    fn quality_button_adds_only_missing_checkpoint_tags() {
+        use crate::profiles::CheckpointProfile as C;
+        assert_eq!(add_quality_tags("1girl, beach", C::Anima), ("masterpiece, best quality, 1girl, beach".to_string(), vec!["masterpiece", "best quality"]));
+        assert_eq!(add_quality_tags("(score_9:1.1), 1girl", C::PonyV6).0, "score 8 up, score 7 up, (score_9:1.1), 1girl".replace("score 8 up, score 7 up", "score_8_up, score_7_up"));
+        assert_eq!(add_quality_tags("masterpiece, best quality, 1girl", C::Sdxl).1.len(), 0);
+        assert_eq!(add_quality_tags("", C::Sd15).0, "masterpiece, best quality, highres");
+        assert_eq!(add_quality_tags("1girl", C::Flux), ("1girl".to_string(), vec![]));
+        // never a rating tag
+        assert!(!add_quality_tags("1girl", C::PonyV6).0.contains("rating"));
     }
 
     #[test]
@@ -4213,7 +4989,8 @@ mod tests {
         assert!(res.changes.iter().any(|c| c.original == "sitting" && c.action == ChangeAction::PoseConflict && c.reason.contains("Forces grounded")));
         assert!(res.changes.iter().any(|c| c.original == "seiza" && c.action == ChangeAction::PoseConflict));
         assert!(res.changes.iter().any(|c| c.original == "lying" && c.action == ChangeAction::PoseConflict));
-        assert!(res.changes.iter().any(|c| c.original == "bent over" && c.action == ChangeAction::PoseConflict));
+        // bending over is done standing (and leaning forward goes with any posture), so it stays
+        assert!(!res.changes.iter().any(|c| c.original == "bent over"));
         assert!(res.changes.iter().any(|c| c.original == "crouching" && c.action == ChangeAction::PoseConflict));
         assert!(out.contains("standing"));
         assert!(!out.contains("sitting"));
@@ -4657,7 +5434,7 @@ mod tests {
         applied.mode = 0;
         let condensed = crate::condenser::build_condensed_output("1girl, large breasts, shirt", &res.processed_tokens, &[applied], &config);
         assert!(condensed.final_prompt.contains("button gap"));
-        assert!(condensed.final_prompt.contains("popping button"));
+        assert!(condensed.final_prompt.contains("popped button"));
 
         // 2. Combo 2: Curvy thighs + fitted legwear
         let (res, _) = run("1girl, thick thighs, white thighhighs", &config);
@@ -4669,12 +5446,96 @@ mod tests {
         applied.mode = 0;
         let condensed = crate::condenser::build_condensed_output("1girl, thick thighs, white thighhighs", &res.processed_tokens, &[applied], &config);
         assert!(condensed.final_prompt.contains("skindentation"));
-        assert!(condensed.final_prompt.contains("thigh squish"));
 
-        // 3. Combo 4: Hourglass + High-slit dress
-        let (res, _) = run("1girl, wide hips, narrow waist wide hips, dress", &config);
+        // 3. Combo 4: Hourglass + High-slit dress (a generic dress or skirt isn't on the garment list)
+        let (res, _) = run("1girl, wide hips, narrow waist wide hips, china dress", &config);
         let card = res.changes.iter().find(|c| c.action == ChangeAction::Recommendation && c.reason.contains("Hourglass & High-Slit Dress")).expect("Combo 4 card");
-        assert!(card.suggested_alternative.contains("high side slit"));
+        assert!(card.suggested_alternative.contains("side slit"));
+
+        let names = |prompt: &str| -> Vec<String> {
+            run(prompt, &config).0.changes.iter().filter(|c| c.action == ChangeAction::Recommendation).map(|c| c.reason.clone()).collect()
+        };
+        let has = |prompt: &str, rule: &str| names(prompt).iter().any(|r| r.contains(rule));
+        // Purged garment rules: Snug Shorts and High-Leg Cut no longer exist
+        assert!(!has("1girl, shortstack, wide hips", "Snug Shorts"), "{:?}", names("1girl, shortstack, wide hips"));
+        assert!(!has("1girl, wide hips, denim shorts", "Snug Shorts"));
+        // a pleated skirt is no slit skirt
+        assert!(!has("1girl, wide hips, pleated skirt", "High-Slit"));
+        // "short hair" is no short stature
+        assert!(!has("1girl, short hair, sword", "Petite Stature"));
+        assert!(!has("1girl, short sleeves, holding sword", "Petite Stature"));
+        assert!(has("1girl, petite, sword", "Petite Stature"));
+    }
+
+    #[test]
+    fn two_hand_budget_and_limb_conflicts_are_resolved() {
+        let config = cfg(TargetView::None);
+
+        // 1. Two-handed pose overrides 1-handed gestures
+        let (res, out) = run("1girl, hands on own hips, peace sign, waving", &config);
+        assert!(out.contains("hands on own hips"));
+        assert!(!out.contains("peace sign"));
+        assert!(!out.contains("waving"));
+        assert!(res.changes.iter().any(|c| c.original == "peace sign" && c.action == ChangeAction::PoseConflict));
+
+        // 2. Postures conflict (standing vs sitting)
+        let (res, out) = run("1girl, standing, sitting", &config);
+        assert!(out.contains("standing"));
+        assert!(!out.contains("sitting"));
+        assert!(res.changes.iter().any(|c| c.original == "sitting" && c.action == ChangeAction::PoseConflict));
+
+        // 3. Posture + valid leg position is preserved (sitting + crossed legs)
+        let (_, out) = run("1girl, sitting, crossed legs", &config);
+        assert!(out.contains("sitting"));
+        assert!(out.contains("crossed legs"));
+
+        // 4. Incompatible leg stances conflict (crossed legs vs wide stance)
+        let (res, out) = run("1girl, crossed legs, wide stance", &config);
+        assert!(out.contains("crossed legs"));
+        assert!(!out.contains("wide stance"));
+        assert!(res.changes.iter().any(|c| c.original == "wide stance" && c.action == ChangeAction::PoseConflict));
+
+        // 5. Barefoot vs Footwear conflict
+        let (res, out) = run("1girl, sneakers, barefoot", &config);
+        assert!(out.contains("sneakers"));
+        assert!(!out.contains("barefoot"));
+        assert!(res.changes.iter().any(|c| c.original == "barefoot" && c.action == ChangeAction::PoseConflict));
+
+        // 6. Footwear implication: loafers prunes generic shoes
+        let (res, out) = run("1girl, loafers, shoes", &config);
+        assert!(out.contains("loafers"));
+        assert!(!out.contains("shoes"));
+        assert!(res.changes.iter().any(|c| c.original == "shoes" && c.action == ChangeAction::ImpliedTag));
+
+        // 7. Shortstack does NOT lock petite into negative prompt
+        let (res, _) = run("1girl, shortstack, gigantic breasts", &config);
+        for c in &res.changes {
+            if c.action == ChangeAction::Recommendation {
+                assert!(!c.reason.contains("Auto-Negative Locks: petite"), "petite should not be locked into negative when shortstack is used");
+            }
+        }
+    }
+
+    #[test]
+    fn shortstack_exaggerated_proportions_bypasses_conflicts_and_adds_tag() {
+        let mut config = cfg(TargetView::None);
+        config.exaggerated_proportions = true;
+
+        let (res, out) = run("1girl, shortstack, gigantic breasts, slender, wide hips", &config);
+        // 1. Positive prompt contains "exaggerated proportions"
+        assert!(out.contains("exaggerated proportions"), "Output should contain exaggerated proportions: {out}");
+        // 2. Both gigantic breasts and wide hips and slender are preserved
+        assert!(out.contains("gigantic breasts"), "gigantic breasts missing: {out}");
+        assert!(out.contains("wide hips"), "wide hips missing: {out}");
+        assert!(out.contains("slender"), "slender missing: {out}");
+        // 3. No size conflicts or anatomy conflicts for these tags
+        assert!(!res.changes.iter().any(|c| c.action == ChangeAction::SizeConflict && c.original == "slender"));
+        assert!(!res.changes.iter().any(|c| c.action == ChangeAction::SizeConflict && c.original == "gigantic breasts"));
+        assert!(!res.changes.iter().any(|c| c.action == ChangeAction::SizeConflict && c.original == "wide hips"));
     }
 }
+
+
+
+
 

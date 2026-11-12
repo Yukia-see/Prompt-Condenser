@@ -523,10 +523,23 @@ pub fn recommended_negative(config: &ScanConfig, positive: &str) -> String {
         }
     }
 
+    let legs_apart = pos_tokens.iter().any(|t| crate::analyzer::legs_apart(&t.normalized));
+    let is_shortstack = pos_tokens.iter().any(|t| t.normalized == "shortstack")
+        || config.frame == 2;
     for (tier, _) in prop_tiers {
         let rec = crate::analyzer::get_proportion_recommendations(tier);
         for tag in rec.auto_negative_lock {
             let clean = tag.replace('_', " ");
+            if is_shortstack && clean == "petite" {
+                continue;
+            }
+            // spread legs separate the thighs: "no thigh gap" would fight the pose
+            if clean == "thigh gap" && legs_apart {
+                continue;
+            }
+            if pos_tokens.iter().any(|t| t.normalized == clean) {
+                continue;
+            }
             // Multi-character isolation check
             if other_char_tags.contains(&clean)
                 || other_char_tags.iter().any(|t| t == &clean || t.contains(&clean) || clean.contains(t.as_str()))
@@ -551,7 +564,69 @@ pub fn recommended_negative(config: &ScanConfig, positive: &str) -> String {
         }
     }
 
-    let mut parts = vec![config.checkpoint.default_negative().to_string()];
+    let mut default_neg = config.checkpoint.default_negative().to_string();
+    if config.exaggerated_proportions && is_shortstack {
+        // Strip negative tags that force realistic human anatomy
+        let filtered: Vec<&str> = default_neg
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| {
+                let n = s.to_ascii_lowercase();
+                n != "bad anatomy" && n != "bad proportions" && n != "deformed"
+            })
+            .collect();
+        default_neg = filtered.join(", ");
+
+        // Add negative tags that prevent realistic human body scaling
+        for tag in ["realistic proportions", "realistic anatomy", "proportionate"] {
+            if !auto_negs.iter().any(|t| t == tag) && !pos_tokens.iter().any(|t| t.normalized == tag) {
+                auto_negs.push(tag.to_string());
+            }
+        }
+    }
+
+    // "Exaggerated" Bust / Frame picks: push the smaller sizes and a tall figure away, so the picked size
+    // isn't settled at a "normal big" (merge_negative below drops anything the positive prompt has)
+    if config.exaggerated_proportions {
+        for (_, tags) in crate::profiles::BUSTS.iter().take(config.bust).skip(1) {
+            for t in tags.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+                if !auto_negs.iter().any(|a| a == t) {
+                    auto_negs.push(t.to_string());
+                }
+            }
+        }
+        // each figure's opposite silhouette (non-tag words are fine in a negative: they still steer)
+        let frame_negs: &[&str] = match frame_label(config.frame) {
+            "petite" => &["tall", "long legs", "long torso", "broad shoulders", "giantess"],
+            "shortstack" => &["tall", "long legs", "long torso", "long neck", "lanky", "broad shoulders"],
+            "thick" => &["bowlegs", "knock-knees"],
+            "pear" => &["broad shoulders", "wide shoulders", "muscular shoulders", "V-taper", "top-heavy"],
+            "hourglass" => &["narrow shoulders", "boxy waist", "wide waist"],
+            "muscular" => &["skinny", "frail", "chubby", "plump", "soft body", "flabby", "noodle arms"],
+            _ => &[],
+        };
+        // a flat chest stays flat under a heavy weight
+        let bust_negs: &[&str] = if config.bust == 1 {
+            &["cleavage", "breast press", "sideboob", "underboob", "small breasts", "medium breasts", "large breasts"]
+        } else {
+            &[]
+        };
+        // the errors heavy weights cause, named without naming proportions (shorter for CLIP's 75-token chunks)
+        let guard: &[&str] = if config.bust == 0 && config.frame == 0 {
+            &[]
+        } else if config.checkpoint.uses_clip_chunks() {
+            EXAGGERATED_ERROR_GUARD_CLIP
+        } else {
+            EXAGGERATED_ERROR_GUARD
+        };
+        for t in frame_negs.iter().chain(bust_negs).chain(guard) {
+            if !auto_negs.iter().any(|a| a == t) {
+                auto_negs.push(t.to_string());
+            }
+        }
+    }
+
+    let mut parts = vec![default_neg];
     if !view_negs.is_empty() {
         parts.push(view_negs.to_string());
     }
@@ -560,6 +635,25 @@ pub fn recommended_negative(config: &ScanConfig, positive: &str) -> String {
     }
     let base = parts.join(", ");
     merge_negative(&base, positive)
+}
+
+/// "Exaggerated" error guard for the negative: the structural errors heavy weights cause, named without naming
+/// body proportions (so they don't pull the exaggerated shape back toward normal).
+pub const EXAGGERATED_ERROR_GUARD: &[&str] = &[
+    "extra limbs", "extra arms", "extra legs", "extra fingers", "fused fingers", "missing fingers", "bad hands",
+    "malformed hands", "missing arms", "missing legs", "fused limbs", "fused legs", "disconnected limbs",
+    "anatomical nonsense", "double navel", "extra breasts", "fused breasts",
+];
+/// The hand / limb part of `EXAGGERATED_ERROR_GUARD`, for CLIP checkpoints (a long negative is chunked).
+pub const EXAGGERATED_ERROR_GUARD_CLIP: &[&str] = &[
+    "extra limbs", "extra arms", "extra legs", "extra fingers", "fused fingers", "missing fingers", "bad hands",
+    "malformed hands",
+];
+
+/// A short name for a Frame menu index: "petite", "shortstack", "thick", "pear", "hourglass", "muscular"
+/// ("" for none or out of range); follows the order of `profiles::FRAMES`.
+pub fn frame_label(frame: usize) -> &'static str {
+    ["", "petite", "shortstack", "thick", "pear", "hourglass", "muscular"].get(frame).copied().unwrap_or("")
 }
 
 /// Cleans a negative prompt: one tag per entry, no duplicates, and nothing that
@@ -637,9 +731,218 @@ pub fn marked_tags(markdown: &str, kind: Highlight) -> Vec<String> {
     out
 }
 
+/// The prompt syntax a copy is written in (the format dropdown next to Copy, `--export`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportFormat {
+    /// `(tag:1.2)`, as the app writes it.
+    ComfyUi,
+    /// A1111 / Forge: the same syntax as ComfyUI.
+    WebUi,
+    /// `{tag}` = ×1.05 and `[tag]` = ÷1.05 per pair; parentheses are plain text.
+    NovelAi,
+    /// No weights, brackets or LoRA tags; BREAK and `{a|b}` groups stay.
+    Plain,
+}
+
+impl ExportFormat {
+    /// Dropdown order: ComfyUI, WebUI, NovelAI, Plain.
+    pub fn from_index(i: i32) -> Self {
+        match i {
+            1 => Self::WebUi,
+            2 => Self::NovelAi,
+            3 => Self::Plain,
+            _ => Self::ComfyUi,
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name.to_lowercase().as_str() {
+            "comfyui" | "comfy" => Some(Self::ComfyUi),
+            "webui" | "a1111" | "forge" => Some(Self::WebUi),
+            "novelai" | "nai" => Some(Self::NovelAi),
+            "plain" => Some(Self::Plain),
+            _ => None,
+        }
+    }
+}
+
+/// A note for the status line when the format can't express part of the prompt: NovelAI reads
+/// `{…}` as emphasis, so dynamic-prompt groups `{a|b}` would change meaning there.
+pub fn export_warning(text: &str, format: ExportFormat) -> Option<&'static str> {
+    (format == ExportFormat::NovelAi && has_dynamic_group(text))
+        .then_some("Note: NovelAI reads {…} as emphasis; the {a|b} dynamic groups were left as they are.")
+}
+
+fn has_dynamic_group(text: &str) -> bool {
+    let mut depth = 0;
+    for c in text.chars() {
+        match c {
+            '{' => depth += 1,
+            '}' => depth -= 1,
+            '|' if depth > 0 => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// The prompt in another tool's syntax. ComfyUI and WebUI share the app's syntax (unchanged). NovelAI:
+/// `(tag:W)` becomes N = round(ln W / ln 1.05) pairs of `{}` (W > 1) or `[]` (W < 1), a bare `(tag)`
+/// counts as 1.1, weight 1.0 is bare, and `\(` / `\)` become plain parentheses. Plain: weights and
+/// brackets go, `\(` / `\)` are unescaped and `<lora:…>` tags are dropped (they mean nothing outside
+/// a LoRA loader); BREAK and `{a|b}` dynamic groups are left alone in every format.
+pub fn format_prompt(text: &str, format: ExportFormat) -> String {
+    if matches!(format, ExportFormat::ComfyUi | ExportFormat::WebUi) {
+        return text.to_string();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let out = convert_span(&chars, format);
+    if format == ExportFormat::Plain {
+        out.trim().trim_end_matches(',').trim_end().to_string()
+    } else {
+        out
+    }
+}
+
+fn convert_span(chars: &[char], format: ExportFormat) -> String {
+    let mut out = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        match c {
+            '\\' if matches!(chars.get(i + 1), Some('(') | Some(')')) => {
+                out.push(chars[i + 1]);
+                i += 2;
+            }
+            '{' => {
+                // a dynamic group (or the user's own braces): copied as it is
+                let end = matching(chars, i, '{', '}').unwrap_or(chars.len() - 1);
+                out.extend(&chars[i..=end]);
+                i = end + 1;
+            }
+            '<' if format == ExportFormat::Plain && starts_with_ci(&chars[i..], "<lora:") => {
+                let end = chars[i..].iter().position(|&c| c == '>').map_or(chars.len(), |e| i + e + 1);
+                i = end;
+                // the separator after it goes too
+                while i < chars.len() && chars[i] == ' ' {
+                    i += 1;
+                }
+                if i < chars.len() && chars[i] == ',' {
+                    i += 1;
+                    while i < chars.len() && chars[i] == ' ' {
+                        i += 1;
+                    }
+                }
+            }
+            '(' => match matching(chars, i, '(', ')') {
+                Some(end) => {
+                    let inner = &chars[i + 1..end];
+                    let (content, weight) = split_weight(inner);
+                    let content = convert_span(content, format);
+                    if format == ExportFormat::NovelAi {
+                        let n = (weight.ln() / 1.05f32.ln()).round() as i32;
+                        let (open, close) = if n > 0 { ('{', '}') } else { ('[', ']') };
+                        let n = n.unsigned_abs() as usize;
+                        out.extend(std::iter::repeat(open).take(n));
+                        out.push_str(&content);
+                        out.extend(std::iter::repeat(close).take(n));
+                    } else {
+                        out.push_str(&content);
+                    }
+                    i = end + 1;
+                }
+                None => {
+                    out.push(c);
+                    i += 1;
+                }
+            },
+            _ => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+fn starts_with_ci(chars: &[char], prefix: &str) -> bool {
+    chars.len() >= prefix.len() && chars.iter().zip(prefix.chars()).all(|(a, b)| a.to_ascii_lowercase() == b)
+}
+
+/// The index of the bracket closing the one at `start` (escaped brackets don't count).
+fn matching(chars: &[char], start: usize, open: char, close: char) -> Option<usize> {
+    let mut depth = 0;
+    let mut i = start;
+    while i < chars.len() {
+        if chars[i] == '\\' {
+            i += 2;
+            continue;
+        }
+        if chars[i] == open {
+            depth += 1;
+        } else if chars[i] == close {
+            depth -= 1;
+            if depth == 0 {
+                return Some(i);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// `tag:1.2` → (`tag`, 1.2); without a top-level `:number` the A1111 default 1.1.
+fn split_weight(inner: &[char]) -> (&[char], f32) {
+    let mut depth = 0;
+    let mut colon = None;
+    let mut i = 0;
+    while i < inner.len() {
+        match inner[i] {
+            '\\' => i += 1,
+            '(' | '{' | '[' => depth += 1,
+            ')' | '}' | ']' => depth -= 1,
+            ':' if depth == 0 => colon = Some(i),
+            _ => {}
+        }
+        i += 1;
+    }
+    if let Some(c) = colon {
+        let w: String = inner[c + 1..].iter().collect();
+        if let Ok(w) = w.trim().parse::<f32>() {
+            if w > 0.0 {
+                return (&inner[..c], w);
+            }
+        }
+    }
+    (inner, 1.1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prompts_are_written_in_other_formats() {
+        use ExportFormat::*;
+        let p = "masterpiece, (red hair:1.15), (smile:0.9), (glasses:1.5), (blue eyes:1.0), kay \\(girls und panzer\\), {sitting|standing}";
+        assert_eq!(format_prompt(p, ComfyUi), p);
+        assert_eq!(format_prompt(p, WebUi), p);
+        assert_eq!(
+            format_prompt(p, NovelAi),
+            "masterpiece, {{{red hair}}}, [[smile]], {{{{{{{{glasses}}}}}}}}, blue eyes, kay (girls und panzer), {sitting|standing}"
+        );
+        assert!(export_warning(p, NovelAi).is_some());
+        assert!(export_warning("(red hair:1.2)", NovelAi).is_none() && export_warning(p, Plain).is_none());
+        // plain: no weights, brackets or LoRA tags; BREAK and dynamic groups stay
+        assert_eq!(
+            format_prompt("<lora:kay:0.8>, 1girl, ((red hair)), (smile:1.2), kay \\(gup\\), BREAK, 1boy, {a|b}, <LORA:x:1>", Plain),
+            "1girl, red hair, smile, kay (gup), BREAK, 1boy, {a|b}"
+        );
+        // a bare (tag) is 1.1: two braces in NovelAI; arranged line breaks survive
+        assert_eq!(format_prompt("(smile),\n(night:1.3)", NovelAi), "{{smile}},\n{{{{{night}}}}}");
+        assert_eq!(ExportFormat::from_name("NAI"), Some(NovelAi));
+        assert_eq!(ExportFormat::from_index(3), Plain);
+    }
 
     #[test]
     fn front_view_negative_detection_and_rear_suppression() {
@@ -653,6 +956,8 @@ mod tests {
             cleanup_enabled: true,
             resolve_conflicts_enabled: true,
             clamp_weights_enabled: true,
+            fit_suggestions: true,
+            exaggerated_proportions: false,
             camera_angle: 0,
             pose: 0,
             bust: 0,
@@ -673,5 +978,125 @@ mod tests {
         let neg = recommended_negative(&cfg, prompt);
         assert!(neg.contains("from behind") || neg.contains("back view") || neg.contains("rear view"), "{neg}");
         assert!(neg.contains("over the shoulder"), "{neg}");
+    }
+
+    #[test]
+    fn shortstack_suppresses_petite_in_recommended_negative() {
+        use crate::analyzer::ScanConfig;
+        use crate::profiles::{CheckpointProfile, TargetView};
+        let cfg = ScanConfig {
+            checkpoint: CheckpointProfile::Anima,
+            target_view: TargetView::None,
+            pinned_emphasis_raw: String::new(),
+            emphasis_weight: 1.25,
+            cleanup_enabled: true,
+            resolve_conflicts_enabled: true,
+            clamp_weights_enabled: true,
+            fit_suggestions: true,
+            exaggerated_proportions: false,
+            camera_angle: 0,
+            pose: 0,
+            bust: 0,
+            frame: 0,
+            dynamic: false,
+            lora_tags_raw: String::new(),
+            arranged: false,
+            natural: false,
+            two_char: false,
+            char2_prompt_raw: String::new(),
+            char2_lora_tags_raw: String::new(),
+            char_break: true,
+            scene_prompt_raw: String::new(),
+            more_chars: Vec::new(),
+            detail: crate::profiles::DetailLevel::Balanced,
+        };
+        let prompt = "1girl, solo, gigantic breasts, shortstack";
+        let neg = recommended_negative(&cfg, prompt);
+        assert!(!neg.contains("petite"), "petite must not be in negative when shortstack is present: {neg}");
+        assert!(neg.contains("flat chest"), "{neg}");
+    }
+
+    #[test]
+    fn exaggerated_picks_push_smaller_sizes_into_the_negative() {
+        let mut c = ScanConfig {
+            checkpoint: CheckpointProfile::Anima,
+            target_view: crate::profiles::TargetView::None,
+            pinned_emphasis_raw: String::new(),
+            emphasis_weight: 1.25,
+            cleanup_enabled: true,
+            resolve_conflicts_enabled: true,
+            clamp_weights_enabled: true,
+            fit_suggestions: true,
+            exaggerated_proportions: false,
+            camera_angle: 0,
+            pose: 0,
+            bust: 0,
+            frame: 0,
+            dynamic: false,
+            lora_tags_raw: String::new(),
+            arranged: false,
+            natural: false,
+            two_char: false,
+            char2_prompt_raw: String::new(),
+            char2_lora_tags_raw: String::new(),
+            char_break: true,
+            scene_prompt_raw: String::new(),
+            more_chars: Vec::new(),
+            detail: crate::profiles::DetailLevel::Balanced,
+        };
+        c.checkpoint = CheckpointProfile::Anima;
+        c.bust = 6;
+        c.frame = 2;
+        c.exaggerated_proportions = true;
+        let neg = recommended_negative(&c, "1girl, gigantic breasts, shortstack");
+        for t in ["small breasts", "medium breasts", "large breasts", "huge breasts", "tall", "long legs"] {
+            assert!(neg.contains(t), "{t} missing: {neg}");
+        }
+        assert!(!neg.contains("gigantic breasts"), "{neg}");
+        c.exaggerated_proportions = false;
+        assert!(!recommended_negative(&c, "1girl, gigantic breasts, shortstack").contains("long legs"));
+    }
+
+    #[test]
+    fn shortstack_exaggerated_proportions_modifies_negative_prompt() {
+        use crate::analyzer::ScanConfig;
+        use crate::profiles::{CheckpointProfile, TargetView};
+        let cfg = ScanConfig {
+            checkpoint: CheckpointProfile::Anima,
+            target_view: TargetView::None,
+            pinned_emphasis_raw: String::new(),
+            emphasis_weight: 1.25,
+            cleanup_enabled: true,
+            resolve_conflicts_enabled: true,
+            clamp_weights_enabled: true,
+            fit_suggestions: true,
+            exaggerated_proportions: true,
+            camera_angle: 0,
+            pose: 0,
+            bust: 0,
+            frame: 0,
+            dynamic: false,
+            lora_tags_raw: String::new(),
+            arranged: false,
+            natural: false,
+            two_char: false,
+            char2_prompt_raw: String::new(),
+            char2_lora_tags_raw: String::new(),
+            char_break: true,
+            scene_prompt_raw: String::new(),
+            more_chars: Vec::new(),
+            detail: crate::profiles::DetailLevel::Balanced,
+        };
+        let prompt = "1girl, solo, gigantic breasts, shortstack";
+        let neg = recommended_negative(&cfg, prompt);
+        // Stripped: bad anatomy, bad proportions, deformed
+        assert!(!neg.contains("bad anatomy"), "bad anatomy must be stripped: {neg}");
+        assert!(!neg.contains("bad proportions"), "bad proportions must be stripped: {neg}");
+        assert!(!neg.contains("deformed"), "deformed must be stripped: {neg}");
+
+        // Added: realistic proportions, realistic anatomy, proportionate
+        assert!(neg.contains("realistic proportions"), "realistic proportions must be added: {neg}");
+        assert!(neg.contains("realistic anatomy"), "realistic anatomy must be added: {neg}");
+        assert!(neg.contains("proportionate"), "proportionate must be added: {neg}");
     }
 }

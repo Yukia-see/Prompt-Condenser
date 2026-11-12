@@ -209,6 +209,7 @@ fn unwrap_weight_syntax(raw: &str) -> (String, f32, bool) {
     let mut s = raw.trim();
     let mut paren_layers = 0i32;
     let mut bracket_layers = 0i32;
+    let mut brace_layers = 0i32;
 
     loop {
         if s.len() >= 2 && s.starts_with('(') && s.ends_with(')') && is_outer_pair_matching(s, '(', ')') {
@@ -217,6 +218,9 @@ fn unwrap_weight_syntax(raw: &str) -> (String, f32, bool) {
         } else if s.len() >= 2 && s.starts_with('[') && s.ends_with(']') && is_outer_pair_matching(s, '[', ']') {
             s = s[1..s.len() - 1].trim();
             bracket_layers += 1;
+        } else if s.len() >= 2 && s.starts_with('{') && s.ends_with('}') && !s.contains('|') && is_outer_pair_matching(s, '{', '}') {
+            s = s[1..s.len() - 1].trim();
+            brace_layers += 1;
         } else {
             break;
         }
@@ -229,8 +233,8 @@ fn unwrap_weight_syntax(raw: &str) -> (String, f32, bool) {
             let text_part = s[..colon_pos].trim().to_string();
             if !text_part.is_empty() {
                 let extra_layers = (paren_layers - 1).max(0);
-                let final_w = explicit_w * 1.1_f32.powi(extra_layers);
-                let runaway = paren_layers >= 3 || final_w > 1.38;
+                let final_w = explicit_w * 1.1_f32.powi(extra_layers) * 1.05_f32.powi(brace_layers);
+                let runaway = paren_layers >= 3 || brace_layers >= 6 || final_w > 1.38;
                 return (text_part, (final_w * 100.0).round() / 100.0, runaway);
             }
         }
@@ -238,13 +242,15 @@ fn unwrap_weight_syntax(raw: &str) -> (String, f32, bool) {
 
     let computed_w = if paren_layers > 0 {
         1.1_f32.powi(paren_layers)
+    } else if brace_layers > 0 {
+        1.05_f32.powi(brace_layers)
     } else if bracket_layers > 0 {
         0.9_f32.powi(bracket_layers)
     } else {
         1.0
     };
 
-    let runaway = paren_layers >= 3 || computed_w > 1.35;
+    let runaway = paren_layers >= 3 || brace_layers >= 6 || computed_w > 1.35;
     (s.to_string(), (computed_w * 100.0).round() / 100.0, runaway)
 }
 
@@ -718,6 +724,15 @@ mod tests {
         assert_eq!(toks[4].normalized, "1girl");
         assert_eq!(toks[5].normalized, "upper body");
         assert_eq!(toks[5].category, TokenCategory::FramingPose);
+
+        // NovelAI curly braces: {tag} is 1.05x, {{tag}} is 1.1025x
+        let n_toks = parse_prompt("{{masterpiece}}, {blue eyes}, {red|blue} hair");
+        assert_eq!(n_toks[0].text, "masterpiece");
+        assert!((n_toks[0].weight - 1.10).abs() < 0.01);
+        assert_eq!(n_toks[1].text, "blue eyes");
+        assert!((n_toks[1].weight - 1.05).abs() < 0.01);
+        // Dynamic prompt variation {red|blue} is preserved without weight strip:
+        assert!(n_toks[2].text.contains("{red|blue}"));
     }
 
     #[test]

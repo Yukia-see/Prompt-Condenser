@@ -204,7 +204,7 @@ pub fn prompts(char1: &str, others: &[String]) -> Vec<String> {
 
 /// Does this BREAK part describe a character (hair, eyes, body, outfit, traits), or only
 /// shared things (quality, count, interaction, camera, setting, light)?
-fn describes_a_character(part: &str) -> bool {
+pub(crate) fn describes_a_character(part: &str) -> bool {
     character_signal(part) > 0
 }
 
@@ -349,8 +349,9 @@ pub struct Combined {
 /// `strip_conflicts` also drops tags that contradict a LoRA box (used on AI text).
 pub fn combine(texts: &[String], config: &ScanConfig, strip_conflicts: bool, sentence: Option<&str>) -> Combined {
     let n = texts.len();
+    let body_picks = crate::analyzer::chosen_body_tags(config);
     let tokens = |text: &str, lora: &str| -> Vec<PromptToken> {
-        crate::analyzer::fix_body_type(strip_lora_tokens(parse_prompt(text), lora, strip_conflicts))
+        crate::analyzer::fix_body_type_keeping(strip_lora_tokens(parse_prompt(text), lora, strip_conflicts), &body_picks)
             .into_iter()
             .filter(|t| t.normalized != "break")
             // "solo" contradicts several characters (the rule cards remove it; AI text too)
@@ -727,6 +728,7 @@ pub fn vrp_state_json_from(prompts: &[String], regions: &[[f64; 4]], image_size:
 
 pub fn combine_section_blocks(texts: &[String], config: &ScanConfig, strip_conflicts: bool, sentence: Option<&str>) -> String {
     let n = texts.len();
+    let body_picks = crate::analyzer::chosen_body_tags(config);
     if n == 0 {
         return String::new();
     }
@@ -748,7 +750,7 @@ pub fn combine_section_blocks(texts: &[String], config: &ScanConfig, strip_confl
     };
 
     let tokens = |text: &str, lora: &str| -> Vec<PromptToken> {
-        crate::analyzer::fix_body_type(strip_lora_tokens(parse_prompt(text), lora, strip_conflicts))
+        crate::analyzer::fix_body_type_keeping(strip_lora_tokens(parse_prompt(text), lora, strip_conflicts), &body_picks)
             .into_iter()
             .filter(|t| t.normalized != "break")
             // "solo" only conflicts when there are multiple characters (n > 1)
@@ -1012,10 +1014,41 @@ pub fn combine_section_blocks_ai(text: &str, boxes: &[String], config: &ScanConf
     combine_section_blocks(&parts, &cfg, true, sentence)
 }
 
+/// Interaction tags (`holding hands`, `back-to-back`, `hug`…, `is_interaction`) typed into more than one
+/// character's box. `combine` already writes each one once in the shared header, so a later character's copy
+/// is a repeat: (character index of the repeat, its raw tag, the character index that has it first).
+pub(crate) fn repeated_interactions(char_prompts: &[String]) -> Vec<(usize, String, usize)> {
+    let mut first_seen: Vec<(String, usize)> = Vec::new();
+    let mut repeats = Vec::new();
+    for (i, prompt) in char_prompts.iter().enumerate() {
+        for t in crate::parser::parse_prompt(prompt) {
+            if !is_interaction(&t.normalized) || count_tag(&t.normalized).is_some() {
+                continue;
+            }
+            match first_seen.iter().find(|(n, _)| *n == t.normalized) {
+                Some((_, first)) if *first != i => repeats.push((i, t.raw.clone(), *first)),
+                Some(_) => {}
+                None => first_seen.push((t.normalized.clone(), i)),
+            }
+        }
+    }
+    repeats
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::profiles::TargetView;
+
+    #[test]
+    fn interactions_typed_in_two_boxes_are_found_once() {
+        let p = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let r = repeated_interactions(&p(&["1girl, red hair, holding hands, back-to-back", "1girl, blue hair, holding hands", "1boy, holding hands, back-to-back"]));
+        assert_eq!(r, vec![(1, "holding hands".into(), 0), (2, "holding hands".into(), 0), (2, "back-to-back".into(), 0)]);
+        // in one box only, or a count tag: nothing
+        assert!(repeated_interactions(&p(&["1girl, holding hands", "1girl, smile"])).is_empty());
+        assert!(repeated_interactions(&p(&["2girls, hug", "2girls"])).is_empty());
+    }
 
     fn cfg() -> ScanConfig {
         ScanConfig {
@@ -1026,6 +1059,8 @@ mod tests {
             cleanup_enabled: true,
             resolve_conflicts_enabled: true,
             clamp_weights_enabled: true,
+            fit_suggestions: true,
+            exaggerated_proportions: false,
             camera_angle: 0,
             pose: 0,
             bust: 0,

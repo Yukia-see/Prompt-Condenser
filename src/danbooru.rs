@@ -927,6 +927,8 @@ mod tests {
             cleanup_enabled: true,
             resolve_conflicts_enabled: true,
             clamp_weights_enabled: true,
+            fit_suggestions: true,
+            exaggerated_proportions: false,
             camera_angle: 0,
             pose: 0,
             bust: 0,

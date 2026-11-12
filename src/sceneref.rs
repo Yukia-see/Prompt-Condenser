@@ -632,4 +632,5 @@ mod tests {
         assert!(char_filtered.contains("blonde hair"));
         assert!(char_filtered.contains("blue dress"));
     }
+
 }

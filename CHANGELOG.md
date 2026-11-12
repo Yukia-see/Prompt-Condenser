@@ -1,5 +1,18 @@
 # Changelog and measurements
 
+## Version 0.6.1 (2026-11-12)
+
+- **Fit & Dynamics recommendation overhaul**: Purged phantom accessory and wardrobe rules (`hip chain`, `belly chain`, `waist chain`, `hip holster`, `hip bag`, `bodycon dress`, `pelvic curtain`, `tight shorts`, `tearing clothes`) from body proportion tiers. `clothing_interaction` now strictly handles fabric tension (`taut_shirt`, `button_gap`, etc.) and only triggers when matching garments are already in the prompt. Added `Fit & Dynamics` toggle chip to Options drawer.
+- **Two-Hand Budget**: Enforces anatomical human limit of two hands. Two-handed poses take priority and resolve conflicts with minor one-handed gestures (`peace sign`, `waving`), preventing diffusion models from generating deformed extra limbs. Generic redundant holds (`supporting own breasts` alongside `two-handed breast hold`) are pruned via implication hierarchy.
+- **Leg Stances & Footwear Conflict Resolution**: Decoupled posture (sitting, kneeling, standing) from leg stance (crossed legs, spread legs, wide stance), preserving natural pairs like `sitting, crossed legs`. Contradictory stances (`crossed legs` vs `spread legs`) and `barefoot` vs `shoes` are resolved. Specific footwear (`loafers`, `boots`, `heels`, `sneakers`, `sandals`) implies and prunes generic `shoes`/`footwear`.
+- **Shortstack Negative Lock Protection**: Guaranteed that `petite` is never locked into the negative prompt when `shortstack` is present in the prompt.
+- **🎲 Roll**: in the Dynamic view, shows one random pick per `{a|b}` group (the way one image of the batch gets it) as a preview; Copy copies it, the template stays.
+- **LoRA weight chips**: under each LoRA box, "name 0.8 − +" steps a LoRA's first weight by 0.05 (−5…5, negative allowed for slider LoRAs, a second weight kept).
+- **🎨 Palette**: a drawer of real lighting / atmosphere / style tags; a click appends one to Before (1 Character) or the Scene box, skipping tags already there.
+- **⚡ Queue**: a status-bar button (while ComfyUI runs) writes the shown prompt to live_prompt.json at once and asks the add-on to press Queue in the open ComfyUI tab; the installer now also writes `js/queue.js`.
+- **Bust / Frame in AI views (fix)**: the Deep Scan is told the picks and its rewrite / dynamic prompt are made to agree (other sizes and frame tags dropped, picks added); `--prompt` gains `--bust` / `--frame`.
+- **Combo recommendation cards (fix)**: each card keeps its own choice while you type (keyed by its rule), and body tags must match the whole tag ("short hair" no longer counts as a short stature, "shortstack" no longer as shorts).
+
 ## Version 0.6.0 (2026-11-11)
 
 - **Fast Tagger Mode**: 4.6s single-pass ONNX Danbooru tagging (79.2% F1) on CPU with zero GPU VRAM consumption.
@@ -9,6 +22,14 @@
 - **Multi-Character Regional Cross-Negatives**: Automated `(tag:0.8)` anti-bleed negative prompt generation for LuCiD VRP regions.
 - **Modular Bust & Frame Proportion Split**: Independent Bust and Frame controls with dedicated Shortstack and Pear-shape archetype support and conflict exemption.
 - **Vision Scanner UI Redesign**: Ergonomic 3-zone scanner dock with collapsible settings drawer and persistent active-filter badges.
+- **Install Node**: "⚡ Install Node" (Options FOLDERS row) and `--install-comfyui [path]` copy the ComfyUI add-on into `custom_nodes` with `binary_path.txt`; a symlinked dev install is left alone.
+- **Window smoke test**: every tab and overlay is rendered headless in `cargo test` (Slint testing backend), catching layout recursion before launch.
+- **Dataset caption cleanup**: `--dataset <folder>` tidies LoRA training captions (duplicates, weights, underscores, implied tags; optional `--one-size` / `--sort`), keeping the trigger word first and writing `.txt.bak` backups.
+- **Narrow windows**: at 800-1250 px the top bar, the reference bar and the Options chips wrap onto a second row, so every control stays reachable (checked by the window smoke test at 800, 900 and 1600 px).
+- **+ Quality and implied tags**: a "+ Quality" button puts the checkpoint's missing quality tags in front of Before; a generic tag implied by a specific one (`swimsuit` + `bikini`, `sword` + `holding sword`, `hat` + `witch hat`) gets an "Implied tag" card.
+- **Declutter suite**: character chips with "+ Add character" / ✕ (text kept), the cards strip collapses to a "✓ Prompt clean" banner, a collapsible negative strip, "⛶ Zen" mode, a mini VRP region preview, and one status pill (checkpoint · version · tokens · conflicts).
+- **main.rs split** into render / image_read / scene_panel / vrp / ollama_ui / settings / translate_ui / deep_scan modules (pure moves, no behavior change).
+- **PNG prompt, multi-sampler**: with hires-fix / refiner passes the first pass's prompt (no sampler upstream) is read; `live_png_prompt` prints only format, partial, sampler, distinct prompt count and word count.
 - **Companion ComfyUI Custom Node Suite**: Official custom nodes (`PromptCondenserText`, `PromptCondenserVRP`, `PromptCondenserCaption`) located in `tools/comfyui/`.
 
 History moved out of CLAUDE.md: benchmarks, and models or modes that were tried and dropped.
@@ -47,3 +68,21 @@ History moved out of CLAUDE.md: benchmarks, and models or modes that were tried 
 - Regional cross-negatives (2026-11-11): Copy VRP regions (and `--vrp`) fills each region's negative with the other characters' distinguishing looks it doesn't share (`two::cross_negatives`, `(tag:0.8)`, ≤ 8), to reduce attribute bleed between regions. Unit-tested; not yet checked on a generation.
 - `--prompt "" --vrp` (2026-11-11): an empty shared scene is accepted when 2-4 characters are given (`positive` stays empty), so the ComfyUI VRP node no longer has to send `scenery`; a non-VRP empty prompt still exits 1.
 - Bust / Frame dropdowns (2026-11-11) replace the single Body dropdown (old saved index mapped): Bust none/flat/small/medium/large/huge/gigantic; Frame none/petite/shortstack/thick thighs & wide hips/pear/hourglass/muscular, real Danbooru tags only. Chosen tags are protected from the conflict rules; a typed or chosen `shortstack` keeps its `petite`.
+- LoRA trigger-word suggestions (2026-11-11): "+ tag" chips under each LoRA box from the LoRA file's training tags (`ss_tag_frequency` in the safetensors header, top 5, generic / quality tags dropped), LoRA folder in Options. Unit-tested on synthetic headers; not clicked through in the window.
+- Token estimate (2026-11-11): the token stats read "~N tokens (M chunks of 75), estimated" and are hidden for Anima / Flux, which don't read prompts in CLIP chunks.
+- LoRA `modelspec.trigger_phrase` first in the trigger chips, `$LORA_DIR` override; token readout "~N / 75 tokens · chunk M, est.", amber past one chunk, plain "~N tokens" on Anima / Flux; `--prompt` JSON gets `chunks_before` / `chunks_after` (2026-11-11).
+- UI declutter (2026-11-11): Options collapsed by default with a "· N changed" count, Boost and Shared Prompt on one row, "✓ Copied" toast on every copy button.
+- Fast Tagger per-kind thresholds (2026-11-11): background/light 0.35, hair 0.35, eyes 0.42, outfit 0.25, other 0.30 instead of one 0.30. Tuning set (9 images): avg F1 80.0% → 81.0% (P 86.7 → 87.9, R 75.0 → 76.0), helps 5 images, dark_armor −0.8; held-out fresh pair: 73.4% → 73.1% (ruri_rocks −0.6, torso_chart ±0). Used by Tagger mode, --caption and the reference transfer; the slider / --threshold now shift all kinds.
+- ComfyUI folder setting (2026-11-11): Options FOLDERS row, `$COMFYUI_PATH`, `~/ComfyUI`; the LoRA folder defaults to its models/loras (`$LORA_DIR` still wins).
+- Card choices survive edits (2026-11-11): a kept or swapped rule card stays that way after unrelated edits (cleared on checkpoint change, emptied prompt or a new prompt load).
+- Copy formats (2026-11-11): ComfyUI / WebUI / NovelAI (`{}` / `[]` emphasis) / Plain (no weights, no LoRA tags) next to Copy, and `--export` in the CLI.
+- Prompt from PNG (2026-11-11, re-approved by the user): "📄 From PNG…" reads A1111 / Forge, ComfyUI (sampler-linked or longest text, marked partial) and NovelAI metadata into Before, with an Undo button in the image tray (which also brings back Undo for image reads).
+- Prompt from PNG on real ComfyUI files (2026-11-11): text through string-concatenate / primitive nodes and guider-based samplers (SamplerCustomAdvanced) are followed, and multi-pass graphs take the first pass (no sampler upstream). Two real files: a hires-fix graph (2 samplers, one shared prompt; it had fallen back to the negative's text as "partial") and an Anima ref-guider + refine graph (2 different prompts; it had taken the refine pass's) both read correctly now.
+- Corner crops in the AI image path measured (2026-11-11): corners on 79.0% vs off 77.3% average F1 on the 9 test images (dark_armor 75→66, sakura_wings 69→63, chibi_pink 77→71; fox_vtuber 74→78, rouge_bat 80→85), ~47 vs ~55 s per image (the on run shared the CPU). Kept: `tag_one_fast` still tags the 4 corners.
+- Prompt history (2026-11-11, Gemini Track 3): "🕒 History (N)" keeps the last 15 prompt states plus up to 10 starred ones (history.json), with Restore that can itself be undone.
+- "Send to ComfyUI" bridge, app side (2026-11-11, Gemini Track 2): the app writes ~/.cache/prompt-condenser/live_prompt.json after every change (≤ 1/s, atomic) for the nodes' live_stream input; the status pill shows whether ComfyUI runs (127.0.0.1:8188).
+- Image reads no longer put "copyright notice", watermark, signature, usernames or platform logos into the prompt (2026-11-12): the tagger described the "©" line printed on official art, and only "copyright name" was filtered (`tagger::IMAGE_TEXT_TAGS`).
+- Multi-character tabs (2026-11-12): an interaction typed into several character boxes (holding hands, back-to-back…) gets one card on the later copies; it's already written once in the shared part.
+- Removed unused code (2026-11-12): `dialect.rs`, `detector::background_environment_crops` (the background-only pass measured on 2026-11-11 with no gain), `detector::estimate_geometric_stature` (unmeasured) and `sceneref::fuse_prompts_with_preset` (duplicated the reference Transfer presets).
+- "Exaggerated" emphasizes the Bust / Frame picks (2026-11-12): Anima (gigantic breasts:2.5) (the user's tested value), (shortstack:1.4), (wide hips / thick thighs:1.5); CLIP checkpoints 1.4 / 1.2; Flux none; not cut by Clamp Weights. The negative gets the smaller sizes plus "tall, long legs".
+- Exaggerated reinforcement (2026-11-12, the user's plan): waist / abs weights, narrow shoulders for Pear / Shortstack, per-frame silhouette negatives, a Flat-chest guard and an error guard (17 terms on Anima, 8 on CLIP); all only with Exaggerated on (off verified identical on 42 combinations). Thigh gap next to thick thighs is fine (no card, not in the negative) when the legs are apart.

@@ -1,6 +1,6 @@
 [package]
 name = "prompt-condenser"
-version = "0.6.0"
+version = "0.6.1"
 edition = "2021"
 description = "ComfyUI Prompt Condenser, Organizer & Framing Conflict Scanner with Cross-Vendor AI"
 
@@ -11,10 +11,16 @@ serde_json = { version = "1.0", features = ["preserve_order"] }
 arboard = "3.4"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }
 anyhow = "1.0"
+# reads the prompt saved in a PNG (`png_meta`); already built for `image`
+png = "0.18"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 ort = "2.0.0-rc.15"
 base64 = "0.22"
 rfd = "0.15"
+
+[dev-dependencies]
+# headless window smoke test (`window_smoke`); must match slint's exact version
+i-slint-backend-testing = { version = "=1.18.1", features = ["renderer-software"] }
 
 [build-dependencies]
 slint-build = "1.9"

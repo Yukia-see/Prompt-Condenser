@@ -1,7 +1,7 @@
 # Maintainer: Yukia See
 # Build with: scripts/build_arch_package.sh [--install]
 pkgname=prompt-condenser
-pkgver=0.6.0
+pkgver=0.6.1
 pkgrel=1
 url="https://github.com/Yukia-see/Prompt-Condenser"
 pkgdesc="ComfyUI prompt condenser, framing-conflict scanner and Danbooru tagger (Slint UI, Ollama AI)"
@@ -32,12 +32,12 @@ build() {
   cd "$pkgname-$pkgver"
   export CARGO_TARGET_DIR=target
   # not --frozen: the ort crate downloads its ONNX Runtime build during the build
-  cargo build --release --locked -j 2
+  cargo build --release --locked
 }
 
 check() {
   cd "$pkgname-$pkgver"
-  cargo test --release --locked -j 2
+  cargo test --release --locked
 }
 
 package() {

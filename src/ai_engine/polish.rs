@@ -320,14 +320,23 @@ pub fn split_merged_tags(tag: String) -> Vec<String> {
 
 /// `barefoot` / `bare feet` next to footwear can't both be true. Legwear (thighhighs, socks, pantyhose) can
 /// go with bare feet on Danbooru, so only shoes count.
+/// Footwear that isn't on the feet (`shoes removed`, `unworn shoes`, `holding shoes`, `single boot`):
+/// it doesn't make a character shod, and barefoot next to it is right.
+pub fn is_unworn_footwear(tag: &str) -> bool {
+    let l = tag.to_lowercase().replace('_', " ");
+    l == "shoes off"
+        || l.split_whitespace().any(|w| matches!(w, "unworn" | "removed" | "holding" | "single"))
+}
+
 pub fn drop_contradicted_feet(tags: Vec<String>) -> Vec<String> {
     let shod = tags.iter().any(|t| {
         let l = t.to_lowercase();
-        ["shoes", "sneakers", "boots", "sandals", "heels", "loafers", "mary janes", "uwabaki", "footwear", "slippers", "geta"]
-            .iter()
-            .any(|f| l == *f || l.ends_with(&format!(" {f}")))
+        !is_unworn_footwear(&l)
+            && ["shoes", "sneakers", "boots", "sandals", "heels", "loafers", "mary janes", "uwabaki", "footwear", "slippers", "geta"]
+                .iter()
+                .any(|f| l == *f || l.ends_with(&format!(" {f}")))
     });
-    if !shod {
+    if !shod || tags.iter().any(|t| is_unworn_footwear(t)) {
         return tags;
     }
     tags.into_iter().filter(|t| !matches!(t.to_lowercase().as_str(), "barefoot" | "bare feet" | "bare foot")).collect()
@@ -457,6 +466,8 @@ pub fn polish_image_prompt_with(
     }
     let mut seen = std::collections::HashSet::new();
     let tags: Vec<String> = tags.into_iter().filter(|t| seen.insert(crate::danbooru::key(t))).collect();
+    // text / logos / usernames printed on the picture (a "©" line) are never content
+    let tags: Vec<String> = tags.into_iter().filter(|t| !crate::tagger::is_image_text_tag(t)).collect();
     let tags = crate::danbooru::dedup_color_parents(&tags.join(", "));
     enforce_strong_tags(&tags, strong)
 }

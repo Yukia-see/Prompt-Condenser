@@ -77,9 +77,9 @@ pub fn read(path: &Path, n: usize, close_ups: bool) -> Result<TagSplit> {
                 }
                 let mut tags = tagger::tag_dynamic(&crop)?;
                 if zoom {
-                    for (_, zone_img) in detector::three_zone_crops(&image, b) {
+                    for (label, zone_img) in detector::three_zone_crops(&image, b) {
                         if let Ok(z_tags) = tagger::tag_dynamic(&zone_img) {
-                            tags = tagger::merge_detail_crop(&tags, &z_tags);
+                            tags = tagger::merge_zone_crop(&tags, &z_tags, label);
                         }
                     }
                 }
@@ -207,6 +207,43 @@ pub fn figure_checks(path: &Path, prompt: &str) -> Option<String> {
 
 pub fn tag_one_fast(path: &Path, progress: &(dyn Fn(String) + Sync)) -> Result<Vec<ScoredTag>> {
     tag_one_passes(path, progress, true, true)
+}
+
+/// Fast Tagger mode thresholds per tag kind (`scene::slot`): stricter for background and eye
+/// colors, looser for clothing. Measured on the 9 local test images (avg F1 80.0% → 81.0% vs one 0.30
+/// threshold) and held on 2 unseen ones (73.4% → 73.1%); see CHANGELOG 2026-11-11.
+pub const FAST_SETTING_THRESHOLD: f32 = 0.35; // setting and light
+pub const FAST_HAIR_THRESHOLD: f32 = 0.35;
+pub const FAST_EYES_THRESHOLD: f32 = 0.42;
+pub const FAST_OUTFIT_THRESHOLD: f32 = 0.25;
+pub const FAST_OTHER_THRESHOLD: f32 = 0.30;
+
+/// The Fast Tagger threshold for one general tag, moved by `offset` (a threshold slider's distance
+/// from its default).
+pub fn fast_threshold(tag_name: &str, offset: f32) -> f32 {
+    let name = tag_name.replace('_', " ");
+    let base = match parse_prompt(&name).first().map(slot) {
+        Some(Slot::Setting | Slot::Light) => FAST_SETTING_THRESHOLD,
+        Some(Slot::Hair) => FAST_HAIR_THRESHOLD,
+        Some(Slot::Eyes) => FAST_EYES_THRESHOLD,
+        Some(Slot::Outfit) => FAST_OUTFIT_THRESHOLD,
+        _ => FAST_OTHER_THRESHOLD,
+    };
+    (base + offset).clamp(0.05, 0.95)
+}
+
+/// `tagger::build_prompt` with the Fast Tagger mode's per-kind thresholds (`fast_threshold`); character
+/// and rating tags are handled by `build_prompt` as usual.
+pub fn build_fast_prompt(scores: &[ScoredTag], offset: f32) -> tagger::TagPrompt {
+    let kept: Vec<ScoredTag> = scores
+        .iter()
+        .filter(|t| t.kind != tagger::TagKind::General || t.score >= fast_threshold(&t.name, offset))
+        .cloned()
+        .collect();
+    let lowest = [FAST_SETTING_THRESHOLD, FAST_HAIR_THRESHOLD, FAST_EYES_THRESHOLD, FAST_OUTFIT_THRESHOLD, FAST_OTHER_THRESHOLD]
+        .into_iter()
+        .fold(1.0f32, f32::min);
+    tagger::build_prompt(&kept, (lowest + offset).clamp(0.05, 0.95))
 }
 
 /// `tag_one_fast` with the extra passes switchable: the 4 corner crops (`quadrants`) and the body-zone crops
@@ -549,6 +586,32 @@ pub fn check_models() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fast_thresholds_follow_the_tag_kind() {
+        use crate::tagger::{ScoredTag, TagKind};
+        assert_eq!(fast_threshold("simple_background", 0.0), FAST_SETTING_THRESHOLD);
+        assert_eq!(fast_threshold("long_hair", 0.0), FAST_HAIR_THRESHOLD);
+        assert_eq!(fast_threshold("blue_eyes", 0.0), FAST_EYES_THRESHOLD);
+        assert_eq!(fast_threshold("pleated_skirt", 0.0), FAST_OUTFIT_THRESHOLD);
+        assert_eq!(fast_threshold("smile", 0.0), FAST_OTHER_THRESHOLD);
+        // the slider's offset moves every kind
+        assert!((fast_threshold("blue_eyes", 0.05) - (FAST_EYES_THRESHOLD + 0.05)).abs() < 1e-6);
+        let t = |name: &str, score: f32| ScoredTag { name: name.into(), kind: TagKind::General, score };
+        let scores = vec![
+            t("pleated_skirt", 0.27),    // outfit: kept at 0.25
+            t("blue_eyes", 0.38),        // eyes: dropped below 0.42
+            t("smile", 0.31),            // other: kept at 0.30
+            t("simple_background", 0.33), // setting: dropped below 0.35
+            ScoredTag { name: "kay_(girls_und_panzer)".into(), kind: TagKind::Character, score: 0.9 },
+        ];
+        let p = build_fast_prompt(&scores, 0.0).prompt;
+        assert!(p.contains("pleated skirt") && p.contains("smile") && p.contains("kay"), "{p}");
+        assert!(!p.contains("blue eyes") && !p.contains("simple background"), "{p}");
+        // a higher slider drops the looser ones too
+        let p = build_fast_prompt(&scores, 0.05).prompt;
+        assert!(!p.contains("pleated skirt") && !p.contains("smile"), "{p}");
+    }
     use crate::tagger::TagKind;
 
     fn tags(list: &[(&str, f32)]) -> Vec<ScoredTag> {

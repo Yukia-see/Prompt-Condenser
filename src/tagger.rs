@@ -389,6 +389,11 @@ const KAOMOJI: &[&str] = &[
     "^_^", "o_o", "u_u", "x_x", "|_|", "||_||",
 ];
 
+/// Whether a tag is an emoticon whose underscores are part of it (`^_^`).
+pub(crate) fn is_kaomoji(tag: &str) -> bool {
+    KAOMOJI.contains(&tag)
+}
+
 /// Danbooru name -> prompt tag: underscores become spaces and parentheses are escaped
 /// so ComfyUI doesn't read `(series)` as a weight.
 pub fn to_prompt_tag(name: &str) -> String {
@@ -404,11 +409,28 @@ pub struct TagPrompt {
 }
 
 /// Builds the prompt: character tags first, then general tags by confidence.
+/// Tags that describe text, logos or usernames printed on the picture (a "©" line, a watermark, an
+/// artist's signature), not its content. In a prompt they make the model draw that text, so no image path
+/// puts them in (danbooru `key` spelling: underscores as spaces). Franchise logos (`rhodes island logo`) stay:
+/// those are usually printed on clothing.
+pub const IMAGE_TEXT_TAGS: &[&str] = &[
+    "copyright notice", "copyright name", "artist name", "character name", "character signature", "signature",
+    "watermark", "sample watermark", "dated", "web address", "logo", "artist logo", "twitter username",
+    "twitter logo", "patreon username", "patreon logo", "pixiv username", "pixiv id", "pixiv logo",
+    "fanbox username", "deviantart username", "instagram username", "instagram logo", "weibo username",
+    "weibo logo", "facebook username", "tumblr username", "gumroad username",
+];
+
+/// Whether a tag is text / a logo / a username printed on the picture (`IMAGE_TEXT_TAGS`).
+pub fn is_image_text_tag(tag: &str) -> bool {
+    IMAGE_TEXT_TAGS.contains(&crate::danbooru::key(tag).as_str())
+}
+
 pub fn build_prompt(scores: &[ScoredTag], general_threshold: f32) -> TagPrompt {
     let mut characters: Vec<&ScoredTag> =
         scores.iter().filter(|t| t.kind == TagKind::Character && t.score >= CHARACTER_THRESHOLD).collect();
     let mut general: Vec<&ScoredTag> =
-        scores.iter().filter(|t| t.kind == TagKind::General && t.score >= general_threshold).collect();
+        scores.iter().filter(|t| t.kind == TagKind::General && t.score >= general_threshold && !is_image_text_tag(&t.name)).collect();
     characters.sort_by(|a, b| b.score.total_cmp(&a.score));
     general.sort_by(|a, b| b.score.total_cmp(&a.score));
     // the tagger scores each size on its own, so "medium breasts" and "large breasts"
@@ -438,6 +460,19 @@ pub fn build_prompt(scores: &[ScoredTag], general_threshold: f32) -> TagPrompt {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_printed_on_the_picture_never_becomes_a_tag() {
+        let t = |name: &str, score| ScoredTag { name: name.into(), kind: TagKind::General, score };
+        let scores = vec![
+            t("1girl", 0.9), t("copyright_notice", 0.8), t("watermark", 0.7), t("pixiv_username", 0.6),
+            t("school_uniform", 0.8), t("rhodes_island_logo_(arknights)", 0.7),
+        ];
+        let p = build_prompt(&scores, 0.3).prompt;
+        assert!(p.contains("school uniform") && p.contains("rhodes island logo"), "{p}");
+        assert!(!p.contains("copyright") && !p.contains("watermark") && !p.contains("username"), "{p}");
+        assert!(is_image_text_tag("Copyright_Notice") && is_image_text_tag("artist name") && !is_image_text_tag("logo on shirt"));
+    }
 
     #[test]
     fn detail_crop_adds_details_but_not_framing() {

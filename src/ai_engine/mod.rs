@@ -184,6 +184,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn unworn_footwear_does_not_cancel_barefoot_on_image_reads() {
+        let v = |x: &[&str]| x.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(drop_contradicted_feet(v(&["1girl", "barefoot", "sneakers"])), v(&["1girl", "sneakers"]));
+        for t in ["shoes removed", "unworn shoes", "holding shoes", "single boot", "shoes off"] {
+            assert_eq!(drop_contradicted_feet(v(&["barefoot", t])), v(&["barefoot", t]), "{t}");
+        }
+    }
+
+    #[test]
     fn ollama_url_normalization() {
         assert_eq!(normalize_ollama_url("192.168.1.50").as_deref(), Some("http://192.168.1.50:11434"));
         assert_eq!(normalize_ollama_url("192.168.1.50:11434").as_deref(), Some("http://192.168.1.50:11434"));
@@ -222,7 +231,7 @@ mod tests {
                 emphasis_weight: 1.25,
                 cleanup_enabled: true,
                 resolve_conflicts_enabled: true,
-                clamp_weights_enabled: true,
+                clamp_weights_enabled: true, fit_suggestions: true, exaggerated_proportions: false,
 
                 camera_angle: 0,
 
@@ -277,7 +286,7 @@ mod tests {
             raw_prompt: "1girl, upper body".into(),
             config: ScanConfig {
                 checkpoint: CheckpointProfile::Anima, target_view: crate::profiles::TargetView::None, pinned_emphasis_raw: String::new(),
-                emphasis_weight: 1.25, cleanup_enabled: true, resolve_conflicts_enabled: true, clamp_weights_enabled: true,
+                emphasis_weight: 1.25, cleanup_enabled: true, resolve_conflicts_enabled: true, clamp_weights_enabled: true, fit_suggestions: true, exaggerated_proportions: false,
                 camera_angle: 0, pose: 0, bust: 0, frame: 0, dynamic: false, lora_tags_raw: String::new(), arranged: false,
                 natural: false, two_char: false, char2_prompt_raw: String::new(), char2_lora_tags_raw: String::new(),
                 char_break: false, scene_prompt_raw: String::new(), more_chars: Vec::new(),
@@ -453,7 +462,7 @@ mod tests {
         use crate::profiles::{CheckpointProfile, DetailLevel, TargetView};
         let config = ScanConfig {
             checkpoint: CheckpointProfile::Anima, target_view: TargetView::None, pinned_emphasis_raw: String::new(),
-            emphasis_weight: 1.25, cleanup_enabled: true, resolve_conflicts_enabled: true, clamp_weights_enabled: true,
+            emphasis_weight: 1.25, cleanup_enabled: true, resolve_conflicts_enabled: true, clamp_weights_enabled: true, fit_suggestions: true, exaggerated_proportions: false,
             camera_angle: 0, pose: 0, bust: 0, frame: 0, dynamic: false, lora_tags_raw: String::new(), arranged: false, natural: true,
             two_char: true, char2_prompt_raw: "1girl, blue hair, bob cut, sailor uniform".into(), char2_lora_tags_raw: String::new(),
             char_break: false, scene_prompt_raw: "beach, sunset, standing in a row, wide shot".into(),
@@ -838,7 +847,7 @@ mod tests {
         let (host, log) = fake_ollama();
         let config = ScanConfig {
             checkpoint: CheckpointProfile::Anima, target_view: TargetView::None, pinned_emphasis_raw: String::new(),
-            emphasis_weight: 1.25, cleanup_enabled: true, resolve_conflicts_enabled: true, clamp_weights_enabled: true,
+            emphasis_weight: 1.25, cleanup_enabled: true, resolve_conflicts_enabled: true, clamp_weights_enabled: true, fit_suggestions: true, exaggerated_proportions: false,
             camera_angle: 0, pose: 0, bust: 0, frame: 0, dynamic: false, lora_tags_raw: String::new(), arranged: false, natural: false,
             two_char: false, char2_prompt_raw: String::new(), char2_lora_tags_raw: String::new(), char_break: false,
             scene_prompt_raw: String::new(), more_chars: Vec::new(), detail: DetailLevel::Balanced,
@@ -947,6 +956,66 @@ mod tests {
     }
 
     #[test]
+    fn bust_and_frame_picks_reach_the_deep_scan_and_its_reply() {
+        use crate::profiles::{CheckpointProfile, TargetView};
+        let mut config = ScanConfig {
+            checkpoint: CheckpointProfile::Anima,
+            target_view: TargetView::None,
+            pinned_emphasis_raw: String::new(),
+            emphasis_weight: 1.25,
+            cleanup_enabled: true,
+            resolve_conflicts_enabled: true,
+            clamp_weights_enabled: true, fit_suggestions: true, exaggerated_proportions: false,
+            camera_angle: 0,
+            pose: 0,
+            bust: 6,
+            frame: 2,
+            dynamic: false,
+            lora_tags_raw: String::new(), arranged: false, natural: false, two_char: false, char2_prompt_raw: String::new(), char2_lora_tags_raw: String::new(), char_break: false, scene_prompt_raw: String::new(), more_chars: Vec::new(),
+            detail: crate::profiles::DetailLevel::Balanced,
+        };
+        // (a) the instructions name the picks, for big and small models
+        for family in [ModelFamily::Gemma, ModelFamily::Small, ModelFamily::Generic] {
+            let (system, user) = build_ai_system_and_user_prompt_for("1girl, large breasts", &config, family);
+            let all = format!("{system}\n{user}");
+            assert!(all.contains("bust size: Gigantic breasts (gigantic breasts)"), "{family:?}");
+            assert!(all.contains("body frame: Shortstack"), "{family:?}");
+        }
+        // (b) the reply is made to agree with them
+        let mut out = AiJsonOutput {
+            improved_prompt: "1girl, large breasts, slender, beach".into(),
+            dynamic_prompt: "1girl, {large breasts|huge breasts}, slender, beach".into(),
+            ..Default::default()
+        };
+        enforce_body_choices(&mut out, &config);
+        for p in [&out.improved_prompt, &out.dynamic_prompt] {
+            assert!(p.contains("gigantic breasts") && !p.contains("large breasts") && !p.contains("slender"), "{p}");
+            for t in ["shortstack", "petite", "wide hips", "thick thighs", "narrow waist", "curvy"] {
+                assert!(p.contains(t), "{t} missing: {p}");
+            }
+            assert_eq!(p.matches("gigantic breasts").count(), 1, "{p}");
+        }
+        // a Petite frame next to a big bust stays petite (the rule path protects picks too)
+        config.frame = 1;
+        let p = crate::analyzer::apply_body_choices("1girl, huge breasts, petite", 6, 1);
+        assert!(p.contains("petite") && p.contains("gigantic breasts"), "{p}");
+        let shown = crate::analyzer::without_lora_tags(&p, &config, true);
+        assert!(shown.iter().any(|t| t.normalized == "petite"), "render's body-type fix kept the pick");
+        // multi-character: every character part gets the pick, the shared scene doesn't
+        config.frame = 0;
+        config.two_char = true;
+        let text = "masterpiece, 2girls, beach, sunset BREAK 1girl, red hair, small breasts, bikini BREAK 1girl, blue hair, large breasts, dress";
+        let fixed = body_choices_in(text, &config);
+        let parts = crate::two::split_breaks(&fixed);
+        assert_eq!(parts.len(), 3, "{fixed}");
+        assert!(!parts[0].contains("breasts"), "{fixed}");
+        assert!(parts[1..].iter().all(|p| p.contains("gigantic breasts") && !p.contains("small") && !p.contains("large")), "{fixed}");
+        // no picks: untouched
+        config.bust = 0;
+        assert_eq!(body_choices_in(text, &config), text);
+    }
+
+    #[test]
     fn talks_to_ollama_api() {
         let _turn = scan_lock();
         use crate::profiles::{CheckpointProfile, TargetView};
@@ -966,7 +1035,7 @@ mod tests {
                 emphasis_weight: 1.25,
                 cleanup_enabled: true,
                 resolve_conflicts_enabled: true,
-                clamp_weights_enabled: true,
+                clamp_weights_enabled: true, fit_suggestions: true, exaggerated_proportions: false,
 
                 camera_angle: 0,
 
@@ -1026,7 +1095,7 @@ mod tests {
                 emphasis_weight: 1.25,
                 cleanup_enabled: true,
                 resolve_conflicts_enabled: true,
-                clamp_weights_enabled: true,
+                clamp_weights_enabled: true, fit_suggestions: true, exaggerated_proportions: false,
 
                 camera_angle: 0,
 
@@ -1085,7 +1154,7 @@ mod tests {
             raw_prompt: "1girl, smile, beach".into(),
             config: ScanConfig {
                 checkpoint: crate::profiles::CheckpointProfile::PonyV6, target_view: crate::profiles::TargetView::None, pinned_emphasis_raw: String::new(),
-                emphasis_weight: 1.25, cleanup_enabled: true, resolve_conflicts_enabled: true, clamp_weights_enabled: true,
+                emphasis_weight: 1.25, cleanup_enabled: true, resolve_conflicts_enabled: true, clamp_weights_enabled: true, fit_suggestions: true, exaggerated_proportions: false,
                 camera_angle: 0, pose: 0, bust: 0, frame: 0, dynamic: false, lora_tags_raw: String::new(), arranged: false, natural: false, two_char: false, char2_prompt_raw: String::new(), char2_lora_tags_raw: String::new(), char_break: false, scene_prompt_raw: String::new(), more_chars: Vec::new(),
                 detail: crate::profiles::DetailLevel::Balanced,
             },
@@ -1153,7 +1222,7 @@ mod tests {
             println!("STRONG  : {}", strong.join(", "));
             let config = ScanConfig {
                 checkpoint: crate::profiles::CheckpointProfile::Anima, target_view: crate::profiles::TargetView::None, pinned_emphasis_raw: String::new(),
-                emphasis_weight: 1.25, cleanup_enabled: true, resolve_conflicts_enabled: true, clamp_weights_enabled: true,
+                emphasis_weight: 1.25, cleanup_enabled: true, resolve_conflicts_enabled: true, clamp_weights_enabled: true, fit_suggestions: true, exaggerated_proportions: false,
                 camera_angle: 0, pose: 0, bust: 0, frame: 0, dynamic: false, lora_tags_raw: String::new(), arranged: false, natural: false, two_char: false, char2_prompt_raw: String::new(), char2_lora_tags_raw: String::new(), char_break: false, scene_prompt_raw: String::new(), more_chars: Vec::new(), detail: crate::profiles::DetailLevel::Balanced,
             };
             let req = ImageAiRequest {
@@ -1248,7 +1317,7 @@ mod tests {
                     raw_prompt: prompt.into(),
                     config: ScanConfig {
                         checkpoint: ckpt, target_view: view, pinned_emphasis_raw: String::new(), emphasis_weight: 1.25,
-                        cleanup_enabled: true, resolve_conflicts_enabled: true, clamp_weights_enabled: true,
+                        cleanup_enabled: true, resolve_conflicts_enabled: true, clamp_weights_enabled: true, fit_suggestions: true, exaggerated_proportions: false,
                         camera_angle: std::env::var("COMPARE_ANGLE").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
                         pose: 0,
                 bust: 0, frame: 0,
@@ -1310,7 +1379,7 @@ mod tests {
         use crate::profiles::{CheckpointProfile, DetailLevel, TargetView};
         let base = || ScanConfig {
             checkpoint: CheckpointProfile::PonyV6, target_view: TargetView::None, pinned_emphasis_raw: String::new(),
-            emphasis_weight: 1.25, cleanup_enabled: true, resolve_conflicts_enabled: true, clamp_weights_enabled: true,
+            emphasis_weight: 1.25, cleanup_enabled: true, resolve_conflicts_enabled: true, clamp_weights_enabled: true, fit_suggestions: true, exaggerated_proportions: false,
             camera_angle: 0, pose: 0, bust: 0, frame: 0, dynamic: false, lora_tags_raw: String::new(), arranged: false, natural: false,
             two_char: false, char2_prompt_raw: String::new(), char2_lora_tags_raw: String::new(), char_break: false,
             scene_prompt_raw: String::new(), more_chars: Vec::new(), detail: DetailLevel::Balanced,
@@ -1410,7 +1479,7 @@ mod tests {
         use crate::profiles::{CheckpointProfile, TargetView};
         let cfg = |view| ScanConfig {
             checkpoint: CheckpointProfile::Anima, target_view: view, pinned_emphasis_raw: String::new(),
-            emphasis_weight: 1.25, cleanup_enabled: true, resolve_conflicts_enabled: true, clamp_weights_enabled: true,
+            emphasis_weight: 1.25, cleanup_enabled: true, resolve_conflicts_enabled: true, clamp_weights_enabled: true, fit_suggestions: true, exaggerated_proportions: false,
  camera_angle: 0,
  pose: 0,
  bust: 0, frame: 0,
@@ -1452,7 +1521,7 @@ mod tests {
         assert_eq!(ModelFamily::detect("prompt-condenser-gemma4-12b"), ModelFamily::Gemma);
         let mut cfg = ScanConfig {
             checkpoint: CheckpointProfile::Anima, target_view: TargetView::None, pinned_emphasis_raw: String::new(),
-            emphasis_weight: 1.25, cleanup_enabled: true, resolve_conflicts_enabled: true, clamp_weights_enabled: true,
+            emphasis_weight: 1.25, cleanup_enabled: true, resolve_conflicts_enabled: true, clamp_weights_enabled: true, fit_suggestions: true, exaggerated_proportions: false,
             camera_angle: 6, pose: 0, bust: 0, frame: 0, dynamic: true, lora_tags_raw: String::new(), arranged: false, natural: false, two_char: false, char2_prompt_raw: String::new(), char2_lora_tags_raw: String::new(), char_break: false, scene_prompt_raw: String::new(), more_chars: Vec::new(), detail: crate::profiles::DetailLevel::Rich,
         };
         let p = "1girl, solo, smile, kimono, shrine, night";

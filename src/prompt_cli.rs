@@ -8,6 +8,13 @@
 //! Target View dropdown (`ScanConfig.target_view`): framing conflicts are judged against it and its
 //! negative tags go into `negative`. Without it, like the window, the prompt's own framing tags decide.
 //!
+//! `--bust` / `--frame` are the window's Bust / Frame dropdowns (`profiles::BUSTS` / `FRAMES`): an index 0-6, a
+//! short name (bust none|flat|small|medium|large|huge|gigantic, frame none|petite|shortstack|thick|pear|
+//! hourglass|muscular), the dropdown label's part before " (" ("pear-shaped", "gigantic breasts") or the
+//! preset's tags; case-insensitive, spaces / dashes / underscores alike. The pick replaces the prompt's own
+//! tags of that list (a bust any other breast size), with a card. With `--vrp` it applies to every
+//! `--char`, not to the shared scene.
+//!
 //! `--vrp` with 2-4 `--char "<prompt>"` options also prints `vrp_state`: the LuCiD VRP "Anima VRP (core)"
 //! JSON (a string, exactly what the window's Copy VRP regions puts on the clipboard), one region per
 //! character. The `--prompt` text is the shared scene: it stays the `positive` (the node's global prompt)
@@ -22,6 +29,7 @@
 use crate::analyzer::{self, ScanConfig};
 use crate::detector::{self, PersonBox};
 use crate::profiles::{CheckpointProfile, DetailLevel, TargetView};
+use crate::condenser::ExportFormat;
 use crate::{condenser, parser, scene, two};
 use anyhow::{anyhow, Context, Result};
 use std::io::Read;
@@ -30,7 +38,11 @@ use std::path::PathBuf;
 const USAGE: &str = "usage: prompt-condenser --prompt \"<text>\" | - [--checkpoint anima|pony|illustrious|sdxl|sd15|flux] \
                      [--lora \"<tags>\"] [--arranged] [--natural] \
                      [--view none|turnaround|360|upper-body|close-up|front|from-behind|side|full-body] \
-                     [--vrp --char \"<prompt>\" --char \"<prompt>\" (2-4) [--image <path>] [--regions \"x,y,w,h;...\"]]";
+                     [--bust none|flat|small|medium|large|huge|gigantic] \
+                     [--frame none|petite|shortstack|thick|pear|hourglass|muscular] [--no-fit-suggestions] \
+                     [--exaggerated] \
+                     [--vrp --char \"<prompt>\" --char \"<prompt>\" (2-4) [--image <path>] [--regions \"x,y,w,h;...\"]] \
+                     [--export comfyui|webui|novelai|plain]";
 
 #[derive(Debug, PartialEq)]
 struct Options {
@@ -39,11 +51,19 @@ struct Options {
     lora: String,
     arranged: bool,
     natural: bool,
+    exaggerated: bool,
     view: TargetView,
+    /// `--bust` / `--frame`: indexes into `profiles::BUSTS` / `FRAMES` (0 = none).
+    bust: usize,
+    frame: usize,
     vrp: bool,
     chars: Vec<String>,
     image: Option<PathBuf>,
     regions: Option<Vec<[f64; 4]>>,
+    /// `--export`: the syntax of `positive`, `negative` and `characters` (`vrp_state` stays ComfyUI's).
+    export: ExportFormat,
+    /// `--no-fit-suggestions`: no "FIT & DYNAMICS" cards (the window's Fit suggestions chip off).
+    no_fit: bool,
 }
 
 impl Default for Options {
@@ -54,13 +74,62 @@ impl Default for Options {
             lora: String::new(),
             arranged: false,
             natural: false,
+            exaggerated: false,
             view: TargetView::None,
+            bust: 0,
+            frame: 0,
             vrp: false,
             chars: Vec::new(),
             image: None,
             regions: None,
+            export: ExportFormat::ComfyUi,
+            no_fit: false,
         }
     }
+}
+
+/// Short `--bust` / `--frame` names, one per `profiles::BUSTS` / `FRAMES` entry.
+const BUST_NAMES: [&str; 7] = ["none", "flat", "small", "medium", "large", "huge", "gigantic"];
+const FRAME_NAMES: [&str; 7] = ["none", "petite", "shortstack", "thick", "pear", "hourglass", "muscular"];
+
+/// Lowercase, with spaces / dashes / underscores alike and single spaces.
+fn loose_name(s: &str) -> String {
+    s.to_lowercase().replace(['-', '_'], " ").split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Every spelling `--bust` / `--frame` takes for entry `i`: the index, the short name, the label's part
+/// before " (", and the preset's tags (also its first tag).
+fn body_spellings(list: &[(&str, &str)], names: &[&str], i: usize) -> Vec<String> {
+    let (label, tags) = list[i];
+    let mut out = vec![i.to_string(), names[i].to_string(), loose_name(label.split(" (").next().unwrap_or(label))];
+    if !tags.is_empty() {
+        out.push(loose_name(tags));
+        out.push(loose_name(tags.split(',').next().unwrap_or(tags)));
+    }
+    out
+}
+
+/// The index of a `--bust` / `--frame` value, or an error listing the valid spellings.
+fn body_from_name(flag: &str, list: &[(&str, &str)], names: &[&str], value: &str) -> Result<usize> {
+    let v = loose_name(value);
+    // the short name and label beat a shared first tag ("petite" is Petite, not Shortstack's first tag)
+    for pass in 0..2 {
+        for i in 0..list.len() {
+            let sp = body_spellings(list, names, i);
+            let hit = if pass == 0 { sp[..3].contains(&v) } else { sp[3..].contains(&v) };
+            if hit {
+                return Ok(i);
+            }
+        }
+    }
+    let valid: Vec<String> = (0..list.len())
+        .map(|i| {
+            let mut sp = body_spellings(list, names, i)[..3].to_vec();
+            sp.dedup();
+            sp.join(" / ")
+        })
+        .collect();
+    Err(anyhow!("unknown {flag} {value}: use one of {} (or the preset's tags; case, spaces, dashes and underscores don't matter)", valid.join(", ")))
 }
 
 /// `--view` names: case doesn't matter, spaces / underscores / dashes are the same.
@@ -124,11 +193,25 @@ fn parse_args(args: &[String], stdin: impl FnOnce() -> Result<String>) -> Result
                     anyhow!("unknown view {v}: use none, turnaround (or 360), upper-body, close-up, front, from-behind, side or full-body")
                 })?;
             }
+            "--no-fit-suggestions" => opts.no_fit = true,
+            "--bust" => {
+                let v = it.next().ok_or_else(|| anyhow!("--bust needs a size\n{USAGE}"))?;
+                opts.bust = body_from_name("--bust", crate::profiles::BUSTS, &BUST_NAMES, v)?;
+            }
+            "--frame" => {
+                let v = it.next().ok_or_else(|| anyhow!("--frame needs a shape\n{USAGE}"))?;
+                opts.frame = body_from_name("--frame", crate::profiles::FRAMES, &FRAME_NAMES, v)?;
+            }
             "--vrp" => opts.vrp = true,
             "--char" => opts.chars.push(it.next().ok_or_else(|| anyhow!("--char needs a prompt\n{USAGE}"))?.clone()),
             "--image" => opts.image = Some(PathBuf::from(it.next().ok_or_else(|| anyhow!("--image needs a path\n{USAGE}"))?)),
             "--regions" => opts.regions = Some(parse_regions(it.next().ok_or_else(|| anyhow!("--regions needs boxes\n{USAGE}"))?)?),
             "--natural" => opts.natural = true,
+            "--exaggerated" | "--exaggerated-proportions" => opts.exaggerated = true,
+            "--export" => {
+                let v = it.next().ok_or_else(|| anyhow!("--export needs a format\n{USAGE}"))?;
+                opts.export = ExportFormat::from_name(v).ok_or_else(|| anyhow!("unknown format {v}: use comfyui, webui, novelai or plain"))?;
+            }
             "-h" | "--help" => return Err(anyhow!("{USAGE}")),
             t if text.is_none() && (t == "-" || !t.starts_with("--")) => text = Some(t.to_string()),
             other => return Err(anyhow!("unknown option {other}\n{USAGE}")),
@@ -163,10 +246,13 @@ fn config_for(o: &Options) -> ScanConfig {
         cleanup_enabled: true,
         resolve_conflicts_enabled: true,
         clamp_weights_enabled: true,
+        fit_suggestions: !o.no_fit,
+        exaggerated_proportions: o.exaggerated,
         camera_angle: 0,
         pose: 0,
-        bust: 0,
-        frame: 0,
+        // with --vrp the picks go to each character, not the shared scene (see `condense`)
+        bust: if o.vrp { 0 } else { o.bust },
+        frame: if o.vrp { 0 } else { o.frame },
         dynamic: false,
         lora_tags_raw: o.lora.clone(),
         arranged: o.arranged,
@@ -217,6 +303,8 @@ fn condense(o: &Options, detected: &Detected) -> serde_json::Value {
     let mut regions_prompts = Vec::new();
     for (i, text) in o.chars.iter().enumerate() {
         let mut ci = config.clone();
+        ci.bust = o.bust;
+        ci.frame = o.frame;
         ci.lora_tags_raw = String::new();
         ci.natural = false;
         if ci.target_view == TargetView::None {
@@ -240,7 +328,16 @@ fn condense(o: &Options, detected: &Detected) -> serde_json::Value {
         "changes": changes,
         "tokens_before": out.before_tokens,
         "tokens_after": out.after_tokens,
+        "chunks_before": out.before_chunks,
+        "chunks_after": out.after_chunks,
     });
+    // --export: the copyable texts in another tool's syntax (the VRP node reads ComfyUI's)
+    let all = std::iter::once(positive.as_str()).chain(regions_prompts.iter().map(String::as_str)).collect::<Vec<_>>().join(", ");
+    if let Some(note) = condenser::export_warning(&all, o.export) {
+        v["export_note"] = serde_json::json!(note);
+    }
+    v["positive"] = serde_json::json!(condenser::format_prompt(&positive, o.export));
+    v["negative"] = serde_json::json!(condenser::format_prompt(&negative, o.export));
     if o.vrp {
         let n = o.chars.len();
         let mut warnings: Vec<String> = detected.warning.iter().cloned().collect();
@@ -256,7 +353,7 @@ fn condense(o: &Options, detected: &Detected) -> serde_json::Value {
             (None, Some(b)) => (two::vrp_regions(n, Some(b), detected.size), "detector"),
             (None, None) => (two::vrp_regions(n, None, detected.size), "strips"),
         };
-        v["characters"] = serde_json::json!(regions_prompts);
+        v["characters"] = serde_json::json!(regions_prompts.iter().map(|p| condenser::format_prompt(p, o.export)).collect::<Vec<_>>());
         v["vrp_state"] = serde_json::json!(two::vrp_state_json_from(&regions_prompts, &regions, detected.size));
         v["regions_source"] = serde_json::json!(source);
         v["warnings"] = serde_json::json!(warnings);
@@ -394,6 +491,81 @@ mod tests {
 
     fn vrp_of(v: &serde_json::Value) -> serde_json::Value {
         serde_json::from_str(v["vrp_state"].as_str().expect("vrp_state is a string")).unwrap()
+    }
+
+    #[test]
+    fn clip_chunks_turn_over_after_75_tokens() {
+        // the estimate counts words, plus one token per two commas / brackets
+        let words = |n: usize| (0..n).map(|i| format!("w{i}")).collect::<Vec<_>>().join(" ");
+        assert_eq!(parser::estimate_clip_tokens(&words(74)), (74, 1));
+        assert_eq!(parser::estimate_clip_tokens(&words(75)), (75, 1));
+        assert_eq!(parser::estimate_clip_tokens(&words(76)), (76, 2));
+        // 50 comma-separated tags: 50 words + 49 / 2 commas = 74
+        let tags = |n: usize| (0..n).map(|i| format!("t{i}")).collect::<Vec<_>>().join(", ");
+        assert_eq!(parser::estimate_clip_tokens(&tags(50)), (74, 1));
+        assert_eq!(parser::estimate_clip_tokens(&tags(51)), (76, 2));
+        // and the JSON reports them
+        let o = Options { text: words(76), ..Default::default() };
+        let v = condense(&o, &Detected::default());
+        assert_eq!(v["chunks_before"], 2, "{v}");
+        assert!(v["chunks_after"].as_u64().unwrap() >= 1, "{v}");
+    }
+
+    #[test]
+    fn export_formats_apply_to_the_texts() {
+        let no_stdin = || -> Result<String> { panic!("stdin not expected") };
+        let o = parse_args(&args(&["1girl, (red hair:1.15)", "--export", "novelai"]), no_stdin).unwrap();
+        assert_eq!(o.export, ExportFormat::NovelAi);
+        assert!(parse_args(&args(&["x", "--export", "bmp"]), no_stdin).is_err());
+        let v = condense(&o, &Detected::default());
+        assert!(v["positive"].as_str().unwrap().contains("{{{red hair}}}"), "{v}");
+        let o = Options {
+            text: "beach".into(),
+            vrp: true,
+            chars: vec!["1girl, (smile:1.2), <lora:a:1>".into(), "1boy".into()],
+            export: ExportFormat::Plain,
+            ..Default::default()
+        };
+        let v = condense(&o, &Detected::default());
+        let c0 = v["characters"][0].as_str().unwrap();
+        assert!(c0.contains("smile") && !c0.contains("1.2") && !c0.contains("lora"), "{v}");
+        // the VRP node reads ComfyUI syntax, so its state is left as is
+        assert!(vrp_of(&v)["regions"][0]["prompt"].as_str().unwrap().contains("(smile:1.2)"), "{v}");
+    }
+
+    #[test]
+    fn bust_and_frame_flags_parse_and_apply() {
+        let no_stdin = || -> Result<String> { panic!("stdin not expected") };
+        let bust = |v: &str| parse_args(&args(&["x", "--bust", v]), no_stdin).map(|o| o.bust);
+        let frame = |v: &str| parse_args(&args(&["x", "--frame", v]), no_stdin).map(|o| o.frame);
+        for v in ["6", "gigantic", "Gigantic breasts", "gigantic_breasts", "GIGANTIC-BREASTS"] {
+            assert_eq!(bust(v).unwrap(), 6, "{v}");
+        }
+        assert_eq!(bust("none").unwrap(), 0);
+        assert_eq!(bust("flat chest").unwrap(), 1);
+        for (v, i) in [("2", 2), ("shortstack", 2), ("Shortstack", 2), ("petite", 1), ("pear", 4), ("Pear-shaped", 4), ("pear_shaped", 4),
+            ("hourglass", 5), ("muscular", 6), ("muscular female", 6), ("thick", 3), ("Thick thighs & wide hips", 3), ("thick thighs, wide hips", 3)]
+        {
+            assert_eq!(frame(v).unwrap(), i, "{v}");
+        }
+        let err = frame("banana").unwrap_err().to_string();
+        assert!(err.contains("shortstack") && err.contains("pear shaped") && err.contains("hourglass"), "{err}");
+        assert!(bust("7").is_err() && bust("enormous").is_err());
+
+        let o = Options { text: "1girl, small breasts, slender, beach".into(), bust: 6, frame: 2, ..Default::default() };
+        let v = condense(&o, &Detected::default());
+        let p = v["positive"].as_str().unwrap();
+        assert!(p.contains("gigantic breasts") && !p.contains("small breasts"), "{p}");
+        for t in ["shortstack", "petite", "wide hips", "thick thighs", "narrow waist", "curvy"] {
+            assert!(p.contains(t), "{t} missing: {p}");
+        }
+        // with --vrp the picks go to the characters, not the shared scene
+        let o = Options { text: "beach".into(), bust: 6, vrp: true, chars: vec!["1girl, small breasts".into(), "1girl".into()], ..Default::default() };
+        let v = condense(&o, &Detected::default());
+        assert!(!v["positive"].as_str().unwrap().contains("breasts"), "{v}");
+        for c in v["characters"].as_array().unwrap() {
+            assert!(c.as_str().unwrap().contains("gigantic breasts") && !c.as_str().unwrap().contains("small breasts"), "{c}");
+        }
     }
 
     #[test]

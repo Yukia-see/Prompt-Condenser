@@ -46,9 +46,133 @@ pub fn make_dynamic(prompt: &str) -> (String, Vec<&'static str>) {
     (parts.join(", "), used)
 }
 
+/// A fresh seed for `roll` (std's per-process random hash keys; no RNG dependency).
+pub fn random_seed() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
+    h.finish()
+}
+
+/// xorshift64: enough for picking options.
+struct XorShift(u64);
+
+impl XorShift {
+    fn new(seed: u64) -> Self {
+        XorShift(if seed == 0 { 0x9E37_79B9_7F4A_7C15 } else { seed })
+    }
+    fn below(&mut self, n: usize) -> usize {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        (x % n as u64) as usize
+    }
+}
+
+/// Resolves every `{a|b|c}` group to one option, picked uniformly with `seed` (nested groups from the
+/// inside out), the way the Dynamic Prompts node does for one image. Everything else is kept as written:
+/// `<lora:…>`, `(tag:1.2)`, escaped `\{` / `\}` / `\|`, a `|` outside a group, an unclosed `{`.
+pub fn roll(prompt: &str, seed: u64) -> String {
+    let chars: Vec<char> = prompt.chars().collect();
+    let mut rng = XorShift::new(seed);
+    let mut i = 0;
+    let mut out = String::new();
+    while i < chars.len() {
+        let (s, _) = roll_seq(&chars, &mut i, &mut rng);
+        out.push_str(&s);
+        if i < chars.len() {
+            // a `|` or `}` at the top level is plain text
+            out.push(chars[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Reads text up to the end or this level's `|` / `}`, which is returned unread.
+fn roll_seq(chars: &[char], i: &mut usize, rng: &mut XorShift) -> (String, Option<char>) {
+    let mut out = String::new();
+    while *i < chars.len() {
+        let c = chars[*i];
+        match c {
+            '\\' => {
+                out.push(c);
+                if let Some(&n) = chars.get(*i + 1) {
+                    out.push(n);
+                }
+                *i += 2;
+            }
+            '|' | '}' => return (out, Some(c)),
+            '{' => {
+                let start = *i;
+                *i += 1;
+                let mut options = Vec::new();
+                let closed = loop {
+                    let (s, end) = roll_seq(chars, i, rng);
+                    options.push(s);
+                    match end {
+                        Some('|') => *i += 1,
+                        Some(_) => {
+                            *i += 1;
+                            break true;
+                        }
+                        None => break false,
+                    }
+                };
+                if closed {
+                    out.push_str(&options[rng.below(options.len())]);
+                } else {
+                    // unclosed: keep the rest as written
+                    out.extend(&chars[start..]);
+                    *i = chars.len();
+                }
+            }
+            _ => {
+                out.push(c);
+                *i += 1;
+            }
+        }
+    }
+    (out, None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn roll_picks_one_option_per_group() {
+        let p = "1girl, {smile|grin|smirk}, {standing|sitting}";
+        // the same seed gives the same pick
+        assert_eq!(roll(p, 7), roll(p, 7));
+        let out = roll(p, 7);
+        assert!(!out.contains('{') && !out.contains('|'), "{out}");
+        assert!(out.starts_with("1girl, "));
+        // every option comes up across seeds
+        let picks: std::collections::HashSet<String> = (1..200).map(|s| roll("{a|b|c}", s)).collect();
+        assert_eq!(picks.len(), 3, "{picks:?}");
+        assert_ne!(random_seed(), random_seed());
+    }
+
+    #[test]
+    fn roll_resolves_nested_groups_from_the_inside_out() {
+        let seen: std::collections::HashSet<String> = (1..400).map(|s| roll("{red {hair|eyes}|blue}", s)).collect();
+        let want: std::collections::HashSet<String> = ["red hair", "red eyes", "blue"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(seen, want);
+    }
+
+    #[test]
+    fn roll_leaves_loras_weights_and_escapes_alone() {
+        let p = "<lora:style_v2:0.8:0.6>, (masterpiece:1.2), \\{literal\\|x\\}, kay \\(girls und panzer\\), {smile|smile}, a|b, {open";
+        assert_eq!(
+            roll(p, 3),
+            "<lora:style_v2:0.8:0.6>, (masterpiece:1.2), \\{literal\\|x\\}, kay \\(girls und panzer\\), smile, a|b, {open"
+        );
+        assert_eq!(roll("no groups here", 1), "no groups here");
+        assert!(roll("{a|}", 1).len() <= 1);
+    }
 
     #[test]
     fn varies_pose_expression_and_light_but_not_identity() {
