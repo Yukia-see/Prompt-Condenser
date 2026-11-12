@@ -29,3 +29,17 @@ __pycache__/
 /tools/bench_combo_taggers.py
 /tools/bench_taggers_shootout.py
 /tools/claude_bridge.py
+
+# test pictures and reports stay local (2026-11-12)
+tests/eval_dataset/
+/*.md
+/*.txt
+/*.json
+!/README.md
+!/CHANGELOG.md
+!/CLAUDE.md
+!/CLAUDE_BACKEND_HANDOFF.md
+*.png
+*.jpg
+*.jpeg
+*.webp
