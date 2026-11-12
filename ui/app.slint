@@ -144,6 +144,12 @@ export struct ScenePanelChar {
     angle_index: int,
 }
 
+/// One suggested tag on a card, switched on or off by itself (only the "on" ones are added).
+export struct CardChip {
+    tag: string,
+    on: bool,
+}
+
 export struct ChangeCardItem {
     id: int,
     badge: string,
@@ -154,6 +160,10 @@ export struct ChangeCardItem {
     framing_alternative: string,
     has_framing_alt: bool,
     mode: int, // 0 = Primary Suggestion, 1 = Framing Alternative, 2 = Restore Original
+    /// Suggestion cards with several tags: each one can be switched on/off.
+    chips: [CardChip],
+    /// > 0: this is the folded "N small fixes" card (its reason lists them).
+    summary_count: int,
 }
 
 component SectionLabel inherits Text {
@@ -362,6 +372,8 @@ component SceneCard inherits Rectangle {
 component ChangeCard inherits Rectangle {
     in property <ChangeCardItem> card;
     callback mode-changed(int, int);
+    callback chip-toggled(int, string);
+    callback expand-fixes();
     background: M3.surface-container-high;
     border-radius: 10px;
     border-width: 1px;
@@ -382,7 +394,7 @@ component ChangeCard inherits Rectangle {
                     bg: card.badge_kind == 3 ? M3.primary : card.badge_kind == 0 ? M3.warning-container : (card.badge_kind == 1 ? M3.success-container : M3.info-container);
                 }
                 Text {
-                    text: card.original == "" ? "New detail" : "Original: \"" + card.original + "\"";
+                    text: card.summary_count > 0 ? "Already applied" : (card.original == "" ? "New detail" : "Original: \"" + card.original + "\"");
                     font-size: 11px;
                     font-weight: 700;
                     color: M3.tertiary;
@@ -391,7 +403,43 @@ component ChangeCard inherits Rectangle {
                 }
             }
 
-            if card.suggested_alternative != "" : Text {
+            // the folded small fixes: one button opens them as separate cards
+            if card.summary_count > 0 : HorizontalLayout {
+                alignment: start;
+                PillButton {
+                    text: "Show each (" + card.summary_count + ") ▸";
+                    clicked => { root.expand-fixes(); }
+                }
+            }
+            if card.chips.length > 0 : Text {
+                text: "Pick the tags to add:";
+                font-size: 11px;
+                font-weight: 600;
+                color: M3.success;
+            }
+            for chip in card.chips : Rectangle {
+                height: 22px;
+                border-radius: 6px;
+                background: chip.on ? M3.secondary-container : transparent;
+                border-width: 1px;
+                border-color: chip.on ? M3.primary : M3.outline-variant;
+                HorizontalLayout {
+                    padding-left: 6px;
+                    padding-right: 6px;
+                    Text {
+                        text: (chip.on ? "☑ " : "☐ ") + chip.tag;
+                        font-size: 11px;
+                        color: chip.on ? M3.primary : M3.on-surface-variant;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                }
+                TouchArea {
+                    mouse-cursor: MouseCursor.pointer;
+                    clicked => { root.chip-toggled(card.id, chip.tag); }
+                }
+            }
+            if card.suggested_alternative != "" && card.chips.length == 0 : Text {
                 text: "Suggested: " + card.suggested_alternative;
                 font-size: 11px;
                 font-weight: 600;
@@ -406,7 +454,7 @@ component ChangeCard inherits Rectangle {
                 wrap: word-wrap;
             }
 
-            HorizontalLayout {
+            if card.summary_count == 0 : HorizontalLayout {
                 spacing: 6px;
                 alignment: start;
                 PillButton {
@@ -687,8 +735,42 @@ component RegionPreview inherits Rectangle {
     }
 }
 
+/// A tab in the card strip's filter row ("Conflicts 3").
+component FilterTab inherits Rectangle {
+    in property <string> text;
+    in property <bool> selected;
+    callback clicked();
+    height: 22px;
+    min-width: tl.preferred-width + 14px;
+    border-radius: 11px;
+    accessible-role: button;
+    accessible-label: root.text;
+    background: root.selected ? M3.secondary-container : (ta.has-hover ? M3.surface-container-high : transparent);
+    border-width: 1px;
+    border-color: root.selected ? M3.primary : M3.outline-variant;
+    tl := Text {
+        text: root.text;
+        font-size: 11px;
+        font-weight: root.selected ? 700 : 500;
+        color: root.selected ? M3.primary : M3.on-surface-variant;
+    }
+    ta := TouchArea {
+        mouse-cursor: MouseCursor.pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
 component CardsPanel inherits M3Card {
     in property <[ChangeCardItem]> cards;
+    /// 0 All, 1 Conflicts, 2 Fixes, 3 Suggestions, 4 AI; counts in the same order.
+    in property <int> card-filter;
+    in property <[int]> filter-counts: [0, 0, 0, 0, 0];
+    in property <bool> ideas-enabled;
+    in property <bool> ideas-busy;
+    callback filter-changed(int);
+    callback chip-toggled(int, string);
+    callback expand-fixes();
+    callback ideas();
     in property <string> live-headline;
     in property <string> live-details;
     in property <string> live-missing;
@@ -714,11 +796,15 @@ component CardsPanel inherits M3Card {
                 vertical-alignment: center;
             }
             Rectangle { horizontal-stretch: 1; }
-            Text {
-                text: "Scroll inside any card · Shift + wheel: sideways · Drag bottom border to resize";
-                font-size: 11px;
-                color: M3.on-surface-variant;
-                vertical-alignment: center;
+            for label[i] in ["All", "Conflicts", "Fixes", "Suggestions", "AI"] : FilterTab {
+                text: label + " " + (root.filter-counts[i]);
+                selected: root.card-filter == i;
+                clicked => { root.filter-changed(i); }
+            }
+            PillButton {
+                text: root.ideas-busy ? "💡 Thinking…" : "💡 Ideas";
+                enabled: root.ideas-enabled && !root.ideas-busy;
+                clicked => { root.ideas(); }
             }
         }
 
@@ -756,6 +842,8 @@ component CardsPanel inherits M3Card {
                     width: 295px;
                     card: card;
                     mode-changed(id, mode) => { root.mode-changed(id, mode); }
+                    chip-toggled(id, tag) => { root.chip-toggled(id, tag); }
+                    expand-fixes => { root.expand-fixes(); }
                 }
             }
         }
@@ -794,14 +882,13 @@ component CharacterCard inherits M3Card {
         // Top: Character Prompt
         VerticalLayout {
             vertical-stretch: root.prompt-ratio;
-            min-height: 36px;
+            min-height: 72px;
             spacing: 4px;
             HorizontalLayout {
                 spacing: 6px;
-                alignment: center;
-                Text { text: root.title; font-size: 11px; font-weight: 700; color: M3.error; vertical-alignment: center; }
-                Rectangle { horizontal-stretch: 1; }
-                Text { text: root.stats; font-size: 11px; color: root.stats-warn ? M3.warning : M3.on-surface-variant; vertical-alignment: center; }
+                // the title and stats shorten with "…" on a narrow window, so the buttons stay visible
+                Text { text: root.title; font-size: 11px; font-weight: 700; color: M3.error; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; min-width: 40px; }
+                Text { text: root.stats; font-size: 11px; color: root.stats-warn ? M3.warning : M3.on-surface-variant; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; min-width: 0px; horizontal-alignment: right; }
                 if root.quality-button : PillButton {
                     text: "+ Quality";
                     clicked => { root.add-quality(); }
@@ -818,6 +905,7 @@ component CharacterCard inherits M3Card {
             }
             TextEdit {
                 vertical-stretch: 1;
+                min-height: 40px;
                 text <=> root.text;
                 wrap: word-wrap;
                 font-size: 13px;
@@ -1820,6 +1908,13 @@ export component AppWindow inherits Window {
     callback queue_comfyui_requested();
 
     in-out property <[ChangeCardItem]> change_cards: [];
+    in-out property <int> card_filter: 0;              // card strip filter (not saved)
+    in-out property <[int]> card_filter_counts: [0, 0, 0, 0, 0];
+    in-out property <bool> ideas_busy: false;          // 💡 Ideas: E4B is suggesting tags for the gaps
+    callback card_chip_toggled(int, string);
+    callback card_expand_fixes();
+    callback card_filter_changed(int);
+    callback ideas_requested();
 
     callback analyze_requested();
     callback ai_settings_changed();
@@ -1831,7 +1926,7 @@ export component AppWindow inherits Window {
     callback load_image_requested();
     callback remove_image_requested();
     callback image_mode_changed();
-    in-out property <bool> enable_dual_pass: false;      // Dual-pass Moondream + WD14 (Advanced)
+    in-out property <bool> enable_dual_pass: false;      // always off: Dual-Pass Vision was never better than the default (option removed 2026-11-12)
     in-out property <bool> image_advanced: false;        // show the older image-reading options (dual pass, synthesis, 2nd pass check)
     callback dual_pass_changed();
     in-out property <int> dual_pass_mode_index: 0;      // 0: Scene + Body Shape (Mode A), 1: Scene + Skeletal Pose (Mode B)
@@ -1842,7 +1937,7 @@ export component AppWindow inherits Window {
     in-out property <string> pipeline_warnings: "";     // Pipeline fallback warnings (e.g. Ollama unreachable)
     in-out property <bool> image_identity_only: false;   // images supply only who + outfit
     callback identity_changed();
-    in-out property <bool> image_second_pass: false;    // 2nd pass visual check with vision-capable model (Advanced)
+    in-out property <bool> image_second_pass: false;    // always off: image reads write with E4B, which can't see (option removed 2026-11-12)
     callback second_pass_changed();
     in-out property <bool> scene_body_shape: false;     // swap body shape from scene reference, keep outfit/height/face
     callback scene_body_shape_changed();
@@ -1880,6 +1975,7 @@ export component AppWindow inherits Window {
     callback translate_apply_requested(bool);   // true = replace the Before prompt
     callback undo_image_prompt_requested();
     callback png_prompt_requested(); // the generation prompt saved in a PNG into Before (png_meta)
+    callback check_result_requested(); // tag a generated picture and compare it with Before (check.rs)
     callback download_tagger_requested();
     callback tag_threshold_changed();
     callback copy_output_requested();
@@ -2468,6 +2564,10 @@ export component AppWindow inherits Window {
                                             text: "📄 From PNG…";
                                             clicked => { root.png_prompt_requested(); }
                                         }
+                                        if root.app_tab == 0 : PillButton {
+                                            text: "🔍 Check Result…";
+                                            clicked => { root.check_result_requested(); }
+                                        }
                                         if root.image_can_undo : PillButton {
                                             text: "↶ Undo";
                                             clicked => { root.undo_image_prompt_requested(); }
@@ -2504,7 +2604,7 @@ export component AppWindow inherits Window {
                                             char1-image-loaded: root.char1_image_loaded;
                                             image-advanced <=> root.image_advanced;
                                             scene-panel-open <=> root.scene_panel_open;
-                                            settings-on: (root.image_identity_only ? 1 : 0) + (root.scene_body_shape ? 1 : 0) + (root.image_second_pass ? 1 : 0) + (root.enable_dual_pass ? 1 : 0);
+                                            settings-on: (root.image_identity_only ? 1 : 0) + (root.scene_body_shape ? 1 : 0);
                                             image-mode-changed => { root.image_mode_changed(); }
                                             transfer => { root.transfer_requested(); }
                                             auto-scene => { root.auto_scene_requested(); }
@@ -2528,7 +2628,7 @@ export component AppWindow inherits Window {
                                             char1-image-loaded: root.char1_image_loaded;
                                             image-advanced <=> root.image_advanced;
                                             scene-panel-open <=> root.scene_panel_open;
-                                            settings-on: (root.image_identity_only ? 1 : 0) + (root.scene_body_shape ? 1 : 0) + (root.image_second_pass ? 1 : 0) + (root.enable_dual_pass ? 1 : 0);
+                                            settings-on: (root.image_identity_only ? 1 : 0) + (root.scene_body_shape ? 1 : 0);
                                             image-mode-changed => { root.image_mode_changed(); }
                                             transfer => { root.transfer_requested(); }
                                             auto-scene => { root.auto_scene_requested(); }
@@ -2581,46 +2681,16 @@ export component AppWindow inherits Window {
                                                 enabled: !root.tagger_busy;
                                                 toggled => { root.identity_changed(); }
                                             }
-                                            if !root.enable_dual_pass : FilterChip {
+                                            FilterChip {
                                                 text: "Scene Body Shape";
                                                 checked <=> root.scene_body_shape;
                                                 enabled: !root.tagger_busy;
                                                 toggled => { root.scene_body_shape_changed(); }
                                             }
-                                            FilterChip {
-                                                text: "2nd Pass Visual Check";
-                                                checked <=> root.image_second_pass;
-                                                enabled: !root.tagger_busy && (!root.enable_dual_pass || root.use_llm_synthesis);
-                                                toggled => { root.second_pass_changed(); }
-                                            }
                                             PillButton {
                                                 text: "↻ Flush Vision Cache";
                                                 enabled: !root.tagger_busy && (root.image_loaded || root.images_pending || root.scene_ref_loaded || root.char1_image_loaded);
                                                 clicked => { root.redo_image_requested(); }
-                                            }
-                                        }
-                                        HorizontalLayout {
-                                            spacing: 8px;
-                                            alignment: start;
-                                            SectionLabel { text: "ADVANCED:"; vertical-alignment: center; }
-                                            FilterChip {
-                                                text: "Dual-Pass Vision";
-                                                checked <=> root.enable_dual_pass;
-                                                enabled: !root.tagger_busy;
-                                                toggled => { root.dual_pass_changed(); }
-                                            }
-                                            if root.enable_dual_pass : ComboBox {
-                                                width: 175px;
-                                                model: root.dual_pass_mode_labels;
-                                                current-index <=> root.dual_pass_mode_index;
-                                                enabled: !root.tagger_busy;
-                                                selected => { root.dual_pass_mode_changed(); }
-                                            }
-                                            if root.enable_dual_pass : FilterChip {
-                                                text: "LLM Synthesis";
-                                                checked <=> root.use_llm_synthesis;
-                                                enabled: !root.tagger_busy;
-                                                toggled => { root.llm_synthesis_changed(); }
                                             }
                                         }
                                     }
@@ -3054,6 +3124,14 @@ export component AppWindow inherits Window {
                             scene-issues: root.scene_issues;
                             show-ai-button: root.ai_improved_available && (root.after_view == 0 || root.after_view == 3);
                             mode-changed(id, mode) => { root.card_mode_changed(id, mode); }
+                            card-filter: root.card_filter;
+                            filter-counts: root.card_filter_counts;
+                            ideas-enabled: root.ollama_connected && root.raw_prompt != "";
+                            ideas-busy: root.ideas_busy;
+                            filter-changed(i) => { root.card_filter_changed(i); }
+                            chip-toggled(id, tag) => { root.card_chip_toggled(id, tag); }
+                            expand-fixes => { root.card_expand_fixes(); }
+                            ideas => { root.ideas_requested(); }
                             show-ai => { if root.after_view == 3 { root.after_view_changed(4); } else { root.after_view_changed(1); } }
                           }
                         }

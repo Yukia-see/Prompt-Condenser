@@ -1250,6 +1250,89 @@ mod tests {
         }
     }
 
+    /// The whole workflow per image: the image read (tagger → vision model → E4B writes, as in the app), then a
+    /// Deep Scan of that prompt with `DEEP_MODEL` (default the 12B). Prints PROMPT / IMPROVED lines for scoring:
+    /// `IMAGE_TEST=a.jpg:b.jpg cargo test live_workflow -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn live_workflow() {
+        let writer = std::env::var("IMAGE_MODEL").unwrap_or_else(|_| "prompt-condenser-gemma4-e4b:latest".into());
+        let deep = std::env::var("DEEP_MODEL").unwrap_or_else(|_| "huihui_ai/gemma-4-abliterated:12b".into());
+        let encoder = std::env::var("VISION_ENCODER").unwrap_or_else(|_| "hf.co/DraconicDragon/ToriiGate-0.5-GGUF:Q4_K_M".into());
+        for path in std::env::var("IMAGE_TEST").unwrap().split(':') {
+            let path = std::path::PathBuf::from(path);
+            let config = ScanConfig {
+                checkpoint: crate::profiles::CheckpointProfile::Anima, target_view: crate::profiles::TargetView::None, pinned_emphasis_raw: String::new(),
+                emphasis_weight: 1.25, cleanup_enabled: true, resolve_conflicts_enabled: true, clamp_weights_enabled: true, fit_suggestions: true, exaggerated_proportions: false,
+                camera_angle: 0, pose: 0, bust: 0, frame: 0, dynamic: false, lora_tags_raw: String::new(), arranged: false, natural: false, two_char: false, char2_prompt_raw: String::new(), char2_lora_tags_raw: String::new(), char_break: false, scene_prompt_raw: String::new(), more_chars: Vec::new(), detail: crate::profiles::DetailLevel::Balanced,
+            };
+            let t = std::time::Instant::now();
+            let scored = crate::twoimg::tag_one_fast(&path, &|_| ()).unwrap_or_default();
+            let req = ImageAiRequest {
+                host: "localhost:11434".into(), model: writer.clone(), vision_encoder: Some(encoder.clone()), mode: AiMode::Gpu,
+                image_path: path.clone(), config: config.clone(), tag_hints: crate::tagger::build_prompt(&scored, 0.35).prompt,
+                strong_tags: strong_tags(&scored), tagger_scores: tag_scores(&scored), second_pass_vision: false, scene_body_shape: false,
+            };
+            let read = describe_image(&req).map(|r| r.prompt).unwrap_or_default();
+            let read_secs = t.elapsed().as_secs_f32();
+            unload_dedicated_encoders("http://localhost:11434", &[encoder.as_str()], &deep);
+            let t2 = std::time::Instant::now();
+            let scan = AiScanRequest {
+                raw_prompt: read.clone(), config, mode: AiMode::Gpu, host: "localhost:11434".into(), model: deep.clone(),
+                keep_alive: "10m".into(), think: false,
+            };
+            let improved = run_ai_scan(&scan).map(|(o, _)| o.improved_prompt).unwrap_or_default();
+            println!("\n=======================================================");
+            println!("IMAGE   : {}", path.display());
+            println!("TIME    : read {read_secs:.1}s, deep scan {:.1}s", t2.elapsed().as_secs_f32());
+            println!("PROMPT  : {read}");
+            println!("IMPROVED: {improved}");
+        }
+    }
+
+    #[test]
+    fn the_12b_slips_are_fixed() {
+        assert_eq!(fix_ai_slips("score_9, 21girls, 1girl, 1boy, BREAK, 1girl, red hair"), "score_9, 1girl, 1boy, BREAK, 1girl, red hair");
+        assert_eq!(fix_ai_slips("1girl, knight, [detailed armor], [flowing cape], (red cape:1.2)"), "1girl, knight, detailed armor, flowing cape, (red cape:1.2)");
+        // left alone: real counts, {a|b} groups, prompt-editing syntax
+        assert_eq!(fix_ai_slips("2girls, {smile|grin}, [cat:dog:0.5]"), "2girls, {smile|grin}, [cat:dog:0.5]");
+    }
+
+    /// 💡 Ideas on real prompts (the answer files of two test pictures): `IDEA_MODEL` (default E4B), prints the
+    /// cards, the time and how many tags were on the menus: `cargo test live_ideas -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn live_ideas() {
+        let model = std::env::var("IDEA_MODEL").unwrap_or_else(|_| "prompt-condenser-gemma4-e4b:latest".into());
+        for name in ["pocky_pink", "malon_lantern"] {
+            let prompt = std::fs::read_to_string(format!("tests/eval_local/{name}.txt")).unwrap_or_default();
+            // what a user would have: the picture's tags minus lighting / setting / pose / camera / expression
+            let stripped: Vec<&str> = prompt
+                .split(',')
+                .map(str::trim)
+                .filter(|t| {
+                    let tok = crate::parser::parse_prompt(t);
+                    tok.first().is_some_and(|tok| {
+                        !matches!(
+                            crate::scene::slot(tok),
+                            crate::scene::Slot::Light | crate::scene::Slot::Setting | crate::scene::Slot::Pose | crate::scene::Slot::Camera | crate::scene::Slot::Expression
+                        )
+                    })
+                })
+                .collect();
+            let stripped = stripped.join(", ");
+            let gaps = crate::ideas::gaps(&stripped);
+            for run in ["cold/warm", "warm"] {
+                let t = std::time::Instant::now();
+                let found = crate::ideas::suggest("localhost:11434", &model, AiMode::Gpu, &stripped, &gaps).unwrap();
+                println!("\n== {name} ({run}) {:.1}s, gaps: {:?}", t.elapsed().as_secs_f32(), gaps.iter().map(|g| g.name).collect::<Vec<_>>());
+                for (part, options) in &found {
+                    println!("   {part}: {}", options.iter().map(|o| o.join(" + ")).collect::<Vec<_>>().join(" · "));
+                }
+            }
+        }
+    }
+
     /// Downloads a tier into a real Ollama: `cargo test live_pull -- --ignored --nocapture`
     #[test]
     #[ignore]

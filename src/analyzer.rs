@@ -30,9 +30,19 @@ pub enum ChangeAction {
     ProportionChoice,
     /// A generic tag a more specific one already implies (`swimsuit` next to `bikini`).
     ImpliedTag,
+    /// 💡 Ideas: E4B's pick from real tags for a part the prompt leaves out (opt-in, `ideas.rs`).
+    Idea,
+    /// 🔍 Check Result: a finding from a generated picture (opt-in, `check.rs`).
+    CheckResult,
 }
 
 impl ChangeAction {
+    /// Cards that change the prompt only once accepted (applied by `condenser::apply_ai_card`), unlike the rule
+    /// cards, whose suggestion is already in the processed tokens.
+    pub fn is_opt_in(&self) -> bool {
+        matches!(self, Self::AiRewrite | Self::Recommendation | Self::Idea | Self::CheckResult)
+    }
+
     pub fn badge_text(&self) -> &'static str {
         match self {
             Self::FramingSafeSwap => "FRAMING-SAFE SWAP",
@@ -51,6 +61,8 @@ impl ChangeAction {
             Self::Recommendation => "FIT & DYNAMICS",
             Self::ProportionChoice => "BODY PROPORTION",
             Self::ImpliedTag => "IMPLIED TAG",
+            Self::Idea => "AI IDEA",
+            Self::CheckResult => "CHECK RESULT",
         }
     }
 }
@@ -2638,6 +2650,96 @@ pub fn analyze_with_rules(tokens: &[PromptToken], config: &ScanConfig) -> RuleAn
             }
         }
 
+        // 6.2 Anima's rating words in the target checkpoint's spelling (Clean Bloat on)
+        if config.cleanup_enabled && tok.weight == 1.0 {
+            if let Some((reason, replacement)) = config.checkpoint.rating_swap(&tok.normalized) {
+                changes.push(PromptChange {
+                    id: next_change_id,
+                    original: tok.raw.clone(),
+                    action: ChangeAction::RemovedBloat,
+                    reason: reason.to_string(),
+                    suggested_alternative: replacement.to_string(),
+                    framing_alternative: String::new(),
+                    mode: 0,
+                });
+                next_change_id += 1;
+                if !replacement.is_empty() && seen_normalized.insert(replacement.to_string()) {
+                    processed_tokens.push(PromptToken {
+                        raw: replacement.to_string(),
+                        text: replacement.to_string(),
+                        normalized: replacement.to_string(),
+                        weight: 1.0,
+                        had_runaway_weight: false,
+                        replaced: true,
+                        added: false,
+                        original_index: tok.original_index,
+                        category: TokenCategory::QualityMeta,
+                    });
+                }
+                continue;
+            }
+        }
+
+        // 6.3 A sentence on a checkpoint that reads tags only (Pony / Illustrious / SD1.5): its tags instead
+        if config.cleanup_enabled
+            && tok.category == TokenCategory::NaturalLanguageClause
+            && !config.checkpoint.supports_natural_language()
+            && !is_pinned
+        {
+            let mut found: Vec<String> =
+                crate::danbooru::extract_tags_from_prose(&tok.text).into_iter().map(str::to_string).collect();
+            for t in crate::danbooru::tags_in_sentence(&tok.text) {
+                if !found.contains(&t) {
+                    found.push(t);
+                }
+            }
+            let new_tags: Vec<String> = found
+                .into_iter()
+                .filter(|t| !tokens.iter().any(|o| o.normalized == *t) && !seen_normalized.contains(t))
+                .collect();
+            // nothing recognizable: the sentence may still say something, so it stays unless the user drops it
+            if new_tags.is_empty() {
+                changes.push(PromptChange {
+                    id: next_change_id,
+                    original: tok.raw.clone(),
+                    action: ChangeAction::RemovedBloat,
+                    reason: "This checkpoint reads tags, not sentences, and no Danbooru tags were found in it: kept. Accept to remove it.".to_string(),
+                    suggested_alternative: String::new(),
+                    framing_alternative: String::new(),
+                    mode: 2,
+                });
+                next_change_id += 1;
+                seen_normalized.insert(tok.normalized.clone());
+                processed_tokens.push(tok);
+                continue;
+            }
+            changes.push(PromptChange {
+                id: next_change_id,
+                original: tok.raw.clone(),
+                action: ChangeAction::RemovedBloat,
+                reason: "This checkpoint reads tags, not sentences: the sentence becomes its Danbooru tags.".to_string(),
+                suggested_alternative: new_tags.join(", "),
+                framing_alternative: String::new(),
+                mode: 0,
+            });
+            next_change_id += 1;
+            for t in new_tags {
+                seen_normalized.insert(t.clone());
+                processed_tokens.push(PromptToken {
+                    raw: t.clone(),
+                    text: t.clone(),
+                    category: crate::parser::categorize_token(&t, &t),
+                    normalized: t,
+                    weight: 1.0,
+                    had_runaway_weight: false,
+                    replaced: true,
+                    added: false,
+                    original_index: tok.original_index,
+                });
+            }
+            continue;
+        }
+
         // 7. Clamp Runaway Weights `((((tag))))` if enabled
         let max_w = config.checkpoint.max_safe_weight();
         if config.clamp_weights_enabled && (tok.had_runaway_weight || tok.weight > max_w) {
@@ -3593,6 +3695,7 @@ pub fn analyze_with_rules(tokens: &[PromptToken], config: &ScanConfig) -> RuleAn
     // 14. Combo Synergy Recommendation Cards (Mexes Danbooru Taxonomy & 8_combo_synergy_matrix)
     if config.fit_suggestions {
         generate_combo_synergy_cards(&processed_tokens, &mut changes, &mut next_change_id);
+        dedup_fit_suggestions(&mut changes);
     }
 
     RuleAnalysisResult {
@@ -4187,6 +4290,38 @@ pub const COMBO_SYNERGY_RULES: &[ComboSynergyRule] = &[
     },
 ];
 
+/// A tag offered by a combo card (specific: it knows the garment) isn't offered again by a body-type
+/// "Reinforce …" card; a Reinforce card left with nothing to offer goes.
+fn dedup_fit_suggestions(changes: &mut Vec<PromptChange>) {
+    let is_reinforce = |c: &PromptChange| c.action == ChangeAction::Recommendation && c.reason.starts_with("Reinforce");
+    let combo_tags: Vec<String> = changes
+        .iter()
+        .filter(|c| c.action == ChangeAction::Recommendation && !is_reinforce(c))
+        .flat_map(|c| c.suggested_alternative.split(',').map(|t| t.trim().to_lowercase()).collect::<Vec<_>>())
+        .filter(|t| !t.is_empty())
+        .collect();
+    for c in changes.iter_mut().filter(|c| is_reinforce(c)) {
+        let kept: Vec<&str> =
+            c.suggested_alternative.split(',').map(str::trim).filter(|t| !t.is_empty() && !combo_tags.contains(&t.to_lowercase())).collect();
+        c.suggested_alternative = kept.join(", ");
+        // the card's "• Fit: …" line lists the same tags
+        c.reason = c
+            .reason
+            .lines()
+            .filter_map(|line| match line.strip_prefix("• Fit:") {
+                Some(list) => {
+                    let left: Vec<&str> =
+                        list.split(',').map(str::trim).filter(|t| !t.is_empty() && !combo_tags.contains(&t.to_lowercase())).collect();
+                    (!left.is_empty()).then(|| format!("• Fit: {}", left.join(", ")))
+                }
+                None => Some(line.to_string()),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+    changes.retain(|c| !(is_reinforce(c) && c.suggested_alternative.is_empty()));
+}
+
 pub fn generate_combo_synergy_cards(
     tokens: &[PromptToken],
     changes: &mut Vec<PromptChange>,
@@ -4420,7 +4555,11 @@ mod tests {
         assert!(!card.reason.contains("Clothing") && !card.reason.contains("Fit:") && !card.reason.contains('_'), "{}", card.reason);
         // striped thighhighs count as legwear, so the fit tag is offered
         let (res, _) = run("1girl, wide hips, striped thighhighs", &config);
-        assert!(res.changes.iter().any(|c| c.reason.starts_with("Reinforce") && c.suggested_alternative.contains("skindentation")));
+        // … and offered once: by the legwear combo card, not again by the body-type card
+        let offering: Vec<&PromptChange> =
+            res.changes.iter().filter(|c| c.suggested_alternative.contains("skindentation") || c.reason.contains("Fit: skindentation")).collect();
+        assert_eq!(offering.len(), 1, "{offering:?}");
+        assert!(!offering[0].reason.starts_with("Reinforce"));
         // the switch turns every FIT & DYNAMICS card off
         let mut off = config.clone();
         off.fit_suggestions = false;

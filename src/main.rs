@@ -2,6 +2,8 @@ mod ai_engine;
 mod analyzer;
 mod condenser;
 mod caption;
+mod check;
+mod ideas;
 mod prompt_cli;
 mod danbooru;
 mod detector;
@@ -92,6 +94,18 @@ struct AppState {
     image_path: Option<std::path::PathBuf>,
     /// Before-box text from just before an image replaced it (for Undo).
     prompt_before_image: Option<String>,
+    /// 🔍 Check Result and 💡 Ideas cards (opt-in), kept while `extra_key` matches the prompt (like AI cards).
+    extra_cards: Vec<PromptChange>,
+    extra_key: Option<AiKey>,
+    /// Check Result cards whose "Add It" puts a tag in the negative: card id → tag.
+    check_neg: std::collections::HashMap<usize, String>,
+    /// Tags switched off on a card with tag chips (by card key); the others are added when it's accepted.
+    chip_off: std::collections::HashMap<render::CardKey, std::collections::HashSet<String>>,
+    /// The folded "N small fixes" card is opened (not saved).
+    fixes_expanded: bool,
+    /// The prompt the last image read put into Before (1 Character tab): a Deep Scan of exactly this prompt
+    /// gets the read's tags it dropped put back (`deep_scan.rs`).
+    image_prompt: Option<String>,
     /// Tag scores for the loaded image, so the threshold slider re-filters instantly.
     last_tags: Option<Vec<tagger::ScoredTag>>,
     /// `last_tags` came from Tagger mode's single pass (not the multi-pass tagging the AI path uses), so the

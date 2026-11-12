@@ -338,6 +338,45 @@ fn prose_has(text: &str, phrase: &str) -> bool {
     false
 }
 
+/// Real Danbooru tags spelled out in a sentence ("The girl is sitting on a bench holding an umbrella."
+/// → sitting, bench, holding umbrella): articles and little words are dropped, then the longest known
+/// phrase (up to 3 words) wins at each position. Only common general tags (≥ 500 uses), never names,
+/// and never subject words like "girl" (the count tags say that). Needs the tag list on disk.
+pub fn tags_in_sentence(sentence: &str) -> Vec<String> {
+    const SKIP: &[&str] = &[
+        "a", "an", "the", "is", "are", "was", "of", "and", "with", "her", "his", "their", "its", "she", "he", "they",
+        "it", "to", "at", "in", "on", "by", "for", "from", "while", "as", "this", "that", "very", "some",
+    ];
+    const SUBJECT: &[&str] = &["girl", "boy", "woman", "man", "person", "people", "female", "male", "character"];
+    let Some(list) = local() else { return Vec::new() };
+    let words: Vec<String> = sentence
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric() && c != '-' && c != '\'')
+        .filter(|w| !w.is_empty() && !SKIP.contains(w))
+        .map(str::to_string)
+        .collect();
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < words.len() {
+        let found = (1..=3).rev().filter(|n| i + n <= words.len()).find_map(|n| {
+            let phrase = words[i..i + n].join(" ");
+            list.get(&phrase)
+                .filter(|t| !t.character && t.count >= 500 && !SUBJECT.contains(&t.name.as_str()))
+                .map(|t| (n, t.name.clone()))
+        });
+        match found {
+            Some((n, tag)) => {
+                if !out.contains(&tag) {
+                    out.push(tag);
+                }
+                i += n;
+            }
+            None => i += 1,
+        }
+    }
+    out
+}
+
 pub fn extract_tags_from_prose(prose: &str) -> Vec<&'static str> {
     let raw = prose.to_lowercase();
     if raw.trim().is_empty() {

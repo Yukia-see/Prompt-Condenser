@@ -190,21 +190,15 @@ pub(crate) fn short_model_name(name: &str) -> &str {
     n.strip_suffix(":latest").unwrap_or(n)
 }
 
-/// The text model that writes image prompts: E4B (Good) when installed, else the dropdown's model
-/// (always the dropdown's model when the 2nd Pass Visual Check is on and that model can see).
+/// The text model that writes image prompts: E4B (Good) when installed, else the dropdown's model.
 pub(crate) fn default_text_model(ui: &AppWindow, state: &State) -> String {
     let st = state.borrow();
-    let selected = st.model_choices.get(ui.get_model_index().max(0) as usize).filter(|c| c.installed);
-    // With the 2nd Pass Visual Check on, the text model has to see the image: keep the
-    // dropdown's model when it can (the 12B).
-    let selected_sees = selected.is_some_and(|c| st.vision_models.iter().any(|v| ai_engine::same_model(v, &c.name)));
-    if !(ui.get_image_second_pass() && selected_sees) {
-        // Otherwise image reads use E4B (Good): it wrote the best image prompts in the tests and
-        // keeps the 12B out of image reads, so it doesn't share the memory with the tagger and the
-        // vision model (that made the system swap). The Deep Scan still uses the dropdown's model.
-        if let Some(e4b) = st.model_choices.iter().find(|c| c.installed && c.tier == Some(AiModelTier::Good)) {
-            return e4b.name.clone();
-        }
+    // Image reads always write with E4B (Good) when it's installed, whatever the dropdown says: it scored best
+    // on the image tests (the 12B wrote worse image prompts and shares the memory badly with the tagger and the
+    // vision model). The dropdown only picks the Deep Scan's model. E4B can't see images, so the 2nd Pass
+    // Visual Check (which attaches the image to the writer) stays off while it writes.
+    if let Some(e4b) = st.model_choices.iter().find(|c| c.installed && c.tier == Some(AiModelTier::Good)) {
+        return e4b.name.clone();
     }
     st.model_choices
         .get(ui.get_model_index().max(0) as usize)

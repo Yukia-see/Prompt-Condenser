@@ -108,7 +108,7 @@ pub(crate) fn wire_deep_scan(ui: &AppWindow, state: &State) {
                     // `state` is Rc (UI thread only), so fetch it via a thread-local handle.
                     with_state(|state| {
                         match result {
-                            Ok((ai_out, placement)) => {
+                            Ok((mut ai_out, placement)) => {
                                 ui.set_run_badge(format!("Last scan: {placement}").into());
                                 let where_ran = format!("ran on {placement}");
                                 if ai_key(&ui) != scanned_key {
@@ -116,6 +116,7 @@ pub(crate) fn wire_deep_scan(ui: &AppWindow, state: &State) {
                                     return;
                                 }
                                 analyze(&ui, state);
+                                let mut restored_tags = 0usize;
                                 let found = {
                                     let mut st = state.borrow_mut();
                                     let tokens = ai_engine::request_tokens(&req);
@@ -141,6 +142,15 @@ pub(crate) fn wire_deep_scan(ui: &AppWindow, state: &State) {
                                     for (o, l) in st.others.iter_mut().zip(lists) {
                                         o.ai_changes = l;
                                     }
+                                    // a Deep Scan of an image read's prompt only adds context: the read's tags it dropped
+                                    // come back (measured 2026-11-12: the 12B dropped 10-25% of correct image tags)
+                                    if n == 1 && st.image_prompt.as_deref() == Some(req.raw_prompt.trim()) && !ai_out.improved_prompt.trim().is_empty() {
+                                        let dropped = condenser::dropped_tags(&req.raw_prompt, &ai_out.improved_prompt, req.config.checkpoint);
+                                        if !dropped.is_empty() {
+                                            ai_out.improved_prompt = format!("{}, {}", ai_out.improved_prompt.trim_end().trim_end_matches(','), dropped.join(", "));
+                                            restored_tags = dropped.len();
+                                        }
+                                    }
                                     st.ai_scene = SceneResult::from_ai(&ai_out, scan_config(&ui).checkpoint);
                                     st.ai_key = Some(ai_key(&ui));
                                     st.ai_changes.len() + st.others.iter().map(|o| o.ai_changes.len()).sum::<usize>()
@@ -161,6 +171,11 @@ pub(crate) fn wire_deep_scan(ui: &AppWindow, state: &State) {
                                     }
                                     (false, 0) => format!("AI scan done — nothing beyond the rule cards • {where_ran}"),
                                     (false, n) => format!("AI scan done — {n} AI card(s) added; click to apply • {where_ran}"),
+                                };
+                                let msg = if restored_tags > 0 {
+                                    format!("{msg} • {restored_tags} tag(s) from the image read the scan left out were put back")
+                                } else {
+                                    msg
                                 };
                                 ui.set_status_message(msg.into());
                             }

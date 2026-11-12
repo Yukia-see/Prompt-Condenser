@@ -34,7 +34,7 @@ pub fn build_condensed_output(
     // Apply any user overrides where `mode != 0` (AI and Recommendation cards are handled below)
     for ch in changes
         .iter()
-        .filter(|c| c.action != ChangeAction::AiRewrite && c.action != ChangeAction::Recommendation)
+        .filter(|c| !c.action.is_opt_in())
     {
         match ch.mode {
             1 => {
@@ -129,7 +129,7 @@ pub fn build_condensed_output(
 
     for ch in changes
         .iter()
-        .filter(|c| c.action == ChangeAction::AiRewrite || c.action == ChangeAction::Recommendation)
+        .filter(|c| c.action.is_opt_in())
     {
         apply_ai_card(&mut result_tokens, ch);
     }
@@ -188,49 +188,80 @@ fn format_as_flux_natural_language(tokens: &[PromptToken], fmt: impl Fn(&PromptT
             TokenCategory::PinnedEmphasis => emphasis_parts.push(fmt(t)),
             TokenCategory::FramingPose => framing_parts.push(fmt(t)),
             TokenCategory::CharacterBody => body_parts.push(fmt(t)),
-            TokenCategory::Attire | TokenCategory::NaturalLanguageClause => {
-                attire_parts.push(fmt(t))
-            }
+            // the parser only knows a few setting words: scene.rs's lists catch cliff, sunset, classroom…
+            TokenCategory::NaturalLanguageClause => attire_parts.push(fmt(t)),
+            TokenCategory::Attire => match crate::scene::slot(t) {
+                crate::scene::Slot::Setting | crate::scene::Slot::Light => scene_parts.push(fmt(t)),
+                crate::scene::Slot::Camera => framing_parts.push(fmt(t)),
+                crate::scene::Slot::Expression | crate::scene::Slot::Pose => body_parts.push(fmt(t)),
+                _ => attire_parts.push(fmt(t)),
+            },
             TokenCategory::EnvironmentLighting => scene_parts.push(fmt(t)),
             TokenCategory::LoraOrSpecial => scene_parts.push(fmt(t)),
         }
     }
 
+    // Flux reads plain English: "A girl with red hair, wearing a white dress. Upper body, from side.
+    // Setting: cliff, sunset." The user's own sentences stay sentences.
+    let (sentences, attire_parts): (Vec<String>, Vec<String>) =
+        attire_parts.into_iter().partition(|p| p.split_whitespace().count() >= 5 && p.chars().next().is_some_and(char::is_uppercase));
+    let subject: Vec<String> = subject_parts.iter().filter_map(|s| flux_subject(s)).collect();
     let mut clauses = Vec::new();
-    if !framing_parts.is_empty() || !subject_parts.is_empty() {
-        let framing = if framing_parts.is_empty() {
-            "A detailed depiction".to_string()
-        } else {
-            format!("A {} shot", framing_parts.join(", "))
-        };
-        let subj = if subject_parts.is_empty() {
-            String::new()
-        } else {
-            format!(" featuring {}", subject_parts.join(", "))
-        };
-        clauses.push(format!("{}{}", framing, subj));
-    }
-
-    if !emphasis_parts.is_empty() {
-        clauses.push(format!(
-            "with prominent focus on {}",
-            emphasis_parts.join(", ")
-        ));
-    }
-
+    let mut first = if subject.is_empty() { String::new() } else { capitalize(&subject.join(" and ")) };
     if !body_parts.is_empty() {
-        clauses.push(format!("characterized by {}", body_parts.join(", ")));
+        first = if first.is_empty() { capitalize(&body_parts.join(", ")) } else { format!("{first} with {}", body_parts.join(", ")) };
     }
-
     if !attire_parts.is_empty() {
-        clauses.push(attire_parts.join(", "));
+        first = if first.is_empty() { format!("Wearing {}", attire_parts.join(", ")) } else { format!("{first}, wearing {}", attire_parts.join(", ")) };
     }
-
+    if !emphasis_parts.is_empty() {
+        first = if first.is_empty() {
+            format!("Focus on {}", emphasis_parts.join(", "))
+        } else {
+            format!("{first}, with prominent focus on {}", emphasis_parts.join(", "))
+        };
+    }
+    if !first.is_empty() {
+        clauses.push(first);
+    }
+    if !framing_parts.is_empty() {
+        clauses.push(capitalize(&framing_parts.join(", ")));
+    }
+    clauses.extend(sentences.into_iter().map(|s| s.trim().trim_end_matches('.').to_string()));
     if !scene_parts.is_empty() {
-        clauses.push(format!("set in {}", scene_parts.join(", ")));
+        clauses.push(format!("Setting: {}", scene_parts.join(", ")));
     }
+    if clauses.is_empty() {
+        return String::new();
+    }
+    format!("{}.", clauses.join(". "))
+}
 
-    clauses.join(", ")
+/// A count tag as plain words for Flux ("1girl" → "a girl", "2girls" → "two girls"); `solo` says nothing new.
+fn flux_subject(tag: &str) -> Option<String> {
+    let t = tag.trim();
+    if t.eq_ignore_ascii_case("solo") {
+        return None;
+    }
+    let numbers = ["", "a", "two", "three", "four", "five", "six"];
+    for (noun, plural) in [("girl", "girls"), ("boy", "boys"), ("other", "others")] {
+        for (n, word) in numbers.iter().enumerate().skip(1) {
+            if t == format!("{n}{noun}") || t == format!("{n}{plural}") {
+                let noun = if noun == "other" { "person" } else { noun };
+                let plural = if plural == "others" { "people" } else { plural };
+                return Some(if n == 1 { format!("a {noun}") } else { format!("{word} {plural}") });
+            }
+        }
+    }
+    Some(t.to_string())
+}
+
+fn capitalize(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+        None => String::new(),
+    }
 }
 
 fn build_category_breakdown(tokens: &[PromptToken], use_weights: bool) -> String {

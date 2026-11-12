@@ -178,12 +178,19 @@ impl CheckpointProfile {
             ));
         }
 
-        if !matches!(self, Self::PonyV6)
-            && (normalized.starts_with("score_9")
-                || normalized.starts_with("score_8")
-                || normalized.starts_with("score_7")
-                || normalized.starts_with("score_6"))
-        {
+        // score tags arrive as "score 7" (underscores become spaces) or "score_7"
+        let score = normalized.replace(' ', "_");
+        let is_score = score.starts_with("score_") && score[6..].chars().next().is_some_and(|c| c.is_ascii_digit());
+        // Pony was trained on score_N_up (and score_9); a bare score_7 is Anima's spelling
+        if matches!(self, Self::PonyV6) && is_score && !score.ends_with("_up") && score != "score_9" {
+            return Some((
+                "Anima-style score tag: Pony V6 XL was trained on 'score_9, score_8_up, score_7_up'.",
+                "score_9, score_8_up, score_7_up",
+            ));
+        }
+
+        // Anima reads its own score tags (score_1 … score_9); other checkpoints only see noise
+        if !matches!(self, Self::PonyV6 | Self::Anima) && is_score {
             let suggestion = match self {
                 Self::Flux => "",
                 Self::Illustrious => "masterpiece, best quality, absurdres",
@@ -196,6 +203,31 @@ impl CheckpointProfile {
         }
 
         None
+    }
+
+    /// Anima's rating words (safe / sensitive / nsfw / explicit) in this checkpoint's own spelling:
+    /// `Some((reason, replacement))` when the tag should change, an empty replacement = drop it.
+    pub fn rating_swap(&self, normalized: &str) -> Option<(&'static str, &'static str)> {
+        let rating = match normalized {
+            "safe" | "general" => 0,
+            "sensitive" | "questionable" => 1,
+            "explicit" => 2,
+            _ => return None,
+        };
+        match self {
+            Self::Anima => None,
+            Self::PonyV6 => Some((
+                "Anima-style rating word: Pony V6 XL uses rating_safe / rating_questionable / rating_explicit.",
+                ["rating_safe", "rating_questionable", "rating_explicit"][rating],
+            )),
+            Self::Illustrious if normalized != ["general", "sensitive", "explicit"][rating] => Some((
+                "Anima-style rating word: Illustrious uses general / sensitive / explicit.",
+                ["general", "sensitive", "explicit"][rating],
+            )),
+            Self::Illustrious => None,
+            // SDXL / SD1.5 / Flux weren't trained on rating words: "safe" is just a stray word there
+            _ => Some(("Rating word from Anima: this checkpoint wasn't trained on rating tags, so it does nothing.", "")),
+        }
     }
 }
 

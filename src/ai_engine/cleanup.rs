@@ -11,8 +11,52 @@ pub(crate) fn enforce_checkpoint_rules(out: &mut AiJsonOutput, checkpoint: Check
     out.improved_prompt = strip_placeholders(&out.improved_prompt);
     out.dynamic_prompt = strip_placeholders(&out.dynamic_prompt);
     out.recommended_negative = strip_placeholders(&out.recommended_negative);
-    out.improved_prompt = ensure_quality_tags(&out.improved_prompt, checkpoint);
-    out.dynamic_prompt = ensure_quality_tags(&out.dynamic_prompt, checkpoint);
+    out.improved_prompt = ensure_quality_tags(&fix_ai_slips(&out.improved_prompt), checkpoint);
+    out.dynamic_prompt = ensure_quality_tags(&fix_ai_slips(&out.dynamic_prompt), checkpoint);
+}
+
+/// Two slips the 12B made in the Deep Scan audit (2026-11-12): a garbled count tag (`21girls` for `2girls`:
+/// any count above 6 is dropped, the per-character `1girl` tags still say who's there) and `[tag]` used as
+/// emphasis (square brackets *lower* a tag's weight in ComfyUI / A1111: unwrapped). `{a|b}` groups, weights and
+/// BREAK are left alone.
+pub(crate) fn fix_ai_slips(text: &str) -> String {
+    if text.trim().is_empty() {
+        return text.to_string();
+    }
+    let mut parts: Vec<String> = Vec::new();
+    let (mut depth, mut cur) = (0i32, String::new());
+    for ch in text.chars() {
+        match ch {
+            '(' | '[' | '{' | '<' => depth += 1,
+            ')' | ']' | '}' | '>' => depth = (depth - 1).max(0),
+            _ => {}
+        }
+        if ch == ',' && depth == 0 {
+            parts.push(std::mem::take(&mut cur));
+        } else {
+            cur.push(ch);
+        }
+    }
+    parts.push(cur);
+    let fixed: Vec<String> = parts
+        .into_iter()
+        .filter_map(|p| {
+            let t = p.trim();
+            let digits: String = t.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if !digits.is_empty()
+                && matches!(&t[digits.len()..], "girls" | "boys" | "others")
+                && digits.parse::<u32>().map_or(true, |n| n > 6)
+            {
+                return None;
+            }
+            if t.len() > 2 && t.starts_with('[') && t.ends_with(']') && !t[1..t.len() - 1].contains(['[', ']', '|', ':']) {
+                let lead = &p[..p.len() - p.trim_start().len()];
+                return Some(format!("{lead}{}", &t[1..t.len() - 1]));
+            }
+            Some(p)
+        })
+        .collect();
+    fixed.join(",")
 }
 
 /// The Bust / Frame dropdown picks, enforced on the reply's rewrite and dynamic version (silently, like the

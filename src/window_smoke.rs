@@ -22,9 +22,9 @@ fn render(ui: &AppWindow, what: &str) {
 }
 
 /// Toolbar buttons that must stay on screen at every window size (the minimum width is 800 px).
-const MUST_REACH: [&str; 18] = [
+const MUST_REACH: [&str; 21] = [
     "▸ Options", "▾ Options", "⚙ Settings", "Scene Panel", "↻", "⛶", "+ Add", "✦", "📋 Copy", "🗺", "✎", "BREAK Sep",
-    "Dynamic", "Clean Bloat", "🕒", "🎲 Roll", "🎨", "⚡ Queue",
+    "Dynamic", "Clean Bloat", "🕒", "🎲 Roll", "🎨", "⚡ Queue", "✕ Clear", "+ Quality", "💡",
 ];
 
 /// Every instantiated button whose label starts with one of `MUST_REACH` ends inside the window: its right
@@ -97,8 +97,24 @@ fn every_tab_and_overlay_renders_headless() {
             framing_alternative: "cowboy shot".into(),
             has_framing_alt: true,
             mode: 0,
+            ..Default::default()
         },
         ChangeCardItem { id: 2, badge: "Weight".into(), badge_kind: 2, original: "(red hair:1.8)".into(), ..Default::default() },
+        // a 💡 Ideas card with tag chips, and the folded small fixes
+        ChangeCardItem {
+            id: 60_000,
+            badge: "AI IDEA".into(),
+            badge_kind: 3,
+            reason: "Idea for the lighting".into(),
+            suggested_alternative: "sunset, backlighting".into(),
+            mode: 2,
+            chips: ModelRc::new(VecModel::from(vec![
+                crate::CardChip { tag: "sunset".into(), on: true },
+                crate::CardChip { tag: "backlighting".into(), on: false },
+            ])),
+            ..Default::default()
+        },
+        ChangeCardItem { id: -1, badge: "SMALL FIXES".into(), badge_kind: 2, reason: "3 small fixes".into(), summary_count: 3, ..Default::default() },
     ])));
     let chars: Vec<ScenePanelChar> = (1..=4)
         .map(|i| ScenePanelChar { title: format!("Character {i}").into(), actions: "standing".into(), has_actions: true, ..Default::default() })

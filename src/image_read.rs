@@ -13,6 +13,7 @@ pub(crate) fn set_prompt_from_image(ui: &AppWindow, state: &State, prompt: &str)
         ui.set_image_can_undo(true);
     }
     state.borrow_mut().card_choices.clear();
+    state.borrow_mut().image_prompt = Some(prompt.trim().to_string());
     ui.set_raw_prompt(prompt.into());
     analyze(ui, state);
 }
@@ -1136,6 +1137,62 @@ pub(crate) fn wire_image_read(ui: &AppWindow, state: &State) {
         });
     }
 
+    // --- Check result: tag a picture generated from Before and compare (check.rs); Undo restores ---
+    {
+        let weak = ui.as_weak();
+        ui.on_check_result_requested(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            if !tagger::is_installed() {
+                ui.set_status_message("Check Result needs the tagger: load an image once with From Image… to download it.".into());
+                return;
+            }
+            if ui.get_raw_prompt().trim().is_empty() {
+                ui.set_status_message("Check Result compares a generated picture with Before, and Before is empty.".into());
+                return;
+            }
+            let Some(path) = rfd::FileDialog::new()
+                .set_title("Pick a picture generated from this prompt")
+                .add_filter("Images", &["png", "jpg", "jpeg", "webp"])
+                .pick_file()
+            else {
+                return;
+            };
+            ui.set_tagger_busy(true);
+            ui.set_status_message("Checking the result: tagging the picture…".into());
+            let weak = weak.clone();
+            std::thread::spawn(move || {
+                let scores = twoimg::tag_one_passes(&path, &|_| (), false, false);
+                let _ = weak.upgrade_in_event_loop(move |ui| {
+                    ui.set_tagger_busy(false);
+                    let scores = match scores {
+                        Ok(s) => s,
+                        Err(e) => {
+                            ui.set_status_message(format!("Couldn't check the picture: {e}").into());
+                            return;
+                        }
+                    };
+                    with_state(|state| {
+                        let before = ui.get_raw_prompt().to_string();
+                        let report = check::compare(&before, &scores);
+                        let (cards, negatives) = check::cards(&report);
+                        let n = cards.len();
+                        {
+                            // a new check replaces the last one's cards; 💡 Ideas cards stay
+                            let mut st = state.borrow_mut();
+                            st.extra_cards.retain(|c| c.action != analyzer::ChangeAction::CheckResult);
+                            st.extra_cards.extend(cards);
+                            st.check_neg = negatives;
+                            st.extra_key = Some(ai_key(&ui));
+                        }
+                        render(&ui, state);
+                        let tail = if n == 0 { " Nothing to change." } else { " Each finding is a card: Add It applies it." };
+                        ui.set_status_message(format!("Check result: {}{tail}", check::summary(&report)).into());
+                    });
+                });
+            });
+        });
+    }
+
     // --- Prompt from PNG: the generation prompt saved in a PNG's metadata into Before (Undo restores) ---
     {
         let weak = ui.as_weak();
@@ -1167,6 +1224,8 @@ pub(crate) fn wire_image_read(ui: &AppWindow, state: &State) {
                         p.source,
                         if p.partial {
                             ", partial: no sampler link, took the longest text"
+                        } else if p.characters > 1 {
+                            ", its characters are separated by BREAK: the 2-4 Characters tabs split them"
                         } else if p.first_pass_chosen {
                             ", the passes have different prompts: took the first pass"
                         } else {

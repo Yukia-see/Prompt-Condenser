@@ -70,6 +70,50 @@ impl PromptToken {
 }
 
 /// Splits a ComfyUI prompt into top-level segments while respecting parentheses `(...)`, `<...>`, and `BREAK`.
+/// NovelAI V4 numeric emphasis: `1.5::red hair, blue eyes::` gives every tag inside the weight
+/// (`(red hair:1.5), (blue eyes:1.5)`); a group with no closing `::` runs to the end of the prompt.
+/// Text without a `<number>::` opener is returned unchanged.
+pub fn convert_novelai_numeric(input: &str) -> String {
+    if !input.contains("::") {
+        return input.to_string();
+    }
+    let mut out = String::new();
+    let mut rest = input;
+    while let Some(pos) = rest.find("::") {
+        // the weight is the number right before "::"
+        let before = &rest[..pos];
+        let num_start = before
+            .char_indices()
+            .rev()
+            .take_while(|(_, c)| c.is_ascii_digit() || *c == '.' || *c == '-')
+            .last()
+            .map(|(i, _)| i);
+        let weight = num_start.and_then(|i| before[i..].parse::<f32>().ok().map(|w| (i, w)));
+        let Some((i, w)) = weight.filter(|(i, _)| before[..*i].trim_end().is_empty() || before[..*i].trim_end().ends_with(',') || before[..*i].ends_with(char::is_whitespace)) else {
+            out.push_str(&rest[..pos + 2]);
+            rest = &rest[pos + 2..];
+            continue;
+        };
+        out.push_str(&before[..i]);
+        let body_and_more = &rest[pos + 2..];
+        let (body, after) = match body_and_more.find("::") {
+            Some(end) => (&body_and_more[..end], &body_and_more[end + 2..]),
+            None => (body_and_more, ""),
+        };
+        let w = (w * 100.0).round() / 100.0;
+        let tags: Vec<String> = body
+            .split(',')
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(|t| if (w - 1.0).abs() < f32::EPSILON { t.to_string() } else { format!("({t}:{w})") })
+            .collect();
+        out.push_str(&tags.join(", "));
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
 pub fn parse_prompt(input: &str) -> Vec<PromptToken> {
     let mut raw_segments = Vec::new();
     let mut current = String::new();
@@ -77,7 +121,7 @@ pub fn parse_prompt(input: &str) -> Vec<PromptToken> {
     let mut angle_depth: i32 = 0;
 
     // Normalize standalone BREAK keywords so they become clean segments
-    let normalized_input = input.replace("\r\n", "\n");
+    let normalized_input = convert_novelai_numeric(&input.replace("\r\n", "\n"));
 
     for ch in normalized_input.chars() {
         match ch {
@@ -725,6 +769,13 @@ mod tests {
         assert_eq!(toks[5].normalized, "upper body");
         assert_eq!(toks[5].category, TokenCategory::FramingPose);
 
+        // NovelAI V4 numeric groups
+        assert_eq!(convert_novelai_numeric("1girl, 1.5::red hair, blue eyes::, smile"), "1girl, (red hair:1.5), (blue eyes:1.5), smile");
+        assert_eq!(convert_novelai_numeric("-1::hat::, solo"), "(hat:-1), solo");
+        assert_eq!(convert_novelai_numeric("1.2::open run"), "(open run:1.2)");
+        assert_eq!(convert_novelai_numeric("artist::name, smile"), "artist::name, smile");
+        let nai = parse_prompt("1girl, 1.5::red hair::");
+        assert!(nai.iter().any(|t| t.normalized == "red hair" && (t.weight - 1.5).abs() < 0.01), "{nai:?}");
         // NovelAI curly braces: {tag} is 1.05x, {{tag}} is 1.1025x
         let n_toks = parse_prompt("{{masterpiece}}, {blue eyes}, {red|blue} hair");
         assert_eq!(n_toks[0].text, "masterpiece");

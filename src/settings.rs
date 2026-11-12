@@ -216,9 +216,10 @@ pub(crate) fn load_settings(ui: &AppWindow) {
     ui.set_char_break_enabled(st.char_break);
     ui.set_scene_prompt(st.scene_prompt.into());
     ui.set_image_identity_only(st.image_identity_only);
-    ui.set_image_second_pass(st.image_second_pass);
+    // the 2nd Pass and Dual-Pass options were removed (2026-11-12): an old saved "on" must not switch them on unseen
+    ui.set_image_second_pass(false);
     ui.set_scene_body_shape(st.scene_body_shape);
-    ui.set_enable_dual_pass(st.enable_dual_pass);
+    ui.set_enable_dual_pass(false);
     ui.set_dual_pass_mode_index(st.dual_pass_mode_index.clamp(0, 1));
     ui.set_use_llm_synthesis(st.use_llm_synthesis);
     ui.set_theme_index(st.theme_index.clamp(0, 5));

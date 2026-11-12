@@ -21,6 +21,8 @@ pub struct PngPrompt {
     /// ComfyUI: the samplers' positives differ and the first pass (no other sampler upstream: it made
     /// the picture's content; later passes refine it) was picked.
     pub first_pass_chosen: bool,
+    /// NovelAI V4: the character prompts (`v4_prompt.caption.char_captions`), already merged into `positive`.
+    pub characters: usize,
 }
 
 /// The prompt saved in a PNG, or `None` when it has no generation metadata.
@@ -71,7 +73,29 @@ fn from_chunks(chunks: &[(String, String)]) -> Option<PngPrompt> {
         .or_else(|| get("Description").map(str::to_string))
         .filter(|p| !p.trim().is_empty())?;
     let negative = comment.as_ref().and_then(|c| c.get("uc").and_then(|u| u.as_str())).map(str::to_string);
-    Some(PngPrompt { positive: positive.trim().to_string(), negative, source: "NovelAI", ..Default::default() })
+    // NovelAI V4 keeps the scene in base_caption and each character in its own char_caption: the scene
+    // first, then the characters (one: joined with commas; several: BREAK between them, which the
+    // multi-character tabs split on)
+    let caption = comment.as_ref().and_then(|c| c.pointer("/v4_prompt/caption"));
+    let base = caption.and_then(|c| c.get("base_caption")).and_then(|b| b.as_str()).map(str::trim).filter(|b| !b.is_empty());
+    let chars: Vec<String> = caption
+        .and_then(|c| c.get("char_captions"))
+        .and_then(|a| a.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|c| c.get("char_caption").and_then(|t| t.as_str()))
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    let positive = match (base, chars.len()) {
+        (Some(b), 0) => b.to_string(),
+        (Some(b), 1) => format!("{b}, {}", chars[0]),
+        (Some(b), _) => format!("{b} BREAK {}", chars.join(" BREAK ")),
+        (None, _) => positive,
+    };
+    Some(PngPrompt { positive: positive.trim().to_string(), negative, source: "NovelAI", characters: chars.len(), ..Default::default() })
 }
 
 /// A1111 / Forge: the prompt, then "Negative prompt: …", then a "Steps: …, Sampler: …" line.
@@ -401,5 +425,18 @@ mod tests {
         let bad = TempPng(std::env::temp_dir().join(format!("pc-png-meta-bad-{}.png", std::process::id())));
         std::fs::write(&*bad, b"not a png").unwrap();
         assert!(read_png_prompt(&bad).is_err());
+    }
+
+    #[test]
+    fn novelai_v4_character_captions_are_read() {
+        let comment = r#"{"prompt": "2girls, beach, girl, girl", "uc": "lowres",
+            "v4_prompt": {"caption": {"base_caption": "2girls, beach, sunset",
+            "char_captions": [{"char_caption": "girl, red hair", "centers": [{"x": 0.3, "y": 0.5}]},
+                              {"char_caption": "girl, blue hair", "centers": [{"x": 0.7, "y": 0.5}]}]}}}"#;
+        let p = from_chunks(&[("Comment".to_string(), comment.to_string())]).unwrap();
+        assert_eq!(p.positive, "2girls, beach, sunset BREAK girl, red hair BREAK girl, blue hair");
+        assert_eq!(p.characters, 2);
+        let one = r#"{"prompt": "x", "v4_prompt": {"caption": {"base_caption": "1girl, shrine", "char_captions": [{"char_caption": "miko"}]}}}"#;
+        assert_eq!(from_chunks(&[("Comment".to_string(), one.to_string())]).unwrap().positive, "1girl, shrine, miko");
     }
 }

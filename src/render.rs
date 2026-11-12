@@ -122,6 +122,12 @@ pub(crate) fn analyze(ui: &AppWindow, state: &State) {
             st.ai_scene = None;
             st.ai_key = None;
         }
+        // Check Result / Ideas cards are about this prompt: a new prompt (or checkpoint, view…) drops them
+        if st.extra_key.as_ref() != Some(&key) {
+            st.extra_cards.clear();
+            st.check_neg.clear();
+            st.extra_key = None;
+        }
     }
     render(ui, state);
     update_lora_suggestions(ui, state);
@@ -323,10 +329,21 @@ pub(crate) fn render(ui: &AppWindow, state: &State) {
     // what the AI views are compared against: every character on the multi-character tabs
     let raw = prompts.join(", ");
     let st = state.borrow();
-    let changes1: Vec<PromptChange> = st.changes.iter().chain(&st.ai_changes).cloned().collect();
-    let other_changes: Vec<Vec<PromptChange>> =
+    // what the cards show (every chip), and what the condenser applies (only the chips left on)
+    let shown1: Vec<PromptChange> = st.changes.iter().chain(&st.ai_changes).chain(&st.extra_cards).cloned().collect();
+    let shown_others: Vec<Vec<PromptChange>> =
         st.others.iter().map(|o| o.changes.iter().chain(&o.ai_changes).cloned().collect()).collect();
+    let changes1 = with_chips(&shown1, 0, &st.chip_off);
+    let other_changes: Vec<Vec<PromptChange>> =
+        shown_others.iter().enumerate().map(|(i, c)| with_chips(c, i + 1, &st.chip_off)).collect();
     let all_changes: Vec<PromptChange> = changes1.iter().chain(other_changes.iter().flatten()).cloned().collect();
+    let check_negative: String = st
+        .extra_cards
+        .iter()
+        .filter(|c| c.mode == 0)
+        .filter_map(|c| st.check_neg.get(&c.id).cloned())
+        .collect::<Vec<_>>()
+        .join(", ");
     let mut out = condenser::build_condensed_output(&c1_raw, &st.base_tokens, &changes1, &config);
     // characters 2..N, each condensed on its own
     let other_outs: Vec<String> = if two_char {
@@ -517,7 +534,7 @@ pub(crate) fn render(ui: &AppWindow, state: &State) {
     }
     // Anima Ref Adapter mode: the reference image supplies the look, so the prompt keeps only the scene
     let text = if ui.get_ref_adapter_mode() { scene::filter_for_ref_adapter(&text) } else { text };
-    render_negative(ui, &config, &text, st.ai_scene.as_ref().filter(|_| ui.get_after_view() == 1 || ui.get_after_view() == 4));
+    render_negative(ui, &config, &text, st.ai_scene.as_ref().filter(|_| ui.get_after_view() == 1 || ui.get_after_view() == 4), &check_negative);
     match shown_parts.as_ref().filter(|_| two_char) {
         Some(c) => set_live_scene(ui, scene::describe_many(&c.chars, &c.shared)),
         None => render_live_scene(ui, &text),
@@ -570,7 +587,13 @@ pub(crate) fn render(ui: &AppWindow, state: &State) {
         tokens_after: after_tokens,
     });
 
-    let cards: Vec<ChangeCardItem> = all_changes.iter().map(to_card).collect();
+    let shown: Vec<(usize, &PromptChange)> = shown1
+        .iter()
+        .map(|c| (0, c))
+        .chain(shown_others.iter().enumerate().flat_map(|(i, cs)| cs.iter().map(move |c| (i + 1, c))))
+        .collect();
+    let (cards, counts) = card_list(&shown, &st.chip_off, st.fixes_expanded, ui.get_card_filter());
+    ui.set_card_filter_counts(ModelRc::new(VecModel::from(counts)));
     let model = &st.cards_model;
     if model.row_count() == cards.len() {
         for (i, card) in cards.into_iter().enumerate() {
@@ -610,7 +633,7 @@ pub(crate) fn structure_rows(summary: &str) -> Vec<StructureRow> {
 
 /// Fills the Recommended Negative panel for the prompt currently shown in After.
 /// On the AI Improved view it uses the AI's tailored negative (new entries in green).
-pub(crate) fn render_negative(ui: &AppWindow, config: &ScanConfig, positive: &str, ai: Option<&SceneResult>) {
+pub(crate) fn render_negative(ui: &AppWindow, config: &ScanConfig, positive: &str, ai: Option<&SceneResult>, checked: &str) {
     if config.checkpoint.default_negative().is_empty() {
         ui.set_negative_text("".into());
         ui.set_negative_tokens("".into());
@@ -658,6 +681,12 @@ pub(crate) fn render_negative(ui: &AppWindow, config: &ScanConfig, positive: &st
         }
     };
     let _ = markdown; // the negative box is plain selectable text
+    // "Check result": what the tagger saw in the generated picture that the prompt contradicts
+    let (text, note) = if checked.trim().is_empty() {
+        (text, note)
+    } else {
+        (condenser::merge_negative(&format!("{text}, {checked}"), positive), format!("{note} Check result added: {checked}."))
+    };
     ui.set_negative_tokens(format!("~{} tokens", parser::estimate_clip_tokens(&text).0).into());
     ui.set_negative_text(text.into());
     ui.set_negative_note(note.into());
@@ -749,6 +778,8 @@ pub(crate) fn to_card(ch: &PromptChange) -> ChangeCardItem {
         | ChangeAction::SizeConflict
         | ChangeAction::StyleConflict
         | ChangeAction::ImpliedTag => 2,
+        ChangeAction::Idea => 3,
+        ChangeAction::CheckResult => 0,
     };
     ChangeCardItem {
         id: ch.id as i32,
@@ -760,7 +791,138 @@ pub(crate) fn to_card(ch: &PromptChange) -> ChangeCardItem {
         framing_alternative: ch.framing_alternative.clone().into(),
         has_framing_alt: !ch.framing_alternative.is_empty(),
         mode: ch.mode as i32,
+        chips: ModelRc::default(),
+        summary_count: 0,
     }
+}
+
+/// Cards whose suggestion is a list of tags to add, picked one by one: AI ideas, suggestion (FIT & DYNAMICS)
+/// cards and AI "add" cards with two or more tags.
+pub(crate) fn has_chips(ch: &PromptChange) -> bool {
+    let adds = match ch.action {
+        ChangeAction::Idea | ChangeAction::Recommendation => true,
+        ChangeAction::AiRewrite => ch.original.trim().is_empty(),
+        _ => false,
+    };
+    adds && ch.suggested_alternative.split(',').filter(|t| !t.trim().is_empty()).count() >= 2
+}
+
+fn chip_tags(ch: &PromptChange) -> Vec<String> {
+    ch.suggested_alternative.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect()
+}
+
+/// The cards as the condenser should apply them: a chip card adds only its chips left on (none on = not
+/// applied).
+pub(crate) fn with_chips(
+    changes: &[PromptChange],
+    character: usize,
+    chip_off: &std::collections::HashMap<CardKey, std::collections::HashSet<String>>,
+) -> Vec<PromptChange> {
+    changes
+        .iter()
+        .map(|c| {
+            let mut c = c.clone();
+            if has_chips(&c) {
+                if let Some(off) = chip_off.get(&card_key(character, &c)) {
+                    let on: Vec<String> = chip_tags(&c).into_iter().filter(|t| !off.contains(t)).collect();
+                    if on.is_empty() {
+                        c.mode = 2;
+                    }
+                    c.suggested_alternative = on.join(", ");
+                }
+            }
+            c
+        })
+        .collect()
+}
+
+/// Which filter tab a card belongs to: 1 Conflicts, 2 Fixes (fixes and the user's picks), 3 Suggestions
+/// (FIT & DYNAMICS, Check Result), 4 AI. The strip shows them in that order.
+pub(crate) fn card_group(ch: &PromptChange) -> i32 {
+    match ch.action {
+        ChangeAction::FramingSafeSwap
+        | ChangeAction::PositioningConflict
+        | ChangeAction::PoseConflict
+        | ChangeAction::AnatomyConflict
+        | ChangeAction::SizeConflict
+        | ChangeAction::StyleConflict => 1,
+        ChangeAction::RemovedBloat
+        | ChangeAction::MergedDuplicate
+        | ChangeAction::WeightClamped
+        | ChangeAction::ImpliedTag
+        | ChangeAction::KeptEmphasized
+        | ChangeAction::AngleChoice
+        | ChangeAction::PoseChoice
+        | ChangeAction::ProportionChoice => 2,
+        ChangeAction::Recommendation | ChangeAction::CheckResult => 3,
+        ChangeAction::AiRewrite | ChangeAction::Idea => 4,
+    }
+}
+
+/// Automatic fixes that fold into one "N small fixes" card while they're applied.
+fn is_small_fix(ch: &PromptChange) -> bool {
+    ch.mode == 0
+        && matches!(ch.action, ChangeAction::RemovedBloat | ChangeAction::MergedDuplicate | ChangeAction::WeightClamped | ChangeAction::ImpliedTag)
+}
+
+/// The id of the folded "small fixes" card (no real card has it).
+pub(crate) const SUMMARY_CARD_ID: i32 = -1;
+
+/// The strip's cards: sorted by group (conflicts first), small fixes folded into one card unless opened (or
+/// the Fixes tab is on), filtered by the tab, chips filled in. Also the tab counts (All, Conflicts, Fixes,
+/// Suggestions, AI).
+pub(crate) fn card_list(
+    shown: &[(usize, &PromptChange)],
+    chip_off: &std::collections::HashMap<CardKey, std::collections::HashSet<String>>,
+    fixes_expanded: bool,
+    filter: i32,
+) -> (Vec<ChangeCardItem>, Vec<i32>) {
+    let mut counts = vec![shown.len() as i32, 0, 0, 0, 0];
+    for (_, c) in shown {
+        counts[card_group(c) as usize] += 1;
+    }
+    let mut sorted: Vec<&(usize, &PromptChange)> = shown.iter().filter(|(_, c)| filter == 0 || card_group(c) == filter).collect();
+    sorted.sort_by_key(|(_, c)| card_group(c));
+    let fold = !fixes_expanded && filter != 2 && sorted.iter().filter(|(_, c)| is_small_fix(c)).count() >= 2;
+    let mut cards = Vec::new();
+    let mut summary_at: Option<usize> = None;
+    let mut folded: Vec<String> = Vec::new();
+    for (character, c) in sorted {
+        if fold && is_small_fix(c) {
+            summary_at.get_or_insert(cards.len());
+            let what = if c.original.trim().is_empty() { c.reason.lines().next().unwrap_or("").to_string() } else { format!("'{}'", c.original.trim()) };
+            folded.push(format!("• {}: {what}", c.action.badge_text().to_lowercase()));
+            continue;
+        }
+        let mut card = to_card(c);
+        if has_chips(c) {
+            let off = chip_off.get(&card_key(*character, c));
+            let chips: Vec<CardChip> =
+                chip_tags(c).into_iter().map(|t| CardChip { on: !off.is_some_and(|o| o.contains(&t)), tag: t.into() }).collect();
+            card.chips = ModelRc::new(VecModel::from(chips));
+        }
+        cards.push(card);
+    }
+    if let Some(at) = summary_at {
+        let n = folded.len();
+        cards.insert(
+            at,
+            ChangeCardItem {
+                id: SUMMARY_CARD_ID,
+                badge: "SMALL FIXES".into(),
+                badge_kind: 2,
+                original: String::new().into(),
+                reason: format!("{n} small automatic fixes (already applied):\n{}", folded.join("\n")).into(),
+                suggested_alternative: SharedString::default(),
+                framing_alternative: SharedString::default(),
+                has_framing_alt: false,
+                mode: 0,
+                chips: ModelRc::default(),
+                summary_count: n as i32,
+            },
+        );
+    }
+    (cards, counts)
 }
 
 /// Wires rule analysis (debounced), card toggles, the After view switch and the copy buttons.
@@ -820,6 +982,7 @@ pub(crate) fn wire_cards(ui: &AppWindow, state: &State) {
                     .changes
                     .iter_mut()
                     .chain(st.ai_changes.iter_mut())
+                    .chain(st.extra_cards.iter_mut())
                     .chain(st.others.iter_mut().flat_map(|o| o.changes.iter_mut().chain(o.ai_changes.iter_mut())))
                     .find(|c| c.id as i32 == card_id)
                 {
@@ -827,6 +990,112 @@ pub(crate) fn wire_cards(ui: &AppWindow, state: &State) {
                 }
             }
             render(&ui, &state);
+        });
+    }
+
+    // --- Tag chips on suggestion cards: switch one tag on / off ---
+    {
+        let weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_card_chip_toggled(move |card_id, tag| {
+            let Some(ui) = weak.upgrade() else { return };
+            {
+                let mut st = state.borrow_mut();
+                let st = &mut *st;
+                let found = std::iter::once((0usize, st.changes.iter().chain(&st.ai_changes).chain(&st.extra_cards).collect::<Vec<_>>()))
+                    .chain(st.others.iter().enumerate().map(|(i, o)| (i + 1, o.changes.iter().chain(&o.ai_changes).collect())))
+                    .find_map(|(i, cs)| cs.into_iter().find(|c| c.id as i32 == card_id).map(|c| card_key(i, c)));
+                if let Some(k) = found {
+                    let off = st.chip_off.entry(k).or_default();
+                    let tag = tag.to_string();
+                    if !off.remove(&tag) {
+                        off.insert(tag);
+                    }
+                }
+            }
+            render(&ui, &state);
+        });
+    }
+
+    // --- The folded "N small fixes" card opens into separate cards ---
+    {
+        let weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_card_expand_fixes(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            state.borrow_mut().fixes_expanded = true;
+            render(&ui, &state);
+        });
+    }
+
+    // --- Filter tabs above the cards ---
+    {
+        let weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_card_filter_changed(move |i| {
+            let Some(ui) = weak.upgrade() else { return };
+            ui.set_card_filter(i.clamp(0, 4));
+            render(&ui, &state);
+        });
+    }
+
+    // --- 💡 Ideas: E4B picks real tags for the parts the prompt leaves out ---
+    {
+        let weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_ideas_requested(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            // the prompt as shown in After (rules applied), so ideas fit what will be generated
+            let prompt = ui.get_condensed_prompt().to_string();
+            let gaps = ideas::gaps(&prompt);
+            if gaps.is_empty() {
+                ui.set_status_message(
+                    "💡 Ideas: the prompt already covers camera, setting, lighting, expression and pose (or the Danbooru tag list isn't downloaded yet).".into(),
+                );
+                return;
+            }
+            let model = default_text_model(&ui, &state);
+            let (host, mode) = (ui.get_ollama_host().to_string(), AiMode::from_index(ui.get_ai_mode_index()));
+            let key = ai_key(&ui);
+            ui.set_ideas_busy(true);
+            ui.set_status_message(format!("💡 Ideas: asking {model} about the {}…", gaps.iter().map(|g| g.name).collect::<Vec<_>>().join(", ")).into());
+            let weak = weak.clone();
+            std::thread::spawn(move || {
+                let started = std::time::Instant::now();
+                let result = ideas::suggest(&host, &model, mode, &prompt, &gaps);
+                let secs = started.elapsed().as_secs_f32();
+                let _ = weak.upgrade_in_event_loop(move |ui| {
+                    ui.set_ideas_busy(false);
+                    with_state(|state| {
+                        // the prompt changed while the model was thinking: these ideas are for the old one
+                        if ai_key(&ui) != key {
+                            ui.set_status_message("💡 Ideas: the prompt changed meanwhile, so the ideas were dropped. Try again.".into());
+                            return;
+                        }
+                        match result {
+                            Ok(found) if !found.is_empty() => {
+                                let cards = ideas::cards(&found);
+                                let n = cards.len();
+                                {
+                                    let mut st = state.borrow_mut();
+                                    st.extra_cards.retain(|c| c.action != ChangeAction::Idea);
+                                    // only the first option starts switched on
+                                    for (card, (_, options)) in cards.iter().zip(&found) {
+                                        let off: std::collections::HashSet<String> = options.iter().skip(1).flatten().cloned().collect();
+                                        st.chip_off.insert(card_key(0, card), off);
+                                    }
+                                    st.extra_cards.extend(cards);
+                                    st.extra_key = Some(key.clone());
+                                }
+                                render(&ui, state);
+                                ui.set_status_message(format!("💡 Ideas: {n} card(s) in {secs:.1}s. Pick tags and press Add It; nothing changes until you do.").into());
+                            }
+                            Ok(_) => ui.set_status_message("💡 Ideas: the model's picks weren't on the tag menus, so there's nothing to suggest. Try again.".into()),
+                            Err(e) => ui.set_status_message(format!("💡 Ideas failed: {e}").into()),
+                        }
+                    });
+                });
+            });
         });
     }
 
@@ -1009,9 +1278,9 @@ mod card_key_tests {
         apply_card_choices(&mut changes, 0, &choices);
         assert_eq!(changes[a].mode, 0);
         assert_eq!(changes[b].mode, 2);
-        let reason_a = changes[a].reason.clone();
-        let again = later.iter().find(|c| c.reason == reason_a).expect("the accepted card is still there");
+        let key_a = card_key(0, &changes[a]);
+        let again = later.iter().find(|c| card_key(0, c) == key_a).expect("the accepted card is still there");
         assert_eq!(again.mode, 0, "the choice survived the edit");
-        assert!(later.iter().filter(|c| c.action == analyzer::ChangeAction::Recommendation && c.reason != reason_a).all(|c| c.mode == 2));
+        assert!(later.iter().filter(|c| c.action == analyzer::ChangeAction::Recommendation && card_key(0, c) != key_a).all(|c| c.mode == 2));
     }
 }

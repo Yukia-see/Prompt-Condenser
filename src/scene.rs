@@ -1252,6 +1252,19 @@ pub fn describe(tokens: &[PromptToken]) -> SceneDescription {
     SceneDescription { headline, details, missing }
 }
 
+/// The keyword list behind a slot, for 💡 Ideas' menus (`ideas.rs` keeps only the real Danbooru tags).
+pub(crate) fn slot_words(slot: Slot) -> Vec<&'static str> {
+    let palette = |name: &str| PALETTE.iter().find(|(n, _)| *n == name).map(|(_, t)| t.to_vec()).unwrap_or_default();
+    match slot {
+        Slot::Camera => CAMERA.to_vec(),
+        Slot::Setting => SETTING.to_vec(),
+        Slot::Light => LIGHT.iter().copied().chain(palette("Lighting")).chain(palette("Atmosphere")).collect(),
+        Slot::Expression => EXPRESSION.to_vec(),
+        Slot::Pose => POSE.to_vec(),
+        _ => Vec::new(),
+    }
+}
+
 /// The 🎨 Palette drawer: lighting / atmosphere / style tags added on an explicit click (like "+ Quality",
 /// so not covered by the "never add tags" rule). Real Danbooru tags only (checked against the tagger's
 /// `selected_tags.csv`), parentheses escaped the way the parser expects.
