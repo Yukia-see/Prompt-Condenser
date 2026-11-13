@@ -64,9 +64,6 @@ pub(crate) fn fix_ai_slips(text: &str) -> String {
 /// BREAK part that describes a character (shared scene parts are left alone; every character gets the
 /// picks, as in the rule path). Runs after `enforce_checkpoint_rules`.
 pub(crate) fn enforce_body_choices(out: &mut AiJsonOutput, config: &ScanConfig) {
-    if config.bust == 0 && config.frame == 0 {
-        return;
-    }
     out.improved_prompt = body_choices_in(&out.improved_prompt, config);
     out.dynamic_prompt = body_choices_in(&out.dynamic_prompt, config);
 }
@@ -76,7 +73,24 @@ pub(crate) fn body_choices_in(text: &str, config: &ScanConfig) -> String {
         return text.to_string();
     }
     let exaggerate = config.exaggerated_proportions.then_some(config.checkpoint);
-    let apply = |t: &str| crate::analyzer::apply_body_choices_with(t, config.bust, config.frame, exaggerate);
+    let apply = |t: &str| {
+        let out = if config.bust == 0 && config.frame == 0 {
+            t.to_string()
+        } else {
+            crate::analyzer::apply_body_choices_with(t, config.bust, config.frame, exaggerate)
+        };
+        // the rule view's Exaggerated / body rules, so a Deep Scan rewrite can't undo them
+        let out = crate::analyzer::body_rule_fixups(&out, config);
+        // the big-bust shape tags, as in the rule view (`analyzer::bust_shape_tags`)
+        let have: Vec<String> = crate::parser::parse_prompt(&out).into_iter().map(|t| t.normalized).collect();
+        let missing: Vec<&str> =
+            crate::analyzer::bust_shape_tags(config.bust, config.checkpoint).iter().copied().filter(|s| !have.iter().any(|h| h == s)).collect();
+        if missing.is_empty() || out.trim().is_empty() {
+            out
+        } else {
+            format!("{}, {}", out.trim_end().trim_end_matches(','), missing.join(", "))
+        }
+    };
     if !config.two_char {
         return apply(text);
     }

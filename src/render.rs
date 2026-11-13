@@ -126,6 +126,7 @@ pub(crate) fn analyze(ui: &AppWindow, state: &State) {
         if st.extra_key.as_ref() != Some(&key) {
             st.extra_cards.clear();
             st.check_neg.clear();
+            st.idea_chip_defaults.clear();
             st.extra_key = None;
         }
     }
@@ -500,10 +501,21 @@ pub(crate) fn render(ui: &AppWindow, state: &State) {
         let (t, c) = parser::estimate_clip_tokens(&dyn_text);
         (dyn_text, String::new(), t, c)
     } else if ui.get_after_view() == 3 {
+        // The Scene box was analyzed with character 1 (`with_scene`); Section Blocks re-reads the box as written, so it
+        // only gets the box tags the rules kept (a removed `realistic` from a Scene / Pose reference came back here)
+        let kept: std::collections::HashSet<String> =
+            rule_texts.iter().flat_map(|t| parser::parse_prompt(t)).map(|t| t.normalized).collect();
+        let mut block_cfg = config.clone();
+        block_cfg.scene_prompt_raw = parser::parse_prompt(&config.scene_prompt_raw)
+            .into_iter()
+            .filter(|t| kept.contains(&t.normalized))
+            .map(|t| t.raw.trim().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
         let blocks_text = if two_char {
-            two::combine_section_blocks(&rule_texts, &config, true, ai_sentence.as_deref())
+            two::combine_section_blocks(&rule_texts, &block_cfg, true, ai_sentence.as_deref())
         } else {
-            two::combine_section_blocks(std::slice::from_ref(&rule_prompt), &config, true, ai_sentence.as_deref())
+            two::combine_section_blocks(std::slice::from_ref(&rule_prompt), &block_cfg, true, ai_sentence.as_deref())
         };
         let (t, c) = parser::estimate_clip_tokens(&blocks_text);
         (blocks_text, String::new(), t, c)
@@ -592,7 +604,8 @@ pub(crate) fn render(ui: &AppWindow, state: &State) {
         .map(|c| (0, c))
         .chain(shown_others.iter().enumerate().flat_map(|(i, cs)| cs.iter().map(move |c| (i + 1, c))))
         .collect();
-    let (cards, counts) = card_list(&shown, &st.chip_off, st.fixes_expanded, ui.get_card_filter());
+    let (cards, counts) = card_list(&shown, &st.chip_off, st.fixes_expanded, ui.get_card_filter(), two_char);
+    ui.set_fixes_expanded(st.fixes_expanded);
     ui.set_card_filter_counts(ModelRc::new(VecModel::from(counts)));
     let model = &st.cards_model;
     if model.row_count() == cards.len() {
@@ -760,7 +773,7 @@ pub(crate) fn format_stats(tokens: usize, chunks: usize, checkpoint: CheckpointP
     (format!("~{tokens} / {} tokens · chunk {chunks}, est.", 75 * chunks), chunks > 1)
 }
 
-pub(crate) fn to_card(ch: &PromptChange) -> ChangeCardItem {
+pub(crate) fn to_card(ch: &PromptChange, character_label: String) -> ChangeCardItem {
     let badge_kind = match ch.action {
         ChangeAction::FramingSafeSwap
         | ChangeAction::PositioningConflict
@@ -785,6 +798,7 @@ pub(crate) fn to_card(ch: &PromptChange) -> ChangeCardItem {
         id: ch.id as i32,
         badge: ch.action.badge_text().into(),
         badge_kind,
+        character_label: character_label.into(),
         original: ch.original.clone().into(),
         reason: ch.reason.clone().into(),
         suggested_alternative: ch.suggested_alternative.clone().into(),
@@ -859,6 +873,15 @@ pub(crate) fn card_group(ch: &PromptChange) -> i32 {
     }
 }
 
+/// Cards Apply all / Skip all may change: not the user's own picks (Angle, Pose, Bust / Frame dropdowns, Keep &
+/// Emphasize), which they made on purpose.
+pub(crate) fn batchable(ch: &PromptChange) -> bool {
+    !matches!(
+        ch.action,
+        ChangeAction::AngleChoice | ChangeAction::PoseChoice | ChangeAction::ProportionChoice | ChangeAction::KeptEmphasized
+    )
+}
+
 /// Automatic fixes that fold into one "N small fixes" card while they're applied.
 fn is_small_fix(ch: &PromptChange) -> bool {
     ch.mode == 0
@@ -876,6 +899,7 @@ pub(crate) fn card_list(
     chip_off: &std::collections::HashMap<CardKey, std::collections::HashSet<String>>,
     fixes_expanded: bool,
     filter: i32,
+    two_char: bool,
 ) -> (Vec<ChangeCardItem>, Vec<i32>) {
     let mut counts = vec![shown.len() as i32, 0, 0, 0, 0];
     for (_, c) in shown {
@@ -894,7 +918,10 @@ pub(crate) fn card_list(
             folded.push(format!("• {}: {what}", c.action.badge_text().to_lowercase()));
             continue;
         }
-        let mut card = to_card(c);
+        // 💡 Ideas and Check Result cards are about the whole prompt, not character 1
+        let whole_prompt = matches!(c.action, ChangeAction::Idea | ChangeAction::CheckResult);
+        let char_label = if two_char && !whole_prompt { format!("Char {}", character + 1) } else { String::new() };
+        let mut card = to_card(c, char_label);
         if has_chips(c) {
             let off = chip_off.get(&card_key(*character, c));
             let chips: Vec<CardChip> =
@@ -911,6 +938,7 @@ pub(crate) fn card_list(
                 id: SUMMARY_CARD_ID,
                 badge: "SMALL FIXES".into(),
                 badge_kind: 2,
+                character_label: SharedString::default(),
                 original: String::new().into(),
                 reason: format!("{n} small automatic fixes (already applied):\n{}", folded.join("\n")).into(),
                 suggested_alternative: SharedString::default(),
@@ -1017,13 +1045,104 @@ pub(crate) fn wire_cards(ui: &AppWindow, state: &State) {
         });
     }
 
-    // --- The folded "N small fixes" card opens into separate cards ---
+    // --- Tag chips batch toggle (All / None) ---
+    {
+        let weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_card_chips_batch(move |card_id, all_on| {
+            let Some(ui) = weak.upgrade() else { return };
+            {
+                let mut st = state.borrow_mut();
+                let st = &mut *st;
+                let found = std::iter::once((0usize, st.changes.iter().chain(&st.ai_changes).chain(&st.extra_cards).collect::<Vec<_>>()))
+                    .chain(st.others.iter().enumerate().map(|(i, o)| (i + 1, o.changes.iter().chain(&o.ai_changes).collect())))
+                    .find_map(|(i, cs)| cs.into_iter().find(|c| c.id as i32 == card_id).map(|c| (card_key(i, c), chip_tags(c))));
+                if let Some((k, tags)) = found {
+                    if all_on {
+                        st.chip_off.remove(&k);
+                    } else {
+                        st.chip_off.insert(k, tags.into_iter().collect());
+                    }
+                }
+            }
+            render(&ui, &state);
+        });
+    }
+
+    // --- The folded "N small fixes" card opens into separate cards / collapses back ---
     {
         let weak = ui.as_weak();
         let state = state.clone();
         ui.on_card_expand_fixes(move || {
             let Some(ui) = weak.upgrade() else { return };
             state.borrow_mut().fixes_expanded = true;
+            render(&ui, &state);
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_card_collapse_fixes(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            state.borrow_mut().fixes_expanded = false;
+            render(&ui, &state);
+        });
+    }
+
+    // --- Batch card actions: 0 = Apply all in tab, 1 = Skip all in tab, 2 = Reset all ---
+    {
+        let weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_card_batch_action(move |action| {
+            let Some(ui) = weak.upgrade() else { return };
+            if action == 2 {
+                {
+                    let mut st = state.borrow_mut();
+                    let st = &mut *st;
+                    st.card_choices.clear();
+                    // chips back to their defaults: every chip on, except the 💡 Ideas options after the first
+                    st.chip_off = st.idea_chip_defaults.clone();
+                    st.fixes_expanded = false;
+                    // opt-in cards (AI, Ideas, Check Result) start unapplied: un-apply them, keep the cards
+                    for ch in st.ai_changes.iter_mut().chain(st.extra_cards.iter_mut()).chain(st.others.iter_mut().flat_map(|o| o.ai_changes.iter_mut())) {
+                        ch.mode = 2;
+                    }
+                }
+                analyze(&ui, &state);
+                ui.set_status_message("Cards reset to their defaults (AI and 💡 Ideas cards kept, unapplied).".into());
+                return;
+            }
+            let target_mode: u8 = if action == 0 { 0 } else { 2 };
+            let filter = ui.get_card_filter();
+            {
+                let mut st = state.borrow_mut();
+                let st = &mut *st;
+                for ch in st.changes.iter_mut() {
+                    if (filter == 0 || card_group(ch) == filter) && batchable(ch) {
+                        ch.mode = target_mode;
+                        st.card_choices.insert(card_key(0, ch), target_mode);
+                    }
+                }
+                for ch in st.ai_changes.iter_mut().chain(st.extra_cards.iter_mut()) {
+                    if (filter == 0 || card_group(ch) == filter) && batchable(ch) {
+                        ch.mode = target_mode;
+                    }
+                }
+                for (i, o) in st.others.iter_mut().enumerate() {
+                    let char_idx = i + 1;
+                    for ch in o.changes.iter_mut() {
+                        if (filter == 0 || card_group(ch) == filter) && batchable(ch) {
+                            ch.mode = target_mode;
+                            st.card_choices.insert(card_key(char_idx, ch), target_mode);
+                        }
+                    }
+                    for ch in o.ai_changes.iter_mut() {
+                        if (filter == 0 || card_group(ch) == filter) && batchable(ch) {
+                            ch.mode = target_mode;
+                        }
+                    }
+                }
+            }
             render(&ui, &state);
         });
     }
@@ -1047,10 +1166,13 @@ pub(crate) fn wire_cards(ui: &AppWindow, state: &State) {
             let Some(ui) = weak.upgrade() else { return };
             // the prompt as shown in After (rules applied), so ideas fit what will be generated
             let prompt = ui.get_condensed_prompt().to_string();
-            let gaps = ideas::gaps(&prompt);
+            let mut gaps = ideas::gaps(&prompt);
+            if gaps.is_empty() {
+                gaps = ideas::refinement_gaps(&prompt);
+            }
             if gaps.is_empty() {
                 ui.set_status_message(
-                    "💡 Ideas: the prompt already covers camera, setting, lighting, expression and pose (or the Danbooru tag list isn't downloaded yet).".into(),
+                    "💡 Ideas: no additional tag menus available (make sure the Danbooru tag list is downloaded).".into(),
                 );
                 return;
             }
@@ -1082,7 +1204,8 @@ pub(crate) fn wire_cards(ui: &AppWindow, state: &State) {
                                     // only the first option starts switched on
                                     for (card, (_, options)) in cards.iter().zip(&found) {
                                         let off: std::collections::HashSet<String> = options.iter().skip(1).flatten().cloned().collect();
-                                        st.chip_off.insert(card_key(0, card), off);
+                                        st.chip_off.insert(card_key(0, card), off.clone());
+                                        st.idea_chip_defaults.insert(card_key(0, card), off);
                                     }
                                     st.extra_cards.extend(cards);
                                     st.extra_key = Some(key.clone());

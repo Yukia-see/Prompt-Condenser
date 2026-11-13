@@ -154,6 +154,7 @@ export struct ChangeCardItem {
     id: int,
     badge: string,
     badge_kind: int, // 0 = swap/conflict (amber), 1 = emphasized (green), 2 = bloat/weight (blue), 3 = AI (purple)
+    character_label: string,
     original: string,
     reason: string,
     suggested_alternative: string,
@@ -373,115 +374,179 @@ component ChangeCard inherits Rectangle {
     in property <ChangeCardItem> card;
     callback mode-changed(int, int);
     callback chip-toggled(int, string);
+    callback chips-batch(int, bool);
     callback expand-fixes();
     background: M3.surface-container-high;
     border-radius: 10px;
     border-width: 1px;
-    border-color: card.badge_kind == 3 ? M3.primary : card.badge_kind == 0 ? M3.warning : (card.badge_kind == 1 ? M3.success : M3.info);
+    border-color: card.mode == 2 ? M3.outline-variant : (card.badge_kind == 3 ? M3.primary : card.badge_kind == 0 ? M3.warning : (card.badge_kind == 1 ? M3.success : M3.info));
     clip: true;
 
-    ScrollBox {
-        VerticalLayout {
-            padding: 10px;
-            spacing: 5px;
-            alignment: start;
+    VerticalLayout {
+        padding: 10px;
+        spacing: 5px;
+        opacity: card.mode == 2 ? 0.65 : 1.0;
 
-            HorizontalLayout {
-                spacing: 6px;
-                Chip {
-                    text: card.badge;
-                    fg: card.badge_kind == 3 ? M3.on-primary : card.badge_kind == 0 ? M3.warning : (card.badge_kind == 1 ? M3.success : M3.info);
-                    bg: card.badge_kind == 3 ? M3.primary : card.badge_kind == 0 ? M3.warning-container : (card.badge_kind == 1 ? M3.success-container : M3.info-container);
-                }
-                Text {
-                    text: card.summary_count > 0 ? "Already applied" : (card.original == "" ? "New detail" : "Original: \"" + card.original + "\"");
-                    font-size: 11px;
-                    font-weight: 700;
-                    color: M3.tertiary;
-                    overflow: elide;
-                    horizontal-stretch: 1;
-                }
+        // Pinned Header
+        HorizontalLayout {
+            spacing: 6px;
+            Chip {
+                text: card.badge;
+                fg: card.badge_kind == 3 ? M3.on-primary : card.badge_kind == 0 ? M3.warning : (card.badge_kind == 1 ? M3.success : M3.info);
+                bg: card.badge_kind == 3 ? M3.primary : card.badge_kind == 0 ? M3.warning-container : (card.badge_kind == 1 ? M3.success-container : M3.info-container);
             }
-
-            // the folded small fixes: one button opens them as separate cards
-            if card.summary_count > 0 : HorizontalLayout {
-                alignment: start;
-                PillButton {
-                    text: "Show each (" + card.summary_count + ") ▸";
-                    clicked => { root.expand-fixes(); }
-                }
+            if card.character_label != "" : Chip {
+                text: card.character_label;
+                fg: M3.on-surface;
+                bg: M3.surface-container;
             }
-            if card.chips.length > 0 : Text {
-                text: "Pick the tags to add:";
+            Text {
+                text: card.summary_count > 0 ? "Already applied" : (card.original == "" ? "New detail" : "Original: \"" + card.original + "\"");
                 font-size: 11px;
-                font-weight: 600;
-                color: M3.success;
+                font-weight: 700;
+                color: M3.tertiary;
+                overflow: elide;
+                horizontal-stretch: 1;
+                vertical-alignment: center;
             }
-            for chip in card.chips : Rectangle {
-                height: 22px;
-                border-radius: 6px;
-                background: chip.on ? M3.secondary-container : transparent;
-                border-width: 1px;
-                border-color: chip.on ? M3.primary : M3.outline-variant;
-                HorizontalLayout {
-                    padding-left: 6px;
-                    padding-right: 6px;
+        }
+
+        // Scrollable Middle: chips, suggestions, framing alt, and reason
+        ScrollBox {
+            vertical-stretch: 1;
+            VerticalLayout {
+                spacing: 5px;
+                alignment: start;
+
+                if card.chips.length > 0 : HorizontalLayout {
+                    spacing: 6px;
                     Text {
-                        text: (chip.on ? "☑ " : "☐ ") + chip.tag;
+                        text: "Pick tags to add:";
                         font-size: 11px;
-                        color: chip.on ? M3.primary : M3.on-surface-variant;
+                        font-weight: 600;
+                        color: M3.success;
+                        horizontal-stretch: 1;
                         vertical-alignment: center;
-                        overflow: elide;
+                    }
+                    if card.chips.length >= 2 : Rectangle {
+                        height: 18px;
+                        min-width: all-lbl.preferred-width + 10px;
+                        border-radius: 5px;
+                        border-width: 1px;
+                        border-color: M3.outline-variant;
+                        background: all-ta.has-hover ? M3.surface-container : transparent;
+                        all-lbl := Text {
+                            text: "All";
+                            font-size: 10px;
+                            color: M3.primary;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        all-ta := TouchArea {
+                            mouse-cursor: MouseCursor.pointer;
+                            clicked => { root.chips-batch(card.id, true); }
+                        }
+                    }
+                    if card.chips.length >= 2 : Rectangle {
+                        height: 18px;
+                        min-width: none-lbl.preferred-width + 10px;
+                        border-radius: 5px;
+                        border-width: 1px;
+                        border-color: M3.outline-variant;
+                        background: none-ta.has-hover ? M3.surface-container : transparent;
+                        none-lbl := Text {
+                            text: "None";
+                            font-size: 10px;
+                            color: M3.on-surface-variant;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        none-ta := TouchArea {
+                            mouse-cursor: MouseCursor.pointer;
+                            clicked => { root.chips-batch(card.id, false); }
+                        }
                     }
                 }
-                TouchArea {
-                    mouse-cursor: MouseCursor.pointer;
-                    clicked => { root.chip-toggled(card.id, chip.tag); }
+                if card.chips.length > 0 : Rectangle {
+                    height: Math.ceil(card.chips.length / 2) * 26px;
+                    for chip[idx] in card.chips : Rectangle {
+                        x: Math.mod(idx, 2) == 0 ? 0px : (parent.width + 4px) / 2;
+                        y: Math.floor(idx / 2) * 26px;
+                        width: (parent.width - 4px) / 2;
+                        height: 22px;
+                        border-radius: 6px;
+                        background: chip.on ? M3.secondary-container : transparent;
+                        border-width: 1px;
+                        border-color: chip.on ? M3.primary : M3.outline-variant;
+                        HorizontalLayout {
+                            padding-left: 6px;
+                            padding-right: 6px;
+                            Text {
+                                text: (chip.on ? "☑ " : "☐ ") + chip.tag;
+                                font-size: 11px;
+                                color: chip.on ? M3.primary : M3.on-surface-variant;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+                        }
+                        TouchArea {
+                            mouse-cursor: MouseCursor.pointer;
+                            clicked => { root.chip-toggled(card.id, chip.tag); }
+                        }
+                    }
                 }
-            }
-            if card.suggested_alternative != "" && card.chips.length == 0 : Text {
-                text: "Suggested: " + card.suggested_alternative;
-                font-size: 11px;
-                font-weight: 600;
-                color: M3.success;
-                wrap: word-wrap;
-            }
+                if card.suggested_alternative != "" && card.chips.length == 0 : Text {
+                    text: "Suggested: " + card.suggested_alternative;
+                    font-size: 11px;
+                    font-weight: 600;
+                    color: M3.success;
+                    wrap: word-wrap;
+                }
 
-            if card.has_framing_alt : Text {
-                text: "Or change framing to: " + card.framing_alternative;
-                font-size: 11px;
-                color: M3.info;
-                wrap: word-wrap;
-            }
+                if card.has_framing_alt : Text {
+                    text: "Or change framing to: " + card.framing_alternative;
+                    font-size: 11px;
+                    color: M3.info;
+                    wrap: word-wrap;
+                }
 
-            if card.summary_count == 0 : HorizontalLayout {
-                spacing: 6px;
-                alignment: start;
-                PillButton {
-                    text: card.mode == 0 ? "✓ Applied" : (card.original == "" ? "Add It" : (card.suggested_alternative == "" ? "Remove Tag" : "Use Suggestion"));
-                    primary: card.mode == 0;
-                    clicked => { root.mode-changed(card.id, 0); }
-                }
-                PillButton {
-                    text: card.original == "" ? (card.mode == 2 ? "✓ Skipped" : "Skip") : (card.mode == 2 ? "✓ Kept Original" : "Keep Original");
-                    primary: card.mode == 2;
-                    clicked => { root.mode-changed(card.id, 2); }
+                Text {
+                    text: card.reason;
+                    font-size: 11px;
+                    color: M3.on-surface-variant;
+                    wrap: word-wrap;
                 }
             }
-            if card.has_framing_alt : HorizontalLayout {
-                alignment: start;
-                PillButton {
-                    text: card.mode == 1 ? "✓ Framing Swapped" : "Keep & Swap Framing";
-                    primary: card.mode == 1;
-                    clicked => { root.mode-changed(card.id, 1); }
-                }
-            }
+        }
 
-            Text {
-                text: card.reason;
-                font-size: 11px;
-                color: M3.on-surface-variant;
-                wrap: word-wrap;
+        // Pinned Action Footer
+        if card.summary_count > 0 : HorizontalLayout {
+            alignment: start;
+            PillButton {
+                text: "Show each (" + card.summary_count + ") ▸";
+                clicked => { root.expand-fixes(); }
+            }
+        }
+        if card.summary_count == 0 : HorizontalLayout {
+            spacing: 6px;
+            alignment: start;
+            PillButton {
+                text: card.mode == 0 ? "✓ Applied" : (card.original == "" ? "Add It" : (card.suggested_alternative == "" ? "Remove Tag" : "Use Suggestion"));
+                primary: card.mode == 0;
+                clicked => { root.mode-changed(card.id, 0); }
+            }
+            PillButton {
+                text: card.original == "" ? (card.mode == 2 ? "✓ Skipped" : "Skip") : (card.mode == 2 ? "✓ Kept Original" : "Keep Original");
+                primary: card.mode == 2;
+                clicked => { root.mode-changed(card.id, 2); }
+            }
+        }
+        if card.has_framing_alt : HorizontalLayout {
+            alignment: start;
+            PillButton {
+                text: card.mode == 1 ? "✓ Framing Swapped" : "Keep & Swap Framing";
+                primary: card.mode == 1;
+                clicked => { root.mode-changed(card.id, 1); }
             }
         }
     }
@@ -765,11 +830,15 @@ component CardsPanel inherits M3Card {
     /// 0 All, 1 Conflicts, 2 Fixes, 3 Suggestions, 4 AI; counts in the same order.
     in property <int> card-filter;
     in property <[int]> filter-counts: [0, 0, 0, 0, 0];
+    in property <bool> fixes-expanded: false;
     in property <bool> ideas-enabled;
     in property <bool> ideas-busy;
     callback filter-changed(int);
     callback chip-toggled(int, string);
+    callback chips-batch(int, bool);
     callback expand-fixes();
+    callback collapse-fixes();
+    callback batch-action(int);
     callback ideas();
     in property <string> live-headline;
     in property <string> live-details;
@@ -787,19 +856,38 @@ component CardsPanel inherits M3Card {
         spacing: 6px;
 
         HorizontalLayout {
-            spacing: 8px;
+            spacing: 6px;
+            // the title shortens with "…" on a narrow window, so the tabs, batch buttons and 💡 Ideas stay visible
             Text {
-                text: "⚡ SCENE & SUGGESTIONS (SCROLLABLE)" + (root.cards.length > 0 ? " · " + root.cards.length : "");
+                text: "⚡ SCENE & SUGGESTIONS" + (root.cards.length > 0 ? " · " + root.cards.length : "");
                 font-size: 11px;
                 font-weight: 700;
                 color: M3.warning;
                 vertical-alignment: center;
+                overflow: elide;
+                min-width: 0px;
+                horizontal-stretch: 1;
             }
-            Rectangle { horizontal-stretch: 1; }
             for label[i] in ["All", "Conflicts", "Fixes", "Suggestions", "AI"] : FilterTab {
                 text: label + " " + (root.filter-counts[i]);
                 selected: root.card-filter == i;
                 clicked => { root.filter-changed(i); }
+            }
+            if root.fixes-expanded : PillButton {
+                text: "Collapse ▴";
+                clicked => { root.collapse-fixes(); }
+            }
+            if root.cards.length > 0 : PillButton {
+                text: "Apply all";
+                clicked => { root.batch-action(0); }
+            }
+            if root.cards.length > 0 : PillButton {
+                text: "Skip all";
+                clicked => { root.batch-action(1); }
+            }
+            if root.filter-counts[0] > 0 : PillButton {
+                text: "Reset";
+                clicked => { root.batch-action(2); }
             }
             PillButton {
                 text: root.ideas-busy ? "💡 Thinking…" : "💡 Ideas";
@@ -810,7 +898,11 @@ component CardsPanel inherits M3Card {
 
         if root.live-headline == "" && root.cards.length == 0 : Text {
             vertical-stretch: 1;
-            text: root.filter-counts[0] > 0 ? "No cards in this tab. Pick another tab above." : "Paste a prompt below (or use From Image… / Scene Ref…) to see the live scene breakdown, conflicts, and fixes.";
+            text: root.card-filter == 4 && root.filter-counts[4] == 0
+                ? "No AI cards yet — click 💡 Ideas or run Deep AI Scan."
+                : (root.filter-counts[0] > 0
+                    ? "No cards in this tab. Pick another tab above."
+                    : "Paste a prompt below (or use From Image… / Scene Ref…) to see the live scene breakdown, conflicts, and fixes.");
             font-size: 12px;
             color: M3.on-surface-variant;
             wrap: word-wrap;
@@ -843,6 +935,7 @@ component CardsPanel inherits M3Card {
                     card: card;
                     mode-changed(id, mode) => { root.mode-changed(id, mode); }
                     chip-toggled(id, tag) => { root.chip-toggled(id, tag); }
+                    chips-batch(id, on) => { root.chips-batch(id, on); }
                     expand-fixes => { root.expand-fixes(); }
                 }
             }
@@ -1911,9 +2004,13 @@ export component AppWindow inherits Window {
     in-out property <[ChangeCardItem]> change_cards: [];
     in-out property <int> card_filter: 0;              // card strip filter (not saved)
     in-out property <[int]> card_filter_counts: [0, 0, 0, 0, 0];
+    in-out property <bool> fixes_expanded: false;
     in-out property <bool> ideas_busy: false;          // 💡 Ideas: E4B is suggesting tags for the gaps
     callback card_chip_toggled(int, string);
+    callback card_chips_batch(int, bool);
     callback card_expand_fixes();
+    callback card_collapse_fixes();
+    callback card_batch_action(int);
     callback card_filter_changed(int);
     callback ideas_requested();
 
@@ -3147,11 +3244,15 @@ export component AppWindow inherits Window {
                             mode-changed(id, mode) => { root.card_mode_changed(id, mode); }
                             card-filter: root.card_filter;
                             filter-counts: root.card_filter_counts;
+                            fixes-expanded: root.fixes_expanded;
                             ideas-enabled: root.ollama_connected && root.raw_prompt != "";
                             ideas-busy: root.ideas_busy;
                             filter-changed(i) => { root.card_filter_changed(i); }
                             chip-toggled(id, tag) => { root.card_chip_toggled(id, tag); }
+                            chips-batch(id, on) => { root.card_chips_batch(id, on); }
                             expand-fixes => { root.card_expand_fixes(); }
+                            collapse-fixes => { root.card_collapse_fixes(); }
+                            batch-action(action) => { root.card_batch_action(action); }
                             ideas => { root.ideas_requested(); }
                             show-ai => { if root.after_view == 3 { root.after_view_changed(4); } else { root.after_view_changed(1); } }
                           }

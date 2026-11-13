@@ -59,6 +59,65 @@ pub fn gaps(prompt: &str) -> Vec<Gap> {
         .collect()
 }
 
+/// Secondary refinement menus when all 5 basic slots already have at least one tag,
+/// offering atmosphere, composition, and detail accents not yet in `prompt`.
+pub fn refinement_gaps(prompt: &str) -> Vec<Gap> {
+    let Some(list) = crate::danbooru::local() else { return Vec::new() };
+    let tokens = parser::parse_prompt(prompt);
+    let in_prompt: Vec<String> = tokens.iter().map(|t| t.normalized.as_str().to_string()).collect();
+    let has_subject = tokens.iter().any(|t| t.normalized == "solo" || crate::two::count_tag(&t.normalized).is_some());
+
+    let mut categories: Vec<(&str, &[&str])> = vec![
+        (
+            "atmosphere & lighting accents",
+            &[
+                "rim lighting", "backlighting", "volumetric lighting", "sunbeam", "lens flare",
+                "depth of field", "bokeh", "chromatic aberration", "bloom", "floating particles",
+                "dust", "sparkles", "mist", "warm lighting", "dramatic shadows",
+            ],
+        ),
+        (
+            "camera & composition polish",
+            &[
+                "dutch angle", "from below", "from above", "close-up", "cowboy shot",
+                "wide shot", "foreshortening", "dynamic angle", "rule of thirds", "blurry background",
+                "blurry foreground", "cinematic composition",
+            ],
+        ),
+    ];
+    if has_subject {
+        categories.push((
+            "character & motion accents",
+            &[
+                "wind", "floating hair", "flowing clothes", "looking back", "head tilt",
+                "hand on hip", "parted lips", "soft smile", "blush", "hair blowing",
+                "collarbone", "wet", "sweat",
+            ],
+        ));
+    }
+
+    // this fallback only runs when the prompt already has camera framing: another shot or angle would fight it
+    // (`full body` + `close-up`), so the composition menu keeps only effects
+    const SHOTS: &[&str] = &["close-up", "cowboy shot", "wide shot", "from below", "from above", "upper body", "full body", "portrait", "dutch angle"];
+    categories
+        .into_iter()
+        .filter_map(|(name, words)| {
+            let mut menu: Vec<String> = Vec::new();
+            for &w in words {
+                if in_prompt.iter().any(|p| p == w) || SHOTS.contains(&w) {
+                    continue;
+                }
+                if let Some(t) = list.get(w).filter(|t| !t.character && t.count >= 1_000) {
+                    if !menu.contains(&t.name) {
+                        menu.push(t.name.clone());
+                    }
+                }
+            }
+            (!menu.is_empty()).then_some(Gap { name, menu })
+        })
+        .collect()
+}
+
 /// Asks the model for up to 3 options (1-2 tags each) per gap, from the menus only.
 pub fn suggest(host: &str, model: &str, mode: AiMode, prompt: &str, gaps: &[Gap]) -> Result<Vec<(String, Vec<Vec<String>>)>> {
     if gaps.is_empty() {

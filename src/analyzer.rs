@@ -2169,6 +2169,111 @@ pub fn is_footwear(norm: &str) -> bool {
         || norm.ends_with(" loafers")
 }
 
+/// The shape tags a big Bust pick brings (the user's choice, 2026-11-12): Large / Huge / Gigantic (index ≥ 4) get
+/// `sagging breasts` (a Danbooru tag) on every checkpoint, plus `soft breasts` / `heavy breasts` (plain words, not
+/// tags) where the checkpoint reads plain words (Anima / SDXL / Flux).
+pub fn bust_shape_tags(bust: usize, checkpoint: crate::profiles::CheckpointProfile) -> &'static [&'static str] {
+    match (bust >= 4, checkpoint.supports_natural_language()) {
+        (true, true) => &["sagging breasts", "soft breasts", "heavy breasts"],
+        (true, false) => &["sagging breasts"],
+        _ => &[],
+    }
+}
+
+/// The rule view's body rules applied to AI text (a Deep Scan rewrite), silently, so the AI can't undo them:
+/// with Exaggerated and a pick, realism tags go; a slender build goes next to Shortstack / Petite; `breasts apart`
+/// goes next to cleavage & co., else is toned down to 0.7 with clothes on; with Exaggerated, Pear / Shortstack get
+/// `narrow shoulders` (plain-word checkpoints) and Shortstack gets `exaggerated proportions`. Other tags keep their
+/// spelling and order; `{a|b}` groups and BREAK are left alone.
+pub fn body_rule_fixups(text: &str, config: &ScanConfig) -> String {
+    if text.trim().is_empty() {
+        return text.to_string();
+    }
+    let mut tokens = crate::parser::parse_prompt(text);
+    let before: Vec<String> = tokens.iter().map(|t| t.raw.clone()).collect();
+    let picks = config.bust > 0 || config.frame > 0;
+    let frame = crate::condenser::frame_label(config.frame);
+    let small_frame = matches!(frame, "shortstack" | "petite") || tokens.iter().any(|t| matches!(t.normalized.as_str(), "shortstack" | "petite"));
+    let together = tokens.iter().any(|t| BREASTS_TOGETHER.contains(&t.normalized.as_str()));
+    tokens.retain(|t| {
+        !(config.exaggerated_proportions && picks && is_realism_tag(&t.normalized))
+            && !(small_frame && is_slender_build(&t.normalized))
+            && !(together && t.normalized == "breasts apart")
+    });
+    if breasts_apart_clothed(&tokens) {
+        for t in tokens.iter_mut().filter(|t| t.normalized == "breasts apart") {
+            t.weight = 0.7;
+            t.raw = t.format_for_output(true);
+        }
+    }
+    let add = |tag: &str, tokens: &mut Vec<PromptToken>| {
+        if !tokens.iter().any(|t| t.normalized == tag) {
+            tokens.push(crate::parser::parse_prompt(tag).remove(0));
+        }
+    };
+    if config.exaggerated_proportions {
+        if matches!(frame, "pear" | "shortstack") && config.checkpoint.supports_natural_language() {
+            add("narrow shoulders", &mut tokens);
+        }
+        if frame == "shortstack" || tokens.iter().any(|t| t.normalized == "shortstack") {
+            add("exaggerated proportions", &mut tokens);
+        }
+    }
+    let after: Vec<String> = tokens.iter().map(|t| t.raw.clone()).collect();
+    if after == before {
+        return text.to_string();
+    }
+    after.join(", ")
+}
+
+/// Realism tags that pull an exaggerated body back toward real proportions.
+pub fn is_realism_tag(norm: &str) -> bool {
+    matches!(
+        norm,
+        "realistic" | "photorealistic" | "photorealism" | "hyperrealistic" | "hyperrealism" | "semi-realistic"
+            | "realistic proportions" | "realistic anatomy" | "realism"
+    )
+}
+
+/// Long, thin build tags that fight a shortstack / petite figure.
+pub fn is_slender_build(norm: &str) -> bool {
+    matches!(norm, "slender build" | "slender body" | "slender figure" | "slim build" | "slim body" | "slim figure")
+}
+
+/// Tags that push the breasts together (the opposite of `breasts apart`).
+pub const BREASTS_TOGETHER: &[&str] = &["cleavage", "breasts squeezed together", "breast press"];
+
+/// The chest is bare: `breasts apart` is drawn as intended then (gravity spreads them).
+pub fn chest_is_bare(tokens: &[PromptToken]) -> bool {
+    tokens.iter().any(|t| {
+        matches!(
+            t.normalized.as_str(),
+            "nude" | "completely nude" | "naked" | "topless" | "bare breasts" | "breasts out" | "no clothes"
+        )
+    })
+}
+
+/// A garment that covers the chest (shirt, dress, bikini top, uniform, armor…): it holds the breasts together.
+pub fn covers_chest(norm: &str) -> bool {
+    const TORSO: &[&str] = &[
+        "shirt", "top", "blouse", "dress", "uniform", "serafuku", "sweater", "hoodie", "jacket", "coat", "vest", "bra",
+        "bikini", "swimsuit", "leotard", "bodysuit", "kimono", "yukata", "armor", "camisole", "cardigan", "robe", "gown",
+        "suit", "corset", "bustier", "tabard", "unitard", "babydoll", "chemise", "qipao", "turtleneck", "tank top",
+        "crop top", "tube top", "sports bra", "maid",
+    ];
+    // "open shirt" / "shirt lift" / "no bra"… leave the chest uncovered or are about something else
+    !norm.starts_with("open ") && !norm.starts_with("no ") && !norm.contains(" lift") && !norm.contains("removed")
+        && !norm.contains("unworn") && crate::scene::has_word(norm, TORSO)
+}
+
+/// `breasts apart` with the chest covered and not bare: clothes push the breasts together, so the tag fights the
+/// outfit (split / torn tops, gaps, lopsided shapes) unless it's toned down.
+pub fn breasts_apart_clothed(tokens: &[PromptToken]) -> bool {
+    tokens.iter().any(|t| t.normalized == "breasts apart" && t.weight > 0.75)
+        && !chest_is_bare(tokens)
+        && tokens.iter().any(|t| covers_chest(&t.normalized))
+}
+
 /// Poses that hold the legs apart, so the thighs separate (a thigh gap is natural then).
 pub fn legs_apart(norm: &str) -> bool {
     matches!(norm, "spread legs" | "legs spread" | "legs apart" | "wide stance" | "squatting" | "knees apart")
@@ -2361,6 +2466,18 @@ pub fn analyze_with_rules(tokens: &[PromptToken], config: &ScanConfig) -> RuleAn
                 "thigh gap".to_string(),
                 "'thigh gap' contradicts thick thighs: full thighs touch unless the legs are apart (spread legs, wide stance…).",
             );
+        }
+
+        // 3e. `breasts apart` next to a tag that pushes the breasts together: they can't both be drawn
+        if tokens.iter().any(|t| t.normalized == "breasts apart") {
+            if let Some(other) = tokens.iter().find(|t| BREASTS_TOGETHER.contains(&t.normalized.as_str())) {
+                let reason: &'static str = match other.normalized.as_str() {
+                    "cleavage" => "'breasts apart' contradicts 'cleavage' (pushed together): the model draws a split or lopsided chest.",
+                    "breast press" => "'breasts apart' contradicts 'breast press' (pressed together): the model draws a split or lopsided chest.",
+                    _ => "'breasts apart' contradicts 'breasts squeezed together': the model draws a split or lopsided chest.",
+                };
+                pose_conflict_reasons.insert("breasts apart".to_string(), reason);
+            }
         }
 
         // 4. Barefoot vs Footwear
@@ -2586,6 +2703,44 @@ pub fn analyze_with_rules(tokens: &[PromptToken], config: &ScanConfig) -> RuleAn
             next_change_id += 1;
             seen_normalized.insert(tok.normalized.clone());
             processed_tokens.push(tok);
+            continue;
+        }
+
+        // 5.9 "Exaggerated": realism pulls the body back toward real proportions, so `realistic` & co. go (and into
+        // the negative, `condenser::recommended_negative`)
+        if config.exaggerated_proportions && (config.bust > 0 || config.frame > 0) && is_realism_tag(&tok.normalized) {
+            changes.push(PromptChange {
+                id: next_change_id,
+                original: tok.raw.clone(),
+                action: ChangeAction::StyleConflict,
+                reason: "Exaggerated: realism tags pull the body back toward real proportions, against the exaggerated shape. Moved to the negative.".to_string(),
+                suggested_alternative: String::new(),
+                framing_alternative: String::new(),
+                mode: 0,
+            });
+            next_change_id += 1;
+            continue;
+        }
+
+        // 5.95 a slender build fights a shortstack / petite figure (picked in Frame or typed): removed, and put in the
+        // negative
+        if is_slender_build(&tok.normalized)
+            && (matches!(crate::condenser::frame_label(config.frame), "shortstack" | "petite")
+                || tokens.iter().any(|t| matches!(t.normalized.as_str(), "shortstack" | "petite")))
+        {
+            changes.push(PromptChange {
+                id: next_change_id,
+                original: tok.raw.clone(),
+                action: ChangeAction::SizeConflict,
+                reason: format!(
+                    "'{}' fights a shortstack / petite figure (it stretches the body long and thin). Moved to the negative.",
+                    tok.text
+                ),
+                suggested_alternative: String::new(),
+                framing_alternative: String::new(),
+                mode: 0,
+            });
+            next_change_id += 1;
             continue;
         }
 
@@ -2831,6 +2986,19 @@ pub fn analyze_with_rules(tokens: &[PromptToken], config: &ScanConfig) -> RuleAn
         t.category = TokenCategory::FramingPose;
         dropdown_body.push(t.clone());
         processed_tokens.push(t);
+    }
+
+    // A big bust pick (Large / Huge / Gigantic) also gets its shape: `sagging breasts` everywhere, `soft breasts` /
+    // `heavy breasts` (not Danbooru tags) only where the checkpoint reads plain words. Plain, never emphasized.
+    for tag in bust_shape_tags(config.bust, config.checkpoint) {
+        if !processed_tokens.iter().any(|t| t.normalized == *tag) {
+            let mut t = crate::parser::parse_prompt(tag).remove(0);
+            t.added = true;
+            t.original_index = 941;
+            t.category = TokenCategory::CharacterBody;
+            dropdown_body.push(t.clone());
+            processed_tokens.push(t);
+        }
     }
 
     // The LoRA box beats a Bust / Frame choice too, so those aren't protected below.
@@ -3512,6 +3680,23 @@ pub fn analyze_with_rules(tokens: &[PromptToken], config: &ScanConfig) -> RuleAn
         }
     }
 
+    // `breasts apart` with clothes on: toned down to 0.7 (opt-in path, so Keep Original really goes back to full
+    // strength); bare chest: left as written
+    if breasts_apart_clothed(&processed_tokens) {
+        if let Some(t) = processed_tokens.iter().find(|t| t.normalized == "breasts apart") {
+            changes.push(PromptChange {
+                id: next_change_id,
+                original: t.raw.clone(),
+                action: ChangeAction::Recommendation,
+                reason: "Clothes on: the outfit pushes the breasts together, so a full-strength 'breasts apart' fights it (split or torn top, a gap in the garment, lopsided or extra breasts, worse at heavy bust weights). At 0.7 it still separates them; the negative also gets topless, nude, torn clothes. With a bare chest (nude, topless) it stays as written.".to_string(),
+                suggested_alternative: "(breasts apart:0.7)".to_string(),
+                framing_alternative: String::new(),
+                mode: 0,
+            });
+            next_change_id += 1;
+        }
+    }
+
     // The hips lock puts `thigh gap` in the negative (condenser::recommended_negative), except with the legs apart:
     // say so, so a missing `thigh gap` in the negative isn't a surprise
     if processed_tokens.iter().any(|t| matches!(t.normalized.as_str(), "thick thighs" | "wide hips"))
@@ -3695,6 +3880,7 @@ pub fn analyze_with_rules(tokens: &[PromptToken], config: &ScanConfig) -> RuleAn
     // 14. Combo Synergy Recommendation Cards (Mexes Danbooru Taxonomy & 8_combo_synergy_matrix)
     if config.fit_suggestions {
         generate_combo_synergy_cards(&processed_tokens, &mut changes, &mut next_change_id);
+        generate_prompt_options(&processed_tokens, &mut changes, &mut next_change_id);
         dedup_fit_suggestions(&mut changes);
     }
 
@@ -4369,6 +4555,124 @@ pub fn generate_combo_synergy_cards(
     }
 }
 
+/// Offline context-aware suggestion cards based on what is currently on screen
+/// (missing scene slots matched to setting/subject, generic-tag enrichments, and theme physics).
+/// Capped at 3 new cards so the strip stays focused.
+pub fn generate_prompt_options(
+    tokens: &[PromptToken],
+    changes: &mut Vec<PromptChange>,
+    next_change_id: &mut usize,
+) {
+    if tokens.is_empty() {
+        return;
+    }
+    let norms: Vec<&str> = tokens.iter().map(|t| t.normalized.as_str()).collect();
+    // a word or phrase anywhere in a tag, whole words only ("long hair" also in "very long hair")
+    let has = |w: &str| norms.iter().any(|n| crate::scene::has_word(n, &[w]));
+    let has_exact = |w: &str| norms.iter().any(|n| *n == w);
+    let slots: Vec<crate::scene::Slot> = tokens.iter().map(crate::scene::slot).collect();
+    let has_subject = norms.iter().any(|n| *n == "solo" || crate::two::count_tag(n).is_some());
+
+    let mut added = 0usize;
+    let mut push_opt = |title: &str, why: &str, candidates: &[&str]| {
+        if added >= 3 {
+            return;
+        }
+        let missing: Vec<&str> = candidates
+            .iter()
+            .copied()
+            .filter(|t| !has_exact(t))
+            .collect();
+        if missing.len() < 2 {
+            return;
+        }
+        let suggested_alt = missing.join(", ");
+        if changes.iter().any(|c| c.action == ChangeAction::Recommendation && c.suggested_alternative == suggested_alt) {
+            return;
+        }
+        changes.push(PromptChange {
+            id: *next_change_id,
+            original: String::new(),
+            action: ChangeAction::Recommendation,
+            reason: format!("Prompt Option ({title}): {why}"),
+            suggested_alternative: suggested_alt,
+            framing_alternative: String::new(),
+            mode: 2,
+        });
+        *next_change_id += 1;
+        added += 1;
+    };
+
+    // 1. Context-matched lighting when the prompt has no lighting effect yet. Time-of-day words (night, evening…)
+    // sort as lighting too, but they say when, not how it's lit, so they don't count here (a `night` prompt is
+    // exactly where the neon / backlight options belong).
+    const TIME_OF_DAY: &[&str] = &["night", "day", "evening", "morning", "afternoon", "midnight", "dusk", "dawn", "dark", "night sky", "starry sky"];
+    let lit = tokens
+        .iter()
+        .zip(&slots)
+        .any(|(t, s)| *s == crate::scene::Slot::Light && !TIME_OF_DAY.contains(&t.normalized.as_str()));
+    if !lit {
+        if has("night") || has("cyberpunk") || has("neon") || has("city lights") {
+            push_opt(
+                "Night / Neon Lighting",
+                "No lighting tag yet — these fit dark or neon scenes.",
+                &["backlighting", "neon lights", "bokeh", "light particles"],
+            );
+        } else if has("indoors") || has("classroom") || has("bedroom") || has("cafe") || has("room") {
+            push_opt(
+                "Indoor Lighting",
+                "No lighting tag yet — adds natural indoor depth and mood.",
+                &["sunlight", "light rays", "light particles", "depth of field"],
+            );
+        } else if has("outdoors") || has("beach") || has("forest") || has("park") || has("street") || has("sky") {
+            push_opt(
+                "Outdoor Lighting",
+                "No lighting tag yet — adds sunlight and outdoor atmosphere.",
+                &["sunlight", "dappled sunlight", "lens flare", "sunbeam"],
+            );
+        } else {
+            push_opt(
+                "Lighting & Depth",
+                "No lighting tag yet — helps separate the subject from the background.",
+                &["backlighting", "depth of field", "light particles", "bokeh"],
+            );
+        }
+    }
+
+    // 2. Expression options when a character is present without an expression tag
+    if has_subject && !slots.contains(&crate::scene::Slot::Expression) {
+        push_opt(
+            "Expression",
+            "Character has no expression tag — pick a subtle mood.",
+            &["light smile", "parted lips", "smug", "light blush"],
+        );
+    }
+
+    // 3. Generic-tag enrichment when broad tags are used on screen
+    if has_exact("standing") {
+        push_opt(
+            "Pose Variety",
+            "Refines generic 'standing' with more natural posture cues.",
+            &["contrapposto", "hand on own hip", "head tilt", "leaning forward"],
+        );
+    } else if has_exact("smiling") || has_exact("smile") {
+        push_opt(
+            "Expression Nuance",
+            "Adds nuance beyond a plain smile.",
+            &["parted lips", "blush", "happy", "sparkling eyes"],
+        );
+    }
+
+    // 4. Motion / wind physics for long hair, skirts, capes, or ribbons
+    if has("long hair") || has("skirt") || has("dress") || has("cape") || has("ribbon") {
+        push_opt(
+            "Motion & Flow",
+            "Adds life to long hair and loose fabric already in your prompt.",
+            &["wind", "floating hair", "wind lift", "floating clothes"],
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4474,6 +4778,173 @@ mod tests {
             assert!(!out.contains("narrow shoulders") && !out.contains("(narrow waist:") && !out.contains("(abs:"), "{frame}: {out}");
             assert!(!neg.contains("broad shoulders") && !neg.contains("extra limbs") && !neg.contains("V-taper"), "{frame}: {neg}");
         }
+    }
+
+    #[test]
+    fn realism_goes_with_exaggerated_and_slender_build_with_shortstack() {
+        use crate::profiles::CheckpointProfile as C;
+        // SDXL: on the 2D anime checkpoints (Anima, Pony…) `realistic` already goes as a 3D-bleed tag in both modes
+        let both = |prompt: &str, frame: usize, bust: usize, ex: bool| {
+            let mut c = cfg(TargetView::None);
+            c.checkpoint = C::Sdxl;
+            c.frame = frame;
+            c.bust = bust;
+            c.exaggerated_proportions = ex;
+            let out = run(prompt, &c).1;
+            let neg = crate::condenser::recommended_negative(&c, &out);
+            (out, neg)
+        };
+        // Exaggerated + a pick: realistic out of the prompt, into the negative
+        let (out, neg) = both("1girl, realistic, smile", 0, 6, true);
+        assert!(!out.contains("realistic") && neg.contains("realistic"), "{out} | {neg}");
+        // Exaggerated off: untouched
+        let (out, neg) = both("1girl, realistic, smile", 0, 6, false);
+        assert!(out.contains("realistic") && !neg.split(", ").any(|t| t == "realistic"), "{out} | {neg}");
+        // slender build with a Shortstack pick (2) or a typed petite, in both modes
+        for (prompt, frame) in [("1girl, (slender build:1.15), smile", 2), ("1girl, petite, slender build, smile", 0)] {
+            for ex in [false, true] {
+                let (out, neg) = both(prompt, frame, 0, ex);
+                assert!(!out.contains("slender build") && neg.contains("slender build"), "{prompt} {ex}: {out} | {neg}");
+            }
+        }
+        // no shortstack / petite: slender build stays
+        assert!(both("1girl, slender build, smile", 0, 0, false).0.contains("slender build"));
+    }
+
+    #[test]
+    fn section_blocks_dont_bring_back_a_removed_scene_box_tag() {
+        use crate::profiles::CheckpointProfile as C;
+        let mut c = cfg(TargetView::None);
+        c.checkpoint = C::Anima;
+        c.frame = 2;
+        c.bust = 6;
+        c.exaggerated_proportions = true;
+        // a Scene / Pose reference put `realistic` in the Scene box; the rules see it with character 1
+        c.scene_prompt_raw = "bed, indoors, realistic".into();
+        let before = crate::render::with_scene("1girl, white shirt, sitting", &c);
+        let out = run(&before, &c).1;
+        assert!(!out.contains("realistic"), "{out}");
+        // what render does for the Section Blocks view: the box minus the tags the rules removed
+        let kept: Vec<String> = crate::parser::parse_prompt(&out).into_iter().map(|t| t.normalized).collect();
+        let mut bc = c.clone();
+        bc.scene_prompt_raw = crate::parser::parse_prompt(&c.scene_prompt_raw)
+            .into_iter()
+            .filter(|t| kept.contains(&t.normalized))
+            .map(|t| t.raw)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let blocks = crate::two::combine_section_blocks(&[out], &bc, true, None);
+        assert!(!blocks.contains("realistic") && blocks.contains("bed") && blocks.contains("indoors"), "{blocks}");
+        // without the filter the raw box brings it back (the bug)
+        let unfiltered = crate::two::combine_section_blocks(&[run(&before, &c).1], &c, true, None);
+        assert!(unfiltered.contains("realistic"), "{unfiltered}");
+    }
+
+    #[test]
+    fn a_deep_scan_rewrite_cannot_undo_the_body_rules() {
+        use crate::profiles::CheckpointProfile as C;
+        let mut c = cfg(TargetView::None);
+        c.checkpoint = C::Anima;
+        c.frame = 2; // Shortstack
+        c.bust = 6;
+        c.exaggerated_proportions = true;
+        // what a model might write back: realism, a slender build, full-strength breasts apart with a shirt, no weights
+        let ai = "masterpiece, 1girl, realistic, slender build, gigantic breasts, breasts apart, white shirt, smile, beach";
+        let out = crate::ai_engine::body_choices_in(ai, &c);
+        assert!(!out.contains("realistic") && !out.contains("slender build"), "{out}");
+        assert!(out.contains("(breasts apart:0.7)") && out.contains("(gigantic breasts:2.5)") && out.contains("(shortstack:1.4)"), "{out}");
+        assert!(out.contains("narrow shoulders") && out.contains("exaggerated proportions") && out.contains("sagging breasts"), "{out}");
+        assert!(out.contains("white shirt") && out.contains("beach"), "{out}");
+        // the stored result is tidied first (weights capped at 1.35), then the body rules: 2.5 survives
+        let stored = crate::ai_engine::body_choices_in(&crate::condenser::tidy_ai_prompt("1girl, (gigantic breasts:1.35), smile", C::Anima), &c);
+        assert!(stored.contains("(gigantic breasts:2.5)") && !stored.contains("1.35"), "{stored}");
+        // no picks, no Exaggerated: only the picks-independent rules (breasts apart next to cleavage goes)
+        let plain = cfg(TargetView::None);
+        assert_eq!(crate::ai_engine::body_choices_in("1girl, breasts apart, cleavage, bikini", &plain), "1girl, cleavage, bikini");
+        assert_eq!(crate::ai_engine::body_choices_in("1girl, realistic, smile", &plain), "1girl, realistic, smile");
+    }
+
+    #[test]
+    fn big_bust_picks_bring_their_shape_tags() {
+        use crate::profiles::CheckpointProfile as C;
+        let out = |cp: C, bust: usize, ex: bool| {
+            let mut c = cfg(TargetView::None);
+            c.checkpoint = cp;
+            c.bust = bust;
+            c.exaggerated_proportions = ex;
+            run("1girl, smile", &c).1
+        };
+        // Anima, Large: all three, plain
+        let a = out(C::Anima, 4, false);
+        assert!(a.contains("sagging breasts") && a.contains("soft breasts") && a.contains("heavy breasts"), "{a}");
+        // Pony: only the real tag
+        let p = out(C::PonyV6, 6, false);
+        assert!(p.contains("sagging breasts") && !p.contains("soft breasts") && !p.contains("heavy breasts"), "{p}");
+        // Medium and below: none
+        assert!(!out(C::Anima, 3, false).contains("sagging"));
+        // Exaggerated weights the size, never the shape tags
+        let e = out(C::Anima, 6, true);
+        assert!(e.contains("(gigantic breasts:2.5)") && e.contains("sagging breasts") && !e.contains("(sagging"), "{e}");
+        // AI views get them too
+        let mut c = cfg(TargetView::None);
+        c.checkpoint = C::Anima;
+        c.bust = 5;
+        let ai = crate::ai_engine::body_choices_in("1girl, smile, beach", &c);
+        assert!(ai.contains("huge breasts") && ai.contains("sagging breasts") && ai.contains("heavy breasts"), "{ai}");
+    }
+
+    #[test]
+    fn prompt_options_are_real_danbooru_tags() {
+        let Some(list) = crate::danbooru::local() else { return };
+        let config = cfg(TargetView::None);
+        let prompts = [
+            "1girl, solo, classroom, school uniform",
+            "1girl, solo, very long hair, night, city",
+            "1girl, standing, smile, beach, dress",
+            "1girl, solo, cape, bedroom",
+            "1girl, smiling, skirt, forest",
+            "1girl, neon, cyberpunk, ribbon",
+        ];
+        let mut seen = 0;
+        for p in prompts {
+            for c in run(p, &config).0.changes.iter().filter(|c| c.reason.starts_with("Prompt Option")) {
+                for t in c.suggested_alternative.split(',').map(str::trim) {
+                    assert!(list.get(t).is_some(), "'{t}' (from '{p}') isn't a Danbooru tag");
+                    seen += 1;
+                }
+            }
+        }
+        assert!(seen > 10, "the options should fire on these prompts");
+        // a night scene gets the night lighting card (night is a time, not a lighting effect)
+        assert!(run("1girl, solo, night, city", &config).0.changes.iter().any(|c| c.reason.contains("Night / Neon")));
+        // very long hair counts as long hair
+        assert!(run("1girl, solo, very long hair, smile, sunlight", &config).0.changes.iter().any(|c| c.reason.contains("Motion & Flow")));
+    }
+
+    #[test]
+    fn breasts_apart_is_toned_down_only_with_clothes_on() {
+        let config = cfg(TargetView::None);
+        let card = |p: &str| {
+            let (res, out) = run(p, &config);
+            (res.changes.into_iter().find(|c| c.original == "breasts apart" || c.suggested_alternative.contains("breasts apart")), out)
+        };
+        // clothed: an applied card lowering it to 0.7, and the outfit guarded in the negative
+        let (c, out) = card("1girl, gigantic breasts, breasts apart, white shirt, smile");
+        let c = c.expect("card");
+        assert_eq!((c.mode, c.suggested_alternative.as_str()), (0, "(breasts apart:0.7)"));
+        assert!(out.contains("(breasts apart:0.7)"), "{out}");
+        let neg = crate::condenser::recommended_negative(&config, &out);
+        assert!(neg.contains("topless") && neg.contains("torn clothes"), "{neg}");
+        // bare chest: as written, no card, nothing in the negative
+        let (c, out) = card("1girl, gigantic breasts, breasts apart, topless, skirt");
+        assert!(c.is_none() && out.contains("breasts apart") && !out.contains("0.7"), "{out}");
+        assert!(!crate::condenser::recommended_negative(&config, &out).contains("torn clothes"));
+        // no chest garment (only a skirt): nothing to fight
+        assert!(card("1girl, breasts apart, skirt").0.is_none());
+        // opposite tags: a conflict card removes `breasts apart`
+        let (res, out) = run("1girl, breasts apart, cleavage, bikini", &config);
+        assert!(res.changes.iter().any(|c| c.original == "breasts apart" && c.action == ChangeAction::PoseConflict), "{:?}", res.changes);
+        assert!(!out.contains("breasts apart"), "{out}");
     }
 
     #[test]

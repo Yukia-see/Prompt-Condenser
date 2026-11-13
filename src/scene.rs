@@ -271,7 +271,7 @@ fn is_hair(n: &str) -> bool {
 }
 
 /// Matches whole words only (so "day" doesn't match "birthday").
-fn has_word(text: &str, words: &[&str]) -> bool {
+pub(crate) fn has_word(text: &str, words: &[&str]) -> bool {
     words.iter().any(|w| {
         text == *w
             || text.split(|c: char| !c.is_alphanumeric() && c != '-').any(|part| part == *w)

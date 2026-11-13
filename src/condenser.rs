@@ -567,6 +567,25 @@ pub fn recommended_negative(config: &ScanConfig, positive: &str) -> String {
     }
 
     let legs_apart = pos_tokens.iter().any(|t| crate::analyzer::legs_apart(&t.normalized));
+    // a slender build stretches a shortstack / petite figure (removed from the positive too)
+    if matches!(frame_label(config.frame), "shortstack" | "petite")
+        || pos_tokens.iter().any(|t| matches!(t.normalized.as_str(), "shortstack" | "petite"))
+    {
+        if !auto_negs.iter().any(|a| a == "slender build") {
+            auto_negs.push("slender build".to_string());
+        }
+    }
+    // `breasts apart` with clothes on: keep the outfit on (the tag pulls toward topless / torn tops)
+    if pos_tokens.iter().any(|t| t.normalized == "breasts apart")
+        && !crate::analyzer::chest_is_bare(&pos_tokens)
+        && pos_tokens.iter().any(|t| crate::analyzer::covers_chest(&t.normalized))
+    {
+        for t in ["topless", "nude", "torn clothes"] {
+            if !auto_negs.iter().any(|a| a == t) {
+                auto_negs.push(t.to_string());
+            }
+        }
+    }
     let is_shortstack = pos_tokens.iter().any(|t| t.normalized == "shortstack")
         || config.frame == 2;
     for (tier, _) in prop_tiers {
@@ -662,7 +681,9 @@ pub fn recommended_negative(config: &ScanConfig, positive: &str) -> String {
         } else {
             EXAGGERATED_ERROR_GUARD
         };
-        for t in frame_negs.iter().chain(bust_negs).chain(guard) {
+        // realism pulls the body back toward real proportions (removed from the positive too)
+        let realism: &[&str] = if config.bust > 0 || config.frame > 0 { &["realistic"] } else { &[] };
+        for t in frame_negs.iter().chain(bust_negs).chain(guard).chain(realism) {
             if !auto_negs.iter().any(|a| a == t) {
                 auto_negs.push(t.to_string());
             }

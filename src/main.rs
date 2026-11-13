@@ -103,6 +103,8 @@ struct AppState {
     chip_off: std::collections::HashMap<render::CardKey, std::collections::HashSet<String>>,
     /// The folded "N small fixes" card is opened (not saved).
     fixes_expanded: bool,
+    /// Each 💡 Ideas card's chips that start off (all options but the first), so Reset can restore them.
+    idea_chip_defaults: std::collections::HashMap<render::CardKey, std::collections::HashSet<String>>,
     /// The prompt the last image read put into Before (1 Character tab): a Deep Scan of exactly this prompt
     /// gets the read's tags it dropped put back (`deep_scan.rs`).
     image_prompt: Option<String>,
@@ -237,7 +239,11 @@ struct SceneResult {
 }
 
 impl SceneResult {
-    fn from_ai(out: &ai_engine::AiJsonOutput, checkpoint: CheckpointProfile) -> Option<Self> {
+    fn from_ai(out: &ai_engine::AiJsonOutput, config: &analyzer::ScanConfig) -> Option<Self> {
+        let checkpoint = config.checkpoint;
+        // tidy_ai_prompt caps weights at the checkpoint's safe maximum (1.35 on Anima); the body rules run after it,
+        // so Exaggerated's emphasis (bust :2.5…) survives, as in the rule view
+        let tidy = |t: &str| ai_engine::body_choices_in(&condenser::tidy_ai_prompt(t, checkpoint), config);
         let b = &out.scene_breakdown;
         let details = [
             ("Subject", &b.subject),
@@ -263,9 +269,9 @@ impl SceneResult {
             summary: out.scene_summary.trim().to_string(),
             details,
             issues,
-            improved_prompt: condenser::tidy_ai_prompt(&out.improved_prompt, checkpoint),
+            improved_prompt: tidy(&out.improved_prompt),
             recommended_negative: condenser::tidy_ai_prompt(&out.recommended_negative, checkpoint),
-            dynamic_prompt: condenser::tidy_ai_prompt(&out.dynamic_prompt, checkpoint),
+            dynamic_prompt: tidy(&out.dynamic_prompt),
             natural_sentence: out.natural_sentence.trim().replace('\n', " "),
         };
         (!result.summary.is_empty() || !result.improved_prompt.is_empty()).then_some(result)

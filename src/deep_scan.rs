@@ -151,7 +151,7 @@ pub(crate) fn wire_deep_scan(ui: &AppWindow, state: &State) {
                                             restored_tags = dropped.len();
                                         }
                                     }
-                                    st.ai_scene = SceneResult::from_ai(&ai_out, scan_config(&ui).checkpoint);
+                                    st.ai_scene = SceneResult::from_ai(&ai_out, &scan_config(&ui));
                                     st.ai_key = Some(ai_key(&ui));
                                     st.ai_changes.len() + st.others.iter().map(|o| o.ai_changes.len()).sum::<usize>()
                                 };
