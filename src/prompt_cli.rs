@@ -40,7 +40,7 @@ const USAGE: &str = "usage: prompt-condenser --prompt \"<text>\" | - [--checkpoi
                      [--view none|turnaround|360|upper-body|close-up|front|from-behind|side|full-body] \
                      [--bust none|flat|small|medium|large|huge|gigantic] \
                      [--frame none|petite|shortstack|thick|pear|hourglass|muscular] [--no-fit-suggestions] \
-                     [--exaggerated] \
+                     [--exaggerated] [--widescreen | --aspect 16:9|21:9] \
                      [--vrp --char \"<prompt>\" --char \"<prompt>\" (2-4) [--image <path>] [--regions \"x,y,w,h;...\"]] \
                      [--export comfyui|webui|novelai|plain]";
 
@@ -52,6 +52,7 @@ struct Options {
     arranged: bool,
     natural: bool,
     exaggerated: bool,
+    widescreen: bool,
     view: TargetView,
     /// `--bust` / `--frame`: indexes into `profiles::BUSTS` / `FRAMES` (0 = none).
     bust: usize,
@@ -75,6 +76,7 @@ impl Default for Options {
             arranged: false,
             natural: false,
             exaggerated: false,
+            widescreen: false,
             view: TargetView::None,
             bust: 0,
             frame: 0,
@@ -208,6 +210,14 @@ fn parse_args(args: &[String], stdin: impl FnOnce() -> Result<String>) -> Result
             "--regions" => opts.regions = Some(parse_regions(it.next().ok_or_else(|| anyhow!("--regions needs boxes\n{USAGE}"))?)?),
             "--natural" => opts.natural = true,
             "--exaggerated" | "--exaggerated-proportions" => opts.exaggerated = true,
+            "--widescreen" => opts.widescreen = true,
+            "--aspect" => {
+                let v = it.next().ok_or_else(|| anyhow!("--aspect needs a ratio (e.g. 16:9)\n{USAGE}"))?;
+                let norm = v.trim().to_ascii_lowercase();
+                if matches!(norm.as_str(), "16:9" | "21:9" | "wide" | "widescreen") {
+                    opts.widescreen = true;
+                }
+            }
             "--export" => {
                 let v = it.next().ok_or_else(|| anyhow!("--export needs a format\n{USAGE}"))?;
                 opts.export = ExportFormat::from_name(v).ok_or_else(|| anyhow!("unknown format {v}: use comfyui, webui, novelai or plain"))?;
@@ -293,10 +303,73 @@ fn change_json(c: &crate::analyzer::PromptChange) -> serde_json::Value {
     })
 }
 
+/// True when `prompt` describes a single character (and not a group/couple/crowd).
+fn is_single_character_prompt(prompt: &str) -> bool {
+    let toks = parser::parse_prompt(prompt);
+    let has_multi = toks.iter().any(|t| {
+        let n = t.normalized.as_str();
+        matches!(n, "multiple girls" | "multiple boys" | "crowd" | "group" | "couple")
+            || crate::two::count_tag(n).is_some_and(|(cnt, _)| cnt >= 2)
+    });
+    if has_multi {
+        return false;
+    }
+    toks.iter().any(|t| {
+        let n = t.normalized.as_str();
+        n == "solo" || crate::two::count_tag(n).is_some_and(|(cnt, _)| cnt == 1)
+    })
+}
+
+/// ComfyUI 16:9 / widescreen single-character guard: prevents extra people or clones
+/// from spawning in the extra horizontal space.
+fn apply_widescreen_single_char_guard(positive: &str, negative: &str, checkpoint: CheckpointProfile) -> (String, String) {
+    if !is_single_character_prompt(positive) {
+        return (positive.to_string(), negative.to_string());
+    }
+    let toks = parser::parse_prompt(positive);
+    let has_norm = |tag: &str| toks.iter().any(|t| t.normalized == tag);
+
+    let mut pos_add: Vec<&str> = Vec::new();
+    if !has_norm("solo") {
+        pos_add.push("solo");
+    }
+    if checkpoint.supports_natural_language() {
+        if !has_norm("single character only") {
+            pos_add.push("single character only");
+        }
+        if !has_norm("one person alone in frame") {
+            pos_add.push("one person alone in frame");
+        }
+    }
+    // (not `solo focus`: on Danbooru it means several people with one in focus, which invites the extra people)
+
+    let new_pos = if pos_add.is_empty() {
+        positive.to_string()
+    } else if positive.trim().is_empty() {
+        pos_add.join(", ")
+    } else {
+        format!("{}, {}", positive.trim().trim_end_matches(','), pos_add.join(", "))
+    };
+
+    // Flux runs at CFG 1 without a negative prompt: only the positive part applies there
+    if checkpoint.default_negative().is_empty() {
+        return (new_pos, negative.to_string());
+    }
+    const WIDE_SOLO_NEG: &str = "2girls, 2boys, multiple girls, multiple boys, multiple views, split screen, \
+        clone, cloned, duplicate, twin, twins, doppelganger, extra people, crowd, background characters, two people";
+    let combined_neg = if negative.trim().is_empty() {
+        WIDE_SOLO_NEG.to_string()
+    } else {
+        format!("{}, {}", negative.trim().trim_end_matches(','), WIDE_SOLO_NEG)
+    };
+    let new_neg = condenser::merge_negative(&combined_neg, &new_pos);
+    (new_pos, new_neg)
+}
+
 /// The JSON `--prompt` prints.
 fn condense(o: &Options, detected: &Detected) -> serde_json::Value {
     let config = config_for(o);
-    let (result, out, positive) = clean(&o.text, &config, true);
+    let (result, out, mut positive) = clean(&o.text, &config, true);
     let mut changes: Vec<serde_json::Value> = result.changes.iter().map(change_json).collect();
 
     // --vrp: each character on its own, like the window's multi-character tabs
@@ -319,7 +392,12 @@ fn condense(o: &Options, detected: &Detected) -> serde_json::Value {
 
     // nothing the scene or a character asks for goes into the negative
     let asked = std::iter::once(positive.clone()).chain(regions_prompts.iter().cloned()).collect::<Vec<_>>().join(",\n");
-    let negative = condenser::recommended_negative(&config, &asked);
+    let mut negative = condenser::recommended_negative(&config, &asked);
+    if o.widescreen && !o.vrp {
+        let (guarded_pos, guarded_neg) = apply_widescreen_single_char_guard(&positive, &negative, config.checkpoint);
+        positive = guarded_pos;
+        negative = guarded_neg;
+    }
     let mut v = serde_json::json!({
         "checkpoint": format!("{:?}", config.checkpoint),
         "view": format!("{:?}", config.target_view),
@@ -402,6 +480,22 @@ pub fn run_prompt_cli(args: &[String]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn widescreen_guard_is_for_one_character_and_never_adds_solo_focus() {
+        let (p, n) = apply_widescreen_single_char_guard("1girl, red hair, beach", "lowres", CheckpointProfile::PonyV6);
+        assert!(p.contains("solo") && !p.contains("solo focus"), "{p}");
+        assert!(n.contains("multiple girls") && n.contains("clone") && n.starts_with("lowres"), "{n}");
+        // Anima reads plain words: the two phrases too
+        let (p, _) = apply_widescreen_single_char_guard("1girl, beach", "lowres", CheckpointProfile::Anima);
+        assert!(p.contains("single character only"), "{p}");
+        // Flux: no negative
+        let (_, n) = apply_widescreen_single_char_guard("1girl, beach", "", CheckpointProfile::Flux);
+        assert!(n.is_empty(), "{n}");
+        // two characters: untouched
+        let (p, n) = apply_widescreen_single_char_guard("2girls, beach", "lowres", CheckpointProfile::PonyV6);
+        assert_eq!((p.as_str(), n.as_str()), ("2girls, beach", "lowres"));
+    }
+
     use super::*;
 
     fn args(v: &[&str]) -> Vec<String> {
