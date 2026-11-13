@@ -810,7 +810,7 @@ component CardsPanel inherits M3Card {
 
         if root.live-headline == "" && root.cards.length == 0 : Text {
             vertical-stretch: 1;
-            text: "Paste a prompt below (or use From Image… / Scene Ref…) to see the live scene breakdown, conflicts, and fixes.";
+            text: root.filter-counts[0] > 0 ? "No cards in this tab. Pick another tab above." : "Paste a prompt below (or use From Image… / Scene Ref…) to see the live scene breakdown, conflicts, and fixes.";
             font-size: 12px;
             color: M3.on-surface-variant;
             wrap: word-wrap;
@@ -1709,7 +1709,8 @@ export component AppWindow inherits Window {
     /// own layout info.
     in-out property <bool> narrow: false;
     property <[string]> checkpoint-names: ["Anima", "Pony V6", "Illustrious", "SDXL", "SD 1.5", "Flux"];
-    property <bool> cards-empty: root.change_cards.length == 0 && root.scene_summary == "";
+    // all cards, not just the filter tab's (a tab with 0 cards must not collapse the strip and hide the tabs)
+    property <bool> cards-empty: root.card_filter_counts[0] == 0 && root.scene_summary == "";
     /// Copy format next to After's Copy (saved; condenser::ExportFormat order).
     in-out property <int> export_index: 0;
     /// Option chips that differ from their defaults (shown on the collapsed Options toggle).
@@ -3082,6 +3083,26 @@ export component AppWindow inherits Window {
                                     regions: root.vrp_preview;
                                     aspect: root.vrp_preview_aspect;
                                     clicked => { root.edit_vrp_requested(); }
+                                }
+                                // 💡 Ideas also on a clean prompt (the strip with its header button is folded away then)
+                                if root.raw_prompt != "" : Rectangle {
+                                    width: ideas-lbl.preferred-width + 16px;
+                                    border-radius: 6px;
+                                    accessible-role: button;
+                                    accessible-label: "💡 Ideas (banner)";
+                                    background: ideas-ta.has-hover && root.ollama_connected && !root.ideas_busy ? M3.secondary-container : transparent;
+                                    ideas-lbl := Text {
+                                        text: root.ideas_busy ? "💡 Thinking…" : "💡 Ideas";
+                                        font-size: 11px;
+                                        font-weight: 700;
+                                        color: root.ollama_connected && !root.ideas_busy ? M3.primary : M3.outline;
+                                        vertical-alignment: center;
+                                    }
+                                    ideas-ta := TouchArea {
+                                        enabled: root.ollama_connected && !root.ideas_busy;
+                                        mouse-cursor: MouseCursor.pointer;
+                                        clicked => { root.ideas_requested(); }
+                                    }
                                 }
                                 Text {
                                     text: root.cards_peek ? "Hide scene ▴" : "Show scene ▾";

@@ -472,6 +472,18 @@ fn balance_brackets(text: &str) -> String {
     let mut keep = vec![true; chars.len()];
     let mut open: Vec<usize> = Vec::new();
     for (i, &c) in chars.iter().enumerate() {
+        let escaped = {
+            let mut slashes = 0usize;
+            let mut k = i;
+            while k > 0 && chars[k - 1] == '\\' {
+                slashes += 1;
+                k -= 1;
+            }
+            slashes % 2 == 1
+        };
+        if escaped {
+            continue;
+        }
         match c {
             '(' | '[' => open.push(i),
             ')' | ']' => {

@@ -116,6 +116,9 @@ fn every_tab_and_overlay_renders_headless() {
         },
         ChangeCardItem { id: -1, badge: "SMALL FIXES".into(), badge_kind: 2, reason: "3 small fixes".into(), summary_count: 3, ..Default::default() },
     ])));
+    // the strip's tab counts (render fills them in the app): 4 cards, so the strip is open
+    let counts = ModelRc::new(VecModel::from(vec![4, 1, 2, 0, 1]));
+    ui.set_card_filter_counts(counts.clone());
     let chars: Vec<ScenePanelChar> = (1..=4)
         .map(|i| ScenePanelChar { title: format!("Character {i}").into(), actions: "standing".into(), has_actions: true, ..Default::default() })
         .collect();
@@ -207,13 +210,20 @@ fn every_tab_and_overlay_renders_headless() {
             ui.set_negative_text("".into());
             render(&ui, &format!("{at}, no negative"));
             ui.set_negative_text("lowres, bad hands".into());
+            // a filter tab with no cards: the strip (and its tabs) must stay open
             ui.set_change_cards(ModelRc::new(VecModel::<ChangeCardItem>::default()));
+            ui.set_card_filter(1);
+            render(&ui, &format!("{at}, empty filter tab"));
+            assert_reachable(&ui, &format!("{at}, empty filter tab"));
+            ui.set_card_filter(0);
+            ui.set_card_filter_counts(ModelRc::new(VecModel::from(vec![0, 0, 0, 0, 0])));
             ui.set_scene_summary("".into());
             render(&ui, &format!("{at}, cards collapsed"));
             ui.set_cards_peek(true);
             render(&ui, &format!("{at}, cards peek"));
             ui.set_cards_peek(false);
             ui.set_change_cards(cards.clone());
+            ui.set_card_filter_counts(counts.clone());
         }
     }
     ui.hide().unwrap();

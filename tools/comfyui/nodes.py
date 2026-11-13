@@ -366,7 +366,7 @@ class PromptCondenserVRP:
                 regions_source = live_data.get("regions_source", "live_stream")
                 summary = f"VRP Streamed from Prompt Condenser (source: {regions_source})"
                 return (scene_pos, scene_neg, vrp_state, summary)
-            elif live_data and not vrp_state_raw:
+            elif live_data:
                 fallback_msg = "app is not on a multi-character tab"
             else:
                 fallback_msg = err
@@ -404,8 +404,8 @@ class PromptCondenserVRP:
         temp_img_path = None
         if image is not None:
             # Save frame for person detector bounding boxes
-            frame = image[0] if image.ndim == 4 else image
-            np_frame = (frame.cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
+            img_frame = image[0] if image.ndim == 4 else image
+            np_frame = (img_frame.cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
             pil_img = Image.fromarray(np_frame)
             with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
                 temp_img_path = f.name
