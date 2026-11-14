@@ -2211,6 +2211,9 @@ pub fn body_rule_fixups(text: &str, config: &ScanConfig) -> String {
             tokens.push(crate::parser::parse_prompt(tag).remove(0));
         }
     };
+    for tag in shortstack_structure(config) {
+        add(tag, &mut tokens);
+    }
     if config.exaggerated_proportions {
         if matches!(frame, "pear" | "shortstack") && config.checkpoint.supports_natural_language() {
             add("narrow shoulders", &mut tokens);
@@ -2224,6 +2227,38 @@ pub fn body_rule_fixups(text: &str, config: &ScanConfig) -> String {
         return text.to_string();
     }
     after.join(", ")
+}
+
+/// The structural words an "Exaggerated" Shortstack pick adds (the user's request, 2026-11-13): compact height
+/// spelled out, since `petite` alone reads as slim and normal height and low angles stretch the figure. Plain words,
+/// so only on checkpoints that read them (Anima / SDXL / Flux).
+pub fn shortstack_structure(config: &ScanConfig) -> &'static [&'static str] {
+    if !config.exaggerated_proportions || crate::condenser::frame_label(config.frame) != "shortstack" {
+        return &[];
+    }
+    if config.checkpoint.supports_natural_language() {
+        &["short", "short legs", "short torso", "plump", "soft body", "stylized", "anime proportions"]
+    } else {
+        // CLIP checkpoints only read real tags: `plump` is one
+        &["plump"]
+    }
+}
+
+/// The body sentence an "Exaggerated" Shortstack adds to the scene prose (one character, plain-word checkpoints):
+/// neutral prose made the model fall back to standard anatomy.
+pub fn shortstack_sentence(config: &ScanConfig) -> Option<&'static str> {
+    (config.checkpoint.supports_natural_language() && !shortstack_structure(config).is_empty() && !config.two_char).then_some(
+        "She is a short, compact shortstack with short legs, a short torso and a plump, soft body with wide hips and thick thighs, drawn with stylized, exaggerated anime proportions, not realistic ones.",
+    )
+}
+
+/// A scene sentence with the Shortstack body sentence in front of it (when it applies and isn't there yet).
+pub fn with_body_sentence(sentence: Option<&str>, config: &ScanConfig) -> Option<String> {
+    match (shortstack_sentence(config), sentence) {
+        (Some(body), Some(s)) if !s.contains(body) => Some(format!("{body} {s}")),
+        (Some(body), None) => Some(body.to_string()),
+        (_, s) => s.map(str::to_string),
+    }
 }
 
 /// Realism tags that pull an exaggerated body back toward real proportions.
@@ -2988,6 +3023,19 @@ pub fn analyze_with_rules(tokens: &[PromptToken], config: &ScanConfig) -> RuleAn
         processed_tokens.push(t);
     }
 
+    // "Exaggerated" Shortstack: structural words that pin the compact height (plain words, not Danbooru tags, so
+    // only where the checkpoint reads them); `petite` alone reads as slim and of normal height
+    for tag in shortstack_structure(config) {
+        if !processed_tokens.iter().any(|t| t.normalized == *tag) {
+            let mut t = crate::parser::parse_prompt(tag).remove(0);
+            t.added = true;
+            t.original_index = 942;
+            t.category = TokenCategory::CharacterBody;
+            dropdown_body.push(t.clone());
+            processed_tokens.push(t);
+        }
+    }
+
     // A big bust pick (Large / Huge / Gigantic) also gets its shape: `sagging breasts` everywhere, `soft breasts` /
     // `heavy breasts` (not Danbooru tags) only where the checkpoint reads plain words. Plain, never emphasized.
     for tag in bust_shape_tags(config.bust, config.checkpoint) {
@@ -3697,6 +3745,23 @@ pub fn analyze_with_rules(tokens: &[PromptToken], config: &ScanConfig) -> RuleAn
         }
     }
 
+    // A low angle stretches the figure taller, against a compact Shortstack: an opt-in card offers `from above`
+    if (crate::condenser::frame_label(config.frame) == "shortstack" || processed_tokens.iter().any(|t| t.normalized == "shortstack"))
+        && processed_tokens.iter().any(|t| t.normalized == "from below")
+        && !processed_tokens.iter().any(|t| t.normalized == "from above")
+    {
+        changes.push(PromptChange {
+            id: next_change_id,
+            original: "from below".to_string(),
+            action: ChangeAction::Recommendation,
+            reason: "Shortstack + a low angle: 'from below' foreshortens the body and stretches the legs, so the figure reads tall. 'from above' keeps it compact. Your angle stays unless you accept.".to_string(),
+            suggested_alternative: "from above".to_string(),
+            framing_alternative: String::new(),
+            mode: 2,
+        });
+        next_change_id += 1;
+    }
+
     // The hips lock puts `thigh gap` in the negative (condenser::recommended_negative), except with the legs apart:
     // say so, so a missing `thigh gap` in the negative isn't a surprise
     if processed_tokens.iter().any(|t| matches!(t.normalized.as_str(), "thick thighs" | "wide hips"))
@@ -3954,10 +4019,11 @@ pub fn body_emphasis(checkpoint: crate::profiles::CheckpointProfile, tag: &str, 
         C::Flux => 1.0,
         // the waist cinch of the figures that have one (an hourglass leans on it most), and Muscular's abs
         C::Anima if tag == "narrow waist" && label == "hourglass" => 1.3,
-        _ if tag == "narrow waist" && matches!(label, "shortstack" | "pear" | "hourglass") => 1.2,
+        // (not Shortstack: its `plump, soft body` would fight a cinched waist; the waist tag stays, plain)
+        _ if tag == "narrow waist" && matches!(label, "pear" | "hourglass") => 1.2,
         _ if tag == "abs" && label == "muscular" => 1.2,
         C::Anima if is_bust => 2.5,
-        C::Anima if tag == "shortstack" => 1.4,
+        C::Anima if tag == "shortstack" => 1.45,
         C::Anima if key_frame_tag => 1.5,
         _ if is_bust => 1.4,
         _ if key_frame_tag => 1.2,
@@ -4297,8 +4363,9 @@ pub fn strip_lora_tokens(tokens: Vec<PromptToken>, lora_raw: &str, strip_conflic
 /// Final touches for any After view: the LoRA box, the natural-language sentence
 /// (only when on and the checkpoint understands it) and the arranged layout.
 pub fn finish_prompt(text: &str, config: &ScanConfig, strip_conflicts: bool, sentence: Option<&str>) -> String {
+    let sentence = with_body_sentence(sentence.map(str::trim).filter(|s| !s.is_empty()), config);
     let sentence = sentence
-        .map(str::trim)
+        .as_deref()
         .filter(|s| config.natural && config.checkpoint.supports_natural_language() && !s.is_empty());
     if config.arranged && config.checkpoint != crate::profiles::CheckpointProfile::Flux {
         let tokens = without_lora_tags(text, config, strip_conflicts);
@@ -4724,9 +4791,10 @@ mod tests {
             run(prompt, &c).1
         };
         let anima = out_for(C::Anima, true, "1girl, smile");
-        assert!(anima.contains("(gigantic breasts:2.5)") && anima.contains("(shortstack:1.4)") && anima.contains("(wide hips:1.5)"), "{anima}");
-        // the waist cinch gets a light 1.2 (the user's plan); curvy and petite stay plain
-        assert!(anima.contains("(narrow waist:1.2)") && !anima.contains("(curvy:") && !anima.contains("(petite:"), "{anima}");
+        assert!(anima.contains("(gigantic breasts:2.5)") && anima.contains("(shortstack:1.45)") && anima.contains("(wide hips:1.5)"), "{anima}");
+        // Shortstack's waist stays plain next to `plump` (2026-11-13); curvy and petite stay plain
+        assert!(anima.contains("narrow waist") && !anima.contains("(narrow waist:") && !anima.contains("(curvy:") && !anima.contains("(petite:"), "{anima}");
+        assert!(anima.contains("(shortstack:1.45)") && anima.contains("plump") && anima.contains("short legs"), "{anima}");
         let pony = out_for(C::PonyV6, true, "1girl, smile");
         assert!(pony.contains("(gigantic breasts:1.4)") && pony.contains("(shortstack:1.2)"), "{pony}");
         // off: plain tags
@@ -4852,7 +4920,7 @@ mod tests {
         let ai = "masterpiece, 1girl, realistic, slender build, gigantic breasts, breasts apart, white shirt, smile, beach";
         let out = crate::ai_engine::body_choices_in(ai, &c);
         assert!(!out.contains("realistic") && !out.contains("slender build"), "{out}");
-        assert!(out.contains("(breasts apart:0.7)") && out.contains("(gigantic breasts:2.5)") && out.contains("(shortstack:1.4)"), "{out}");
+        assert!(out.contains("(breasts apart:0.7)") && out.contains("(gigantic breasts:2.5)") && out.contains("(shortstack:1.45)") && out.contains("plump"), "{out}");
         assert!(out.contains("narrow shoulders") && out.contains("exaggerated proportions") && out.contains("sagging breasts"), "{out}");
         assert!(out.contains("white shirt") && out.contains("beach"), "{out}");
         // the stored result is tidied first (weights capped at 1.35), then the body rules: 2.5 survives
@@ -4862,6 +4930,35 @@ mod tests {
         let plain = cfg(TargetView::None);
         assert_eq!(crate::ai_engine::body_choices_in("1girl, breasts apart, cleavage, bikini", &plain), "1girl, cleavage, bikini");
         assert_eq!(crate::ai_engine::body_choices_in("1girl, realistic, smile", &plain), "1girl, realistic, smile");
+    }
+
+    #[test]
+    fn exaggerated_shortstack_spells_out_its_height() {
+        use crate::profiles::CheckpointProfile as C;
+        let with = |cp: C, prompt: &str| {
+            let mut c = cfg(TargetView::None);
+            c.checkpoint = cp;
+            c.frame = 2;
+            c.exaggerated_proportions = true;
+            c.natural = true;
+            let (res, out) = run(prompt, &c);
+            let neg = crate::condenser::recommended_negative(&c, &out);
+            (res, crate::analyzer::finish_prompt(&out, &c, true, None), neg)
+        };
+        // Anima: the structural words, the body sentence, the adult guard
+        let (_, out, neg) = with(C::Anima, "1girl, smile");
+        for t in ["(shortstack:1.45)", "short legs", "short torso", "plump", "soft body", "anime proportions"] {
+            assert!(out.contains(t), "{t}: {out}");
+        }
+        assert!(out.contains("She is a short, compact shortstack"), "{out}");
+        assert!(neg.contains("child") && neg.contains("loli") && neg.contains("aged down"), "{neg}");
+        // Pony: only the real tag `plump`, no sentence words
+        let (_, out, _) = with(C::PonyV6, "1girl, smile");
+        assert!(out.contains("plump") && !out.contains("short legs") && !out.contains("She is"), "{out}");
+        // a low angle gets an opt-in card offering `from above`
+        let (res, out, _) = with(C::Anima, "1girl, smile, from below");
+        assert!(res.changes.iter().any(|c| c.original == "from below" && c.suggested_alternative == "from above" && c.mode == 2));
+        assert!(out.contains("from below"), "unchanged until accepted: {out}");
     }
 
     #[test]

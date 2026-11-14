@@ -659,8 +659,9 @@ pub fn recommended_negative(config: &ScanConfig, positive: &str) -> String {
         }
         // each figure's opposite silhouette (non-tag words are fine in a negative: they still steer)
         let frame_negs: &[&str] = match frame_label(config.frame) {
-            "petite" => &["tall", "long legs", "long torso", "broad shoulders", "giantess"],
-            "shortstack" => &["tall", "long legs", "long torso", "long neck", "lanky", "broad shoulders"],
+            // shortstack / petite are adult bodies: the adult guard keeps the compact height from reading as a child
+            "petite" => &["tall", "long legs", "long torso", "broad shoulders", "giantess", "child", "loli", "aged down"],
+            "shortstack" => &["tall", "long legs", "long torso", "long neck", "lanky", "broad shoulders", "child", "loli", "aged down"],
             "thick" => &["bowlegs", "knock-knees"],
             "pear" => &["broad shoulders", "wide shoulders", "muscular shoulders", "V-taper", "top-heavy"],
             "hourglass" => &["narrow shoulders", "boxy waist", "wide waist"],

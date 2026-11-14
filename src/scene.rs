@@ -926,7 +926,13 @@ pub fn describe_many(chars: &[Vec<PromptToken>], shared: &[PromptToken]) -> Scen
         second.push(format!("with {}", list(&sp.light, 2)));
     }
     if !sp.style.is_empty() {
-        second.push(format!("in a {} style", list(&sp.style, 2)));
+        // "an" before a vowel; the Shortstack body words (stylized, anime proportions) are body, not an art style
+        let styles: Vec<String> = sp.style.iter().filter(|x| !matches!(x.as_str(), "anime proportions" | "stylized")).cloned().collect();
+        if !styles.is_empty() {
+            let s = list(&styles, 2);
+            let article = if s.starts_with(['a', 'e', 'i', 'o', 'u']) { "an" } else { "a" };
+            second.push(format!("in {article} {s} style"));
+        }
     }
     if !second.is_empty() {
         let mut s = second.join(", ");
@@ -1197,7 +1203,13 @@ pub fn describe(tokens: &[PromptToken]) -> SceneDescription {
         second.push(format!("with {}", list(&p.light, 2)));
     }
     if !p.style.is_empty() {
-        second.push(format!("in a {} style", list(&p.style, 2)));
+        // "an" before a vowel; the Shortstack body words (stylized, anime proportions) are body, not an art style
+        let styles: Vec<String> = p.style.iter().filter(|x| !matches!(x.as_str(), "anime proportions" | "stylized")).cloned().collect();
+        if !styles.is_empty() {
+            let s = list(&styles, 2);
+            let article = if s.starts_with(['a', 'e', 'i', 'o', 'u']) { "an" } else { "a" };
+            second.push(format!("in {article} {s} style"));
+        }
     }
     let headline = if second.is_empty() {
         sentence

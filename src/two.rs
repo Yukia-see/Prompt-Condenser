@@ -727,6 +727,13 @@ pub fn vrp_state_json_from(prompts: &[String], regions: &[[f64; 4]], image_size:
 }
 
 pub fn combine_section_blocks(texts: &[String], config: &ScanConfig, strip_conflicts: bool, sentence: Option<&str>) -> String {
+    // the Shortstack body sentence goes into the [Scene] prose too (`analyzer::with_body_sentence`)
+    let body_sentence = if config.natural && config.checkpoint.supports_natural_language() {
+        crate::analyzer::with_body_sentence(sentence, config)
+    } else {
+        sentence.map(str::to_string)
+    };
+    let sentence = body_sentence.as_deref();
     let n = texts.len();
     let body_picks = crate::analyzer::chosen_body_tags(config);
     if n == 0 {
