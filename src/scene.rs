@@ -273,9 +273,12 @@ fn is_hair(n: &str) -> bool {
 /// Matches whole words only (so "day" doesn't match "birthday").
 pub(crate) fn has_word(text: &str, words: &[&str]) -> bool {
     words.iter().any(|w| {
-        text == *w
-            || text.split(|c: char| !c.is_alphanumeric() && c != '-').any(|part| part == *w)
-            || (w.contains(' ') && text.contains(w))
+        if w.contains(' ') {
+            crate::parser::has_phrase(text, w)
+        } else {
+            text == *w
+                || text.split(|c: char| !c.is_alphanumeric() && c != '-').any(|part| part == *w)
+        }
     })
 }
 
@@ -296,8 +299,8 @@ pub fn is_character_like(n: &str) -> bool {
         || has_word(n, TRAITS)
         || has_word(n, &["girl", "boy", "guy", "woman", "man", "female", "male", "person", "human", "character", "lady", "gentleman", "dude", "chibi", "doll", "figure", "model"])
         || is_hair(n)
-        || n.contains("eyes")
-        || n.contains("skin")
+        || has_word(n, &["eyes", "eye"])
+        || has_word(n, &["skin"])
         || n.contains("breast")
         || n.contains("cleavage")
         || n.contains("nipple")
@@ -488,11 +491,8 @@ pub(crate) fn slot(t: &PromptToken) -> Slot {
         Slot::Subject
     } else if is_hair(n) || has_word(n, &["ponytail", "twintails", "bangs", "braid", "bun", "ahoge", "sidelocks"]) {
         Slot::Hair
-    } else if n.contains("eyes") && !has_word(n, &["closed eyes", "one eye closed"])
-        || n.contains("pupils")
-        || n.contains("heterochromia")
-        || n.contains("eyebrow")
-        || n.contains("eyelash")
+    } else if (has_word(n, &["eyes"]) && !has_word(n, &["closed eyes", "one eye closed"]))
+        || has_word(n, &["pupils", "heterochromia", "eyebrow", "eyebrows", "eyelash", "eyelashes"])
     {
         Slot::Eyes
     } else if has_word(n, EXPRESSION) {
@@ -655,8 +655,10 @@ pub fn filter_identity_only_with_shape(prompt: &str, drop_body_shape: bool) -> S
 
     let has_long_hair = has("long hair") || has("very long hair");
     let has_sunglasses = norms.iter().any(|x| x.contains("sunglasses") || x.contains("eyewear"));
-    let has_blue_top_print = (has("spaghetti strap") || has("camisole") || has("tank top") || has("crop top") || has("tube top") || norms.iter().any(|x| x.contains("blue bikini") || x.contains("blue tube top")))
-        && (has("clothes writing") || has("print shirt") || has("text on clothes") || has_sunglasses);
+    let has_blue_top_print = norms
+        .iter()
+        .any(|x| x.contains("blue bikini") || x.contains("blue tube top"))
+        && (has("clothes writing") || has("print shirt") || has("text on clothes"));
 
     let mut out: Vec<String> = Vec::new();
     let push_uniq = |v: &mut Vec<String>, s: &str| {
@@ -730,7 +732,10 @@ pub fn filter_identity_only_with_shape(prompt: &str, drop_body_shape: bool) -> S
 
     for t in &parsed {
         let n = t.normalized.as_str();
-        if n.ends_with(" flag") || n.ends_with("_flag") || n.contains("flag") || t.raw.to_lowercase().contains("flag") {
+        if t.raw.trim().to_ascii_uppercase().ends_with("_FLAG")
+            || n.ends_with("_flag")
+            || matches!(n, "missing bottoms flag" | "unanchored limbs flag" | "missing_bottoms_flag" | "unanchored_limbs_flag")
+        {
             continue;
         }
         let gaze = n.starts_with("looking ") || n.ends_with(" gaze") || n == "eye contact";
@@ -809,7 +814,10 @@ pub fn filter_scene_and_pose_only_with_shape(prompt: &str, keep_unknown: bool, e
         .into_iter()
         .filter(|t| {
             let n = t.normalized.as_str();
-            if n.ends_with(" flag") || n.ends_with("_flag") || n.contains("flag") || t.raw.to_lowercase().contains("flag") {
+            if t.raw.trim().to_ascii_uppercase().ends_with("_FLAG")
+                || n.ends_with("_flag")
+                || matches!(n, "missing bottoms flag" | "unanchored limbs flag" | "missing_bottoms_flag" | "unanchored_limbs_flag")
+            {
                 return false;
             }
             if crate::two::count_tag(n).is_some() || n == "solo" || n == "multiple girls" || n == "multiple boys" {

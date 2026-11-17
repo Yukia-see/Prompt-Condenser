@@ -646,8 +646,9 @@ fn distinguishing_kind(t: &PromptToken) -> Option<u8> {
 /// Per character, the other characters' distinguishing tags (`distinguishing_kind`) this character
 /// doesn't share, as low-weight `(tag:0.8)` entries for its region's negative prompt, at most
 /// `CROSS_NEGATIVE_MAX`. A tag that is part of one of this character's tags, or the other way round,
-/// counts as shared ("long hair" next to "very long hair", "uniform" next to "school uniform"). Weighted,
-/// because ComfyUI's prompt parser reads the weight syntax in negatives too.
+/// counts as shared ("long hair" next to "very long hair", "uniform" next to "school uniform"),
+/// unless the other tag adds a distinct color (e.g. generic "dress" does not share "red dress").
+/// Round-robins across kinds/characters so hair & eyes don't starve traits, skin, or outfits on 3-4 chars.
 pub fn cross_negatives(prompts: &[String]) -> Vec<String> {
     let tags: Vec<Vec<(u8, String)>> = prompts
         .iter()
@@ -668,26 +669,69 @@ pub fn cross_negatives(prompts: &[String]) -> Vec<String> {
         .iter()
         .map(|p| parse_prompt(p).into_iter().map(|t| t.normalized.replace('_', " ")).collect())
         .collect();
-    let overlaps = |a: &str, b: &str| crate::parser::has_phrase(a, b) || crate::parser::has_phrase(b, a);
+    let has_color = |s: &str| {
+        s.split(|c: char| !c.is_alphanumeric())
+            .any(|w| crate::analyzer::COLOR_WORDS.contains(&w))
+    };
+    let overlaps = |own: &str, theirs: &str| {
+        if crate::parser::has_phrase(own, theirs) {
+            return true;
+        }
+        if crate::parser::has_phrase(theirs, own) {
+            // Generic own ("dress") shouldn't suppress a colored rival ("red dress") unless own also has a color
+            return !has_color(theirs) || has_color(own);
+        }
+        false
+    };
     (0..prompts.len())
         .map(|i| {
-            let mut picked: Vec<(u8, String)> = Vec::new();
+            let mut by_kind: [Vec<(u8, String)>; 5] = Default::default();
+            let mut seen_tags: std::collections::HashSet<String> = std::collections::HashSet::new();
             for (j, theirs) in tags.iter().enumerate() {
                 if j == i {
                     continue;
                 }
                 for (k, tag) in theirs {
-                    if own_all[i].iter().any(|own| overlaps(own, tag)) || picked.iter().any(|(_, p)| p == tag) {
+                    if own_all[i].iter().any(|own| overlaps(own, tag)) || !seen_tags.insert(tag.clone()) {
                         continue;
                     }
-                    picked.push((*k, tag.clone()));
+                    by_kind[(*k as usize).min(4)].push((*k, tag.clone()));
                 }
             }
-            // by kind, keeping the prompts' order within a kind
-            picked.sort_by_key(|(k, _)| *k);
+            let mut picked: Vec<(u8, String)> = Vec::new();
+            if prompts.len() <= 2 {
+                // 2 characters: strict priority order (Hair -> Eyes -> Traits -> Skin -> Outfit)
+                for list in by_kind {
+                    for item in list {
+                        if picked.len() >= CROSS_NEGATIVE_MAX {
+                            break;
+                        }
+                        picked.push(item);
+                    }
+                }
+            } else {
+                // 3-4 characters: round-robin across distinguishing kinds so outfits/species/skin aren't starved
+                let mut cursors = [0usize; 5];
+                while picked.len() < CROSS_NEGATIVE_MAX {
+                    let mut progressed = false;
+                    for k in 0..5 {
+                        if picked.len() >= CROSS_NEGATIVE_MAX {
+                            break;
+                        }
+                        if cursors[k] < by_kind[k].len() {
+                            picked.push(by_kind[k][cursors[k]].clone());
+                            cursors[k] += 1;
+                            progressed = true;
+                        }
+                    }
+                    if !progressed {
+                        break;
+                    }
+                }
+                picked.sort_by_key(|(k, _)| *k);
+            }
             picked
                 .into_iter()
-                .take(CROSS_NEGATIVE_MAX)
                 .map(|(_, t)| format!("({t}:{CROSS_NEGATIVE_WEIGHT})"))
                 .collect::<Vec<_>>()
                 .join(", ")
@@ -1081,6 +1125,7 @@ mod tests {
             char2_lora_tags_raw: String::new(),
             char_break: true, scene_prompt_raw: String::new(), more_chars: Vec::new(),
             detail: crate::profiles::DetailLevel::Balanced,
+            ..Default::default()
         }
     }
 

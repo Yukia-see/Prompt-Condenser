@@ -5,6 +5,15 @@ use super::*;
 /// and the checkpoint's quality tags lead the rewrite (AI text only; the rule-based output
 /// never gets tags the user didn't write).
 pub(crate) fn enforce_checkpoint_rules(out: &mut AiJsonOutput, checkpoint: CheckpointProfile) {
+    let mut cfg = ScanConfig::default();
+    cfg.checkpoint = checkpoint;
+    enforce_checkpoint_rules_with_config(out, &cfg);
+}
+
+/// Full config-aware post-AI enforcement: checkpoint quality/negative rules, multi-stage weight caps,
+/// stage-specific negative rules (Inpaint, Shortstack), and positive/negative deduplication.
+pub(crate) fn enforce_checkpoint_rules_with_config(out: &mut AiJsonOutput, config: &ScanConfig) {
+    let checkpoint = config.checkpoint;
     if checkpoint.default_negative().is_empty() {
         out.recommended_negative.clear();
     }
@@ -13,6 +22,108 @@ pub(crate) fn enforce_checkpoint_rules(out: &mut AiJsonOutput, checkpoint: Check
     out.recommended_negative = strip_placeholders(&out.recommended_negative);
     out.improved_prompt = ensure_quality_tags(&fix_ai_slips(&out.improved_prompt), checkpoint);
     out.dynamic_prompt = ensure_quality_tags(&fix_ai_slips(&out.dynamic_prompt), checkpoint);
+    if checkpoint.uses_explicit_weights() {
+        let cap = config.stage.weight_cap(checkpoint);
+        out.improved_prompt = enforce_stage_weights(&out.improved_prompt, cap);
+        out.dynamic_prompt = enforce_stage_weights(&out.dynamic_prompt, cap);
+    }
+    if !out.recommended_negative.trim().is_empty() {
+        // Deduplicate AI negative against AI's own improved prompt and sanitize phrasing
+        out.recommended_negative = crate::condenser::merge_negative(&out.recommended_negative, &out.improved_prompt);
+        if config.stage == crate::profiles::GenerationStage::Inpaint {
+            out.recommended_negative = crate::condenser::filter_negative_tags(&out.recommended_negative, |l| {
+                matches!(
+                    l,
+                    "cropped"
+                        | "out of frame"
+                        | "head out of frame"
+                        | "feet out of frame"
+                        | "cut off"
+                        | "partially out of frame"
+                )
+            });
+        }
+        let is_shortstack = config.frame == 2
+            || crate::parser::parse_prompt(&out.improved_prompt).iter().any(|t| t.normalized == "shortstack");
+        if config.exaggerated_proportions && (is_shortstack || config.bust >= 5 || config.frame > 0) {
+            out.recommended_negative = crate::condenser::filter_negative_tags(&out.recommended_negative, |l| {
+                matches!(l, "bad anatomy" | "bad proportions" | "deformed")
+                    || (is_shortstack && l == "petite")
+            });
+        }
+    }
+}
+
+/// Clamps explicit `(tag:weight)` values above `cap` while preserving `{a|b}`, `<lora:...>`,
+/// line breaks, and non-weighted tags untouched.
+pub(crate) fn enforce_stage_weights(text: &str, cap: f32) -> String {
+    if text.trim().is_empty() || !text.contains(':') {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0usize;
+    while i < chars.len() {
+        if chars[i] == '<' {
+            // Leave <lora:...:w> untouched
+            if let Some(rel) = chars[i..].iter().position(|&c| c == '>') {
+                out.extend(&chars[i..=i + rel]);
+                i += rel + 1;
+                continue;
+            }
+        }
+        if chars[i] == '(' && (i == 0 || chars[i - 1] != '\\') {
+            if let Some(end) = find_matching_paren(&chars, i) {
+                let inner: String = chars[i + 1..end].iter().collect();
+                if let Some((body, w_str)) = inner.rsplit_once(':') {
+                    if let Ok(w) = w_str.trim().parse::<f32>() {
+                        if w > cap {
+                            let mut formatted = format!("{cap:.2}");
+                            if formatted.contains('.') {
+                                while formatted.ends_with('0') {
+                                    formatted.pop();
+                                }
+                                if formatted.ends_with('.') {
+                                    formatted.pop();
+                                }
+                            }
+                            out.push('(');
+                            out.push_str(body);
+                            out.push(':');
+                            out.push_str(&formatted);
+                            out.push(')');
+                            i = end + 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
+fn find_matching_paren(chars: &[char], start: usize) -> Option<usize> {
+    let mut depth = 0i32;
+    let mut i = start;
+    while i < chars.len() {
+        if chars[i] == '\\' {
+            i += 2;
+            continue;
+        }
+        if chars[i] == '(' {
+            depth += 1;
+        } else if chars[i] == ')' {
+            depth -= 1;
+            if depth == 0 {
+                return Some(i);
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Two slips the 12B made in the Deep Scan audit (2026-11-12): a garbled count tag (`21girls` for `2girls`:

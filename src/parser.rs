@@ -62,9 +62,16 @@ impl PromptToken {
         if !use_explicit_weights || (self.weight - 1.0).abs() < 0.04 {
             self.text.clone()
         } else {
-            format!("({}:{:.2})", self.text, self.weight)
-                .replace(".00)", ")")
-                .replace("0)", ")")
+            let mut w = format!("{:.2}", self.weight);
+            if w.contains('.') {
+                while w.ends_with('0') {
+                    w.pop();
+                }
+                if w.ends_with('.') {
+                    w.pop();
+                }
+            }
+            format!("({}:{w})", self.text)
         }
     }
 }
@@ -121,10 +128,25 @@ pub fn parse_prompt(input: &str) -> Vec<PromptToken> {
     let mut angle_depth: i32 = 0;
 
     // Normalize standalone BREAK keywords so they become clean segments
-    let normalized_input = convert_novelai_numeric(&input.replace("\r\n", "\n"));
+    let crlf_clean: std::borrow::Cow<'_, str> = if input.contains("\r\n") {
+        std::borrow::Cow::Owned(input.replace("\r\n", "\n"))
+    } else {
+        std::borrow::Cow::Borrowed(input)
+    };
+    let normalized_input = convert_novelai_numeric(&crlf_clean);
 
+    let mut prev_escaped = false;
     for ch in normalized_input.chars() {
+        if prev_escaped {
+            prev_escaped = false;
+            current.push(ch);
+            continue;
+        }
         match ch {
+            '\\' => {
+                prev_escaped = true;
+                current.push(ch);
+            }
             // {a|b} is Dynamic Prompts variation syntax: keep it as one segment
             '(' | '[' | '{' => {
                 paren_depth += 1;
@@ -142,6 +164,15 @@ pub fn parse_prompt(input: &str) -> Vec<PromptToken> {
             '>' => {
                 angle_depth = (angle_depth - 1).max(0);
                 current.push(ch);
+            }
+            '\n' if paren_depth == 0 => {
+                // An unclosed `<` shouldn't swallow the rest of a multi-line prompt
+                angle_depth = 0;
+                let trimmed = current.trim().to_string();
+                if !trimmed.is_empty() {
+                    raw_segments.push(trimmed);
+                }
+                current.clear();
             }
             ',' | '\n' if paren_depth == 0 && angle_depth == 0 => {
                 let trimmed = current.trim().to_string();
@@ -192,12 +223,7 @@ pub fn parse_prompt(input: &str) -> Vec<PromptToken> {
             continue;
         }
 
-        let normalized = clean_text
-            .to_lowercase()
-            .replace('_', " ")
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
+        let normalized = normalize_tag_text(&clean_text);
 
         let category = categorize_token(&clean_text, &normalized);
 
@@ -218,7 +244,33 @@ pub fn parse_prompt(input: &str) -> Vec<PromptToken> {
     tokens
 }
 
+/// Single-pass tag normalization: lowercases, turns `_` and runs of whitespace
+/// into a single space, and trims leading/trailing whitespace.
+fn normalize_tag_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut pending_space = false;
+    for ch in s.chars() {
+        if ch == '_' || ch.is_whitespace() {
+            if !out.is_empty() {
+                pending_space = true;
+            }
+        } else {
+            if pending_space {
+                out.push(' ');
+                pending_space = false;
+            }
+            for lc in ch.to_lowercase() {
+                out.push(lc);
+            }
+        }
+    }
+    out
+}
+
 fn extract_inline_loras(segment: &str) -> (Vec<String>, String) {
+    if !segment.contains('<') {
+        return (Vec::new(), segment.to_string());
+    }
     let mut loras = Vec::new();
     let mut remainder = String::new();
     let mut chars = segment.chars().peekable();
@@ -302,13 +354,13 @@ fn unwrap_weight_syntax(raw: &str) -> (String, f32, bool) {
 
 fn is_outer_pair_matching(s: &str, open: char, close: char) -> bool {
     let mut depth = 0i32;
-    let chars: Vec<char> = s.chars().collect();
-    for (i, &c) in chars.iter().enumerate() {
+    let len = s.len();
+    for (i, c) in s.char_indices() {
         if c == open {
             depth += 1;
         } else if c == close {
             depth -= 1;
-            if depth == 0 && i < chars.len() - 1 {
+            if depth == 0 && i + c.len_utf8() < len {
                 return false;
             }
         }
@@ -318,10 +370,47 @@ fn is_outer_pair_matching(s: &str, open: char, close: char) -> bool {
 
 /// Does `text` contain `phrase` as whole words? ("night" is in "night sky" and "at night",
 /// not in "knight"; "close-up" matches "close up".)
+#[inline]
+fn word_eq_ci(a: &str, b: &str) -> bool {
+    if a.is_ascii() && b.is_ascii() {
+        a.eq_ignore_ascii_case(b)
+    } else {
+        a.chars().flat_map(char::to_lowercase).eq(b.chars().flat_map(char::to_lowercase))
+    }
+}
+
+/// Zero-allocation whole-word phrase check: matches `phrase` as a contiguous sequence
+/// of alphanumeric words inside `text` (case-insensitive, punctuation-insensitive).
 pub fn has_phrase(text: &str, phrase: &str) -> bool {
-    let words = |s: &str| s.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).map(str::to_lowercase).collect::<Vec<_>>();
-    let (hay, needle) = (words(text), words(phrase));
-    !needle.is_empty() && hay.windows(needle.len()).any(|w| w == needle.as_slice())
+    let mut needle_iter = phrase.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty());
+    let Some(first_needle) = needle_iter.next() else {
+        return false;
+    };
+    let rest_count = needle_iter.clone().count();
+    let mut hay_iter = text.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty());
+    while let Some(hw) = hay_iter.next() {
+        if word_eq_ci(hw, first_needle) {
+            if rest_count == 0 {
+                return true;
+            }
+            let mut h_rem = hay_iter.clone();
+            let mut n_rem = needle_iter.clone();
+            let mut matched = true;
+            for nw in n_rem.by_ref() {
+                match h_rem.next() {
+                    Some(hw2) if word_eq_ci(hw2, nw) => {}
+                    _ => {
+                        matched = false;
+                        break;
+                    }
+                }
+            }
+            if matched {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 pub fn categorize_token(raw_text: &str, normalized: &str) -> TokenCategory {
@@ -487,18 +576,62 @@ pub fn categorize_token(raw_text: &str, normalized: &str) -> TokenCategory {
 }
 
 /// Estimates CLIP token count and 75-token chunk count for a prompt string.
+/// Excludes `<lora:...>` blocks (stripped before CLIP encoding) and accounts for
+/// `BREAK` padding to the next 75-token chunk boundary.
 pub fn estimate_clip_tokens(prompt: &str) -> (usize, usize) {
     if prompt.trim().is_empty() {
         return (0, 0);
     }
-    let words = prompt
-        .split(|c: char| c.is_whitespace() || c == ',' || c == '(' || c == ')' || c == ':')
-        .filter(|s| !s.is_empty())
-        .count();
-    let punctuation = prompt.chars().filter(|&c| c == ',' || c == '(' || c == ')').count();
-    let estimated_tokens = words + (punctuation / 2);
-    let chunks = ((estimated_tokens.max(1) - 1) / 75) + 1;
-    (estimated_tokens, chunks)
+    let estimate_section = |sec: &str| -> usize {
+        let words = sec
+            .split(|c: char| c.is_whitespace() || c == ',' || c == '(' || c == ')' || c == ':')
+            .filter(|s| !s.is_empty())
+            .count();
+        let punctuation = sec.chars().filter(|&c| c == ',' || c == '(' || c == ')').count();
+        words + (punctuation / 2)
+    };
+
+    // Fast path when neither `<lora:` nor `BREAK` is present
+    if !prompt.contains("<lora:") && !prompt.contains("BREAK") {
+        let est = estimate_section(prompt);
+        let chunks = ((est.max(1) - 1) / 75) + 1;
+        return (est, chunks);
+    }
+
+    // Strip `<lora:...>` blocks before counting CLIP tokens
+    let mut cleaned = String::with_capacity(prompt.len());
+    let mut rest = prompt;
+    while let Some(at) = rest.to_ascii_lowercase().find("<lora:") {
+        cleaned.push_str(&rest[..at]);
+        if let Some(end) = rest[at..].find('>') {
+            rest = &rest[at + end + 1..];
+        } else {
+            rest = "";
+            break;
+        }
+    }
+    cleaned.push_str(rest);
+
+    if cleaned.trim().is_empty() {
+        return (0, 0);
+    }
+
+    let sections = crate::two::split_breaks(&cleaned);
+    if sections.is_empty() {
+        let est = estimate_section(&cleaned);
+        let chunks = ((est.max(1) - 1) / 75) + 1;
+        return (est, chunks);
+    }
+    let mut total_tokens = 0usize;
+    let mut total_chunks = 0usize;
+    for sec in sections {
+        let t = estimate_section(&sec);
+        if t > 0 {
+            total_tokens += t;
+            total_chunks += ((t - 1) / 75) + 1;
+        }
+    }
+    (total_tokens, total_chunks)
 }
 
 /// Sanitizes scanner/raw tags and injects structural audit flags before the LLM pass.
@@ -627,7 +760,7 @@ impl AntigravityTagFilter {
         ];
         if tags
             .iter()
-            .any(|t| footwear_triggers.iter().any(|fw| t.contains(fw)))
+            .any(|t| footwear_triggers.iter().any(|fw| has_phrase(t, fw)))
         {
             let has_framing = tags.iter().any(|t| {
                 self.wide_shots.contains(&t.as_str()) || self.close_shots.contains(&t.as_str())
@@ -647,7 +780,7 @@ impl AntigravityTagFilter {
         // 4. Archetype vs. Uniform Collision Purge
         if tags
             .iter()
-            .any(|t| self.uniforms.iter().any(|u| t.contains(u)))
+            .any(|t| self.uniforms.iter().any(|u| has_phrase(t, u)))
         {
             tags.retain(|t| !self.archetype_overrides.contains(&t.as_str()));
         }
@@ -658,10 +791,10 @@ impl AntigravityTagFilter {
             .any(|t| self.static_poses.contains(&t.as_str()) || t.starts_with("sitting "));
         let has_top = tags
             .iter()
-            .any(|t| self.tops.iter().any(|top| t.contains(top)));
+            .any(|t| self.tops.iter().any(|top| has_phrase(t, top)));
         let has_bottom = tags
             .iter()
-            .any(|t| self.bottoms.iter().any(|bot| t.contains(bot)));
+            .any(|t| self.bottoms.iter().any(|bot| has_phrase(t, bot)));
         if (has_wide || (has_static && !has_close)) && has_top && !has_bottom {
             tags.push("MISSING_BOTTOMS_FLAG".to_string());
         }
@@ -669,7 +802,7 @@ impl AntigravityTagFilter {
         // 6. Unrouted Limb Flagging
         let has_limb_anchor = tags
             .iter()
-            .any(|t| self.limb_anchors.iter().any(|limb| t.contains(limb)));
+            .any(|t| self.limb_anchors.iter().any(|limb| has_phrase(t, limb)));
         if has_static && !has_limb_anchor {
             tags.push("UNANCHORED_LIMBS_FLAG".to_string());
         }
@@ -688,32 +821,30 @@ impl AntigravityTagFilter {
 
         tokens.retain(|t| {
             let l = t.to_lowercase();
-            !l.ends_with("_flag") && !l.ends_with(" flag") && !l.contains("flag")
+            !matches!(l.as_str(), "missing_bottoms_flag" | "unanchored_limbs_flag")
+                && !l.ends_with("_flag")
         });
 
         if has_missing_bottoms {
             let has_bot = tokens.iter().any(|t| {
-                let l = t.to_lowercase();
-                self.bottoms.iter().any(|b| l.contains(b))
+                self.bottoms.iter().any(|b| has_phrase(t, b))
             });
             if !has_bot {
-                let is_blue = tokens.iter().any(|t| {
-                    let l = t.to_lowercase();
-                    l.contains("blue") || l.contains("tube top")
+                let is_blue_swimwear = tokens.iter().any(|t| {
+                    has_phrase(t, "blue bikini") || has_phrase(t, "blue tube top")
                 });
-                if is_blue {
+                if is_blue_swimwear {
                     tokens.push("light blue bikini bottoms".to_string());
                 } else {
                     tokens.push("denim shorts".to_string());
                 }
             }
             let has_feet = tokens.iter().any(|t| {
-                let l = t.to_lowercase();
-                l.contains("barefoot")
-                    || l.contains("bare foot")
-                    || l.contains("shoes")
-                    || l.contains("sandals")
-                    || l.contains("boots")
+                has_phrase(t, "barefoot")
+                    || has_phrase(t, "bare foot")
+                    || has_phrase(t, "shoes")
+                    || has_phrase(t, "sandals")
+                    || has_phrase(t, "boots")
             });
             if !has_feet {
                 tokens.push("bare foot".to_string());
@@ -820,5 +951,18 @@ mod tests {
         // Wide overrides close
         let out2 = filter.process_tags("full body, upper body, portrait, 1girl, shirt, skirt, sitting, hands in lap");
         assert_eq!(out2, "full body, 1girl, shirt, skirt, sitting, hands in lap");
+
+        // Whole-word checks: "armor" does not count as "arm", "laptop" does not count as "top",
+        // and real "flag" tags survive resolve_and_strip_flags.
+        let out3 = filter.process_tags("1girl, armor, laptop, standing");
+        assert!(out3.contains("UNANCHORED_LIMBS_FLAG"), "armor must not satisfy arm limb anchor: {out3}");
+        assert!(!out3.contains("MISSING_BOTTOMS_FLAG"), "laptop must not trigger top/bottomless: {out3}");
+        let resolved = filter.resolve_and_strip_flags("1girl, holding flag, UNANCHORED_LIMBS_FLAG");
+        assert!(resolved.contains("holding flag"), "real flag tag must survive: {resolved}");
+        assert!(!resolved.contains("UNANCHORED_LIMBS_FLAG"));
+
+        // estimate_clip_tokens ignores <lora:...> and breaks chunks at BREAK
+        assert_eq!(estimate_clip_tokens("<lora:my_lora:0.8>, 1girl, smile"), (2, 1));
+        assert_eq!(estimate_clip_tokens("1girl, smile, BREAK, red hair"), (4, 2));
     }
 }

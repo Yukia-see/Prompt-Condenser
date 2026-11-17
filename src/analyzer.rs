@@ -124,6 +124,14 @@ pub struct ScanConfig {
     pub more_chars: Vec<(String, String)>,
     /// How much the deep scan may enrich the prompt.
     pub detail: crate::profiles::DetailLevel,
+    /// Target canvas aspect ratio for composition-aware guards (e.g. widescreen single-char guard).
+    pub aspect_ratio: crate::profiles::AspectRatio,
+    /// Target generation stage in a multi-stage pipeline (Base, HiresFix, Detailer, Refiner, Inpaint).
+    pub stage: crate::profiles::GenerationStage,
+    /// Negative prompt strictness (Light, Balanced, Strict).
+    pub negative_strictness: crate::profiles::NegativeStrictness,
+    /// User-supplied custom negative tags merged into `recommended_negative`.
+    pub custom_negative_raw: String,
 }
 
 impl Default for ScanConfig {
@@ -153,6 +161,10 @@ impl Default for ScanConfig {
             scene_prompt_raw: String::new(),
             more_chars: Vec::new(),
             detail: crate::profiles::DetailLevel::Balanced,
+            aspect_ratio: crate::profiles::AspectRatio::Default,
+            stage: crate::profiles::GenerationStage::Base,
+            negative_strictness: crate::profiles::NegativeStrictness::Balanced,
+            custom_negative_raw: String::new(),
         }
     }
 }
@@ -190,35 +202,38 @@ pub struct RuleAnalysisResult {
 }
 
 /// Checks if the prompt itself contains an explicit framing tag even if the TargetView dropdown is `None`.
+/// When multiple framing tags appear, prefers the highest-weighted tag (tie-breaking on earliest order).
 pub fn detect_effective_view(tokens: &[PromptToken], selected_view: TargetView) -> TargetView {
     if selected_view != TargetView::None {
         return selected_view;
     }
+    let mut best: Option<(f32, TargetView)> = None;
     for t in tokens {
         let n = t.normalized.as_str();
-        if n.contains("360") || n.contains("turnaround") || n.contains("multiple views") {
-            return TargetView::Turnaround360;
-        }
-        if n == "upper body" || n == "cowboy shot" {
-            return TargetView::UpperBody;
-        }
-        if n == "portrait" || n == "close-up" || n == "close up" || n == "headshot" {
-            return TargetView::CloseUpPortrait;
-        }
-        if n == "from behind" || n == "back view" {
-            return TargetView::FromBehind;
-        }
-        if n == "front view" || n == "straight-on" || n == "straight on" || n == "facing viewer" {
-            return TargetView::FrontView;
-        }
-        if n == "side profile" || n == "from side" || n == "side view" {
-            return TargetView::SideProfile;
-        }
-        if n == "full body" {
-            return TargetView::FullBody;
+        let view = if n.contains("360") || n.contains("turnaround") || n.contains("multiple views") {
+            Some(TargetView::Turnaround360)
+        } else if n == "upper body" || n == "cowboy shot" {
+            Some(TargetView::UpperBody)
+        } else if n == "portrait" || n == "close-up" || n == "close up" || n == "headshot" {
+            Some(TargetView::CloseUpPortrait)
+        } else if n == "from behind" || n == "back view" {
+            Some(TargetView::FromBehind)
+        } else if n == "front view" || n == "straight-on" || n == "straight on" || n == "facing viewer" {
+            Some(TargetView::FrontView)
+        } else if n == "side profile" || n == "from side" || n == "side view" {
+            Some(TargetView::SideProfile)
+        } else if n == "full body" {
+            Some(TargetView::FullBody)
+        } else {
+            None
+        };
+        if let Some(v) = view {
+            if best.is_none_or(|(bw, _)| t.weight > bw + 0.01) {
+                best = Some((t.weight, v));
+            }
         }
     }
-    TargetView::None
+    best.map_or(TargetView::None, |(_, v)| v)
 }
 
 /// Tags specifying small or flat chest.
@@ -1657,9 +1672,14 @@ pub fn check_framing_safe_body_swap(
                 || is_footwear_legwear
                 || matches!(normalized_tag, "standing" | "walking" | "running" | "squatting")
             {
+                let body_alt = if has_small_chest {
+                    "slender build, graceful posture, poised stance"
+                } else {
+                    "graceful posture, poised stance"
+                };
                 return Some((
                     "Forces framing below the waist/hips.",
-                    "slender build, graceful posture, poised stance",
+                    body_alt,
                     "full body, standing",
                 ));
             }
@@ -2114,6 +2134,14 @@ pub fn postures_conflict(a: &str, b: &str) -> bool {
     !(seated_kneel_ok(a, b) || seated_kneel_ok(b, a))
 }
 
+/// True when two raw normalized tags belong to incompatible posture groups (e.g. "standing" vs "sitting").
+pub fn tags_posture_conflict(a: &str, b: &str) -> bool {
+    match (posture_group(a), posture_group(b)) {
+        (Some(ga), Some(gb)) => postures_conflict(ga, gb),
+        _ => false,
+    }
+}
+
 /// Leg positions or postures that can't go with a leg position (`crossed legs`, `spread legs`…):
 /// seiza / wariza fold the legs under, standing on one leg lifts one.
 pub fn leg_cross_conflict(posture: &str, leg_group: &str) -> bool {
@@ -2320,6 +2348,160 @@ pub fn is_barefoot(norm: &str) -> bool {
 
 pub fn is_barefoot_exception(norm: &str) -> bool {
     crate::ai_engine::is_unworn_footwear(norm)
+}
+
+/// Canonical key for near-duplicate Danbooru tag variants (punctuation / spacing / common aliases)
+/// so `close up` + `close-up` or `barefoot` + `bare foot` are condensed cleanly without altering
+/// a tag when it appears on its own.
+fn canonical_synonym_key(norm: &str) -> &str {
+    match norm {
+        "close up" | "close-up" => "close-up",
+        "straight on" | "straight-on" | "front view" => "straight-on",
+        "full-body" | "full body" => "full body",
+        "upper-body" | "upper body" => "upper body",
+        "lower-body" | "lower body" => "lower body",
+        "cowboy-shot" | "cowboy shot" | "three-quarter shot" => "cowboy shot",
+        "bare foot" | "barefoot" => "barefoot",
+        "thigh highs" | "thighhighs" => "thighhighs",
+        "knee highs" | "kneehighs" => "kneehighs",
+        "t shirt" | "t-shirt" => "t-shirt",
+        "side view" | "from side" => "from side",
+        "back view" | "from behind" | "rear view" => "from behind",
+        "looking at the viewer" | "looking at viewer" | "eye contact" => "looking at viewer",
+        "arms crossed" | "crossed arms" => "crossed arms",
+        "hands on own hips" | "hands on hips" => "hands on hips",
+        "hand on own hip" | "hand on hip" => "hand on hip",
+        "hands on own knees" | "hands on knees" => "hands on knees",
+        "legs crossed" | "crossed legs" => "crossed legs",
+        "three quarter view" | "three-quarter view" => "three-quarter view",
+        "low-angle" | "low angle" => "low angle",
+        "high-angle" | "high angle" => "high angle",
+        "dutch-angle" | "dutch angle" => "dutch angle",
+        "360 view" | "turnaround" | "character turnaround" => "character turnaround",
+        "multi-view" | "multiple views" => "multiple views",
+        "depth of field" | "dof" => "depth of field",
+        "simple background" | "plain background" => "simple background",
+        "outdoor" | "outdoors" => "outdoors",
+        "indoor" | "indoors" => "indoors",
+        "smiling" | "smile" => "smile",
+        "blushing" | "blush" => "blush",
+        "seated" | "sitting" => "sitting",
+        _ => norm,
+    }
+}
+
+/// Returns `true` when `tokens` describe a single character (and NOT multiple people/crowds/couples).
+/// Correctly handles multi-count combinations like `1girl, 1boy` (total = 2 -> false).
+pub fn is_single_character_tokens(tokens: &[PromptToken]) -> bool {
+    let mut total_count: usize = 0;
+    let mut has_solo = false;
+    for t in tokens {
+        let n = t.normalized.as_str();
+        if matches!(
+            n,
+            "multiple girls" | "multiple boys" | "multiple others" | "crowd" | "group" | "couple" | "twins"
+        ) {
+            return false;
+        }
+        if let Some((cnt, _)) = crate::two::count_tag(n) {
+            total_count += cnt as usize;
+            if cnt >= 2 || total_count >= 2 {
+                return false;
+            }
+        }
+        if n == "solo" {
+            has_solo = true;
+        }
+    }
+    has_solo || total_count == 1
+}
+
+/// Stage-specific filtering for multi-stage generation pipelines (`HiresFix`, `Detailer`, `Refiner`, `Inpaint`).
+fn stage_drop_reason(tok: &PromptToken, stage: crate::profiles::GenerationStage) -> Option<&'static str> {
+    use crate::profiles::GenerationStage;
+    let n = tok.normalized.as_str();
+    match stage {
+        GenerationStage::Base => None,
+        GenerationStage::HiresFix => {
+            if matches!(
+                n,
+                "360 view" | "character turnaround" | "multiple views" | "reference sheet" | "split screen"
+            ) {
+                Some("Removed multi-view/turnaround tag for HiresFix pass to prevent tiling or duplicate figures.")
+            } else {
+                None
+            }
+        }
+        GenerationStage::Detailer => {
+            if crate::two::count_tag(n).is_some_and(|(cnt, _)| cnt >= 2)
+                || matches!(
+                    n,
+                    "multiple girls"
+                        | "multiple boys"
+                        | "multiple others"
+                        | "crowd"
+                        | "group"
+                        | "couple"
+                        | "full body"
+                        | "cowboy shot"
+                        | "upper body"
+                        | "wide shot"
+                        | "long shot"
+                        | "establishing shot"
+                        | "360 view"
+                        | "character turnaround"
+                        | "multiple views"
+                        | "reference sheet"
+                        | "split screen"
+                        | "dutch angle"
+                        | "fisheye"
+                        | "wide-angle"
+                        | "panoramic"
+                        | "letterboxed"
+                        | "from far away"
+                        | "distant"
+                        | "bird's-eye view"
+                        | "worm's-eye view"
+                        | "aerial view"
+                )
+            {
+                return Some("Removed global framing/lens/multi-person tag for Detailer crop pass to prevent hallucinating extra figures or distortion inside the crop.");
+            }
+            if matches!(crate::scene::slot(tok), crate::scene::Slot::Setting) {
+                return Some("Removed global environment/setting tag for Detailer crop pass to keep attention on local detail.");
+            }
+            None
+        }
+        GenerationStage::Refiner => {
+            if tok.category == TokenCategory::LoraOrSpecial && n.starts_with("<lora") {
+                Some("Removed base LoRA block for Refiner pass (refiner models do not load base LoRAs).")
+            } else if n.starts_with("score ") || n.starts_with("source ") || n.starts_with("rating:") || n.starts_with("rating ") {
+                Some("Removed Pony/Danbooru meta tag for Refiner pass (refiner models ignore booru score/rating tags).")
+            } else {
+                None
+            }
+        }
+        GenerationStage::Inpaint => {
+            if matches!(
+                n,
+                "full body"
+                    | "cowboy shot"
+                    | "upper body"
+                    | "wide shot"
+                    | "long shot"
+                    | "establishing shot"
+                    | "panoramic"
+                    | "360 view"
+                    | "character turnaround"
+                    | "multiple views"
+                    | "split screen"
+            ) {
+                Some("Removed global framing/multi-view tag for Inpaint pass so it does not fight the masked region.")
+            } else {
+                None
+            }
+        }
+    }
 }
 
 pub fn analyze_with_rules(tokens: &[PromptToken], config: &ScanConfig) -> RuleAnalysisResult {
@@ -2542,19 +2724,35 @@ pub fn analyze_with_rules(tokens: &[PromptToken], config: &ScanConfig) -> RuleAn
             .iter()
             .any(|p| tok.normalized == *p || crate::parser::has_phrase(&tok.normalized, p));
 
-        // 1. Check exact duplicates (when cleanup is enabled)
+        // 1. Check exact duplicates & near-duplicate synonyms (when cleanup is enabled)
+        let canon_key = canonical_synonym_key(&tok.normalized);
         if config.cleanup_enabled
             && tok.category != TokenCategory::LoraOrSpecial
-            && seen_normalized.contains(&tok.normalized)
+            && (seen_normalized.contains(&tok.normalized) || seen_normalized.contains(canon_key))
         {
             changes.push(PromptChange {
                 id: next_change_id,
                 original: tok.raw.clone(),
                 action: ChangeAction::MergedDuplicate,
-                reason: format!("Duplicate tag '{}' appeared multiple times in the prompt.", tok.text),
+                reason: format!("Duplicate/synonym tag '{}' appeared multiple times in the prompt.", tok.text),
                 suggested_alternative: String::new(),
                 framing_alternative: String::new(),
                 mode: if config.cleanup_enabled { 0 } else { 2 },
+            });
+            next_change_id += 1;
+            continue;
+        }
+
+        // 1.5 Multi-stage generation filtering (HiresFix, Detailer, Refiner, Inpaint)
+        if let Some(reason) = stage_drop_reason(&tok, config.stage) {
+            changes.push(PromptChange {
+                id: next_change_id,
+                original: tok.raw.clone(),
+                action: ChangeAction::RemovedBloat,
+                reason: reason.to_string(),
+                suggested_alternative: String::new(),
+                framing_alternative: String::new(),
+                mode: 0,
             });
             next_change_id += 1;
             continue;
@@ -2930,8 +3128,8 @@ pub fn analyze_with_rules(tokens: &[PromptToken], config: &ScanConfig) -> RuleAn
             continue;
         }
 
-        // 7. Clamp Runaway Weights `((((tag))))` if enabled
-        let max_w = config.checkpoint.max_safe_weight();
+        // 7. Clamp Runaway Weights `((((tag))))` if enabled (also respects multi-stage weight caps)
+        let max_w = config.stage.weight_cap(config.checkpoint);
         if config.clamp_weights_enabled && (tok.had_runaway_weight || tok.weight > max_w) {
             let clamped = tok.weight.min(max_w).min(1.25);
             changes.push(PromptChange {
@@ -2955,6 +3153,9 @@ pub fn analyze_with_rules(tokens: &[PromptToken], config: &ScanConfig) -> RuleAn
         }
 
         seen_normalized.insert(tok.normalized.clone());
+        if canon_key != tok.normalized {
+            seen_normalized.insert(canon_key.to_string());
+        }
         processed_tokens.push(tok);
     }
 
@@ -3593,13 +3794,17 @@ pub fn analyze_with_rules(tokens: &[PromptToken], config: &ScanConfig) -> RuleAn
     // A generic tag next to a more specific one that implies it (`swimsuit` + `bikini`, `sword` +
     // `holding sword`): the generic one goes, with a card to keep it. Weighted / pinned tags stay.
     if config.cleanup_enabled {
-        let norms: Vec<String> = processed_tokens.iter().map(|t| t.normalized.clone()).collect();
-        let mut drop: Vec<usize> = Vec::new();
+        let mut drop = vec![false; processed_tokens.len()];
         for (i, t) in processed_tokens.iter().enumerate() {
             if (t.weight - 1.0).abs() > f32::EPSILON || t.category == TokenCategory::PinnedEmphasis || t.added {
                 continue;
             }
-            let Some(child) = norms.iter().enumerate().find(|(j, o)| *j != i && implies(o, &t.normalized)).map(|(j, _)| j) else {
+            let Some(child) = processed_tokens
+                .iter()
+                .enumerate()
+                .find(|(j, o)| *j != i && !drop[*j] && implies(&o.normalized, &t.normalized))
+                .map(|(j, _)| j)
+            else {
                 continue;
             };
             changes.push(PromptChange {
@@ -3615,11 +3820,11 @@ pub fn analyze_with_rules(tokens: &[PromptToken], config: &ScanConfig) -> RuleAn
                 mode: 0,
             });
             next_change_id += 1;
-            drop.push(i);
+            drop[i] = true;
         }
         let mut i = 0;
         processed_tokens.retain(|_| {
-            let keep = !drop.contains(&i);
+            let keep = !drop[i];
             i += 1;
             keep
         });
@@ -3799,10 +4004,15 @@ pub fn analyze_with_rules(tokens: &[PromptToken], config: &ScanConfig) -> RuleAn
     if config.fit_suggestions {
         let prop_tiers = detect_all_proportion_tiers(&processed_tokens);
         let has_shirt = processed_tokens.iter().any(|t| {
+            let n = t.normalized.as_str();
             matches!(
-                t.normalized.as_str(),
-                "shirt" | "blouse" | "top" | "sweater" | "turtleneck" | "jacket" | "uniform" | "school uniform" | "dress shirt"
-            )
+                n,
+                "shirt" | "blouse" | "top" | "sweater" | "turtleneck" | "jacket" | "uniform"
+                    | "school uniform" | "dress shirt" | "cardigan" | "vest" | "camisole"
+                    | "tank top" | "tube top" | "hoodie" | "coat" | "blazer"
+            ) || ["shirt", "blouse", "sweater", "top", "uniform", "jacket"]
+                .iter()
+                .any(|w| n.ends_with(&format!(" {w}")))
         });
         let has_legwear = processed_tokens.iter().any(|t| {
             matches!(
@@ -3812,42 +4022,59 @@ pub fn analyze_with_rules(tokens: &[PromptToken], config: &ScanConfig) -> RuleAn
                 .iter()
                 .any(|w| t.normalized.ends_with(&format!(" {w}")))
         });
+        let custom_neg: HashSet<String> = crate::parser::parse_prompt(&config.custom_negative_raw)
+            .into_iter()
+            .map(|t| t.normalized)
+            .collect();
 
         for (tier, tier_tok) in prop_tiers {
             let rec = get_proportion_recommendations(tier);
 
-            // Filter clothing tags to only match garments currently worn in prompt
-            let valid_clothing: Vec<&str> = rec.clothing_interaction.iter().copied().filter(|c| {
-                if *c == "skindentation" {
-                    has_legwear
-                } else if c.contains("shirt") || c.contains("clothes") || c.contains("button") {
-                    has_shirt
-                } else {
-                    false
-                }
-            }).collect();
+            // Filter clothing tags to only match garments currently worn in prompt and not conflicting/already present
+            let valid_clothing: Vec<String> = rec
+                .clothing_interaction
+                .iter()
+                .map(|c| c.replace('_', " "))
+                .filter(|c| {
+                    let match_garment = if c == "skindentation" {
+                        has_legwear
+                    } else if c.contains("shirt") || c.contains("clothes") || c.contains("button") {
+                        has_shirt
+                    } else {
+                        false
+                    };
+                    match_garment && can_recommend_tag(c, &processed_tokens, config, &custom_neg)
+                })
+                .collect();
 
-            let pretty = |v: &[&str]| v.iter().map(|t| t.replace('_', " ")).collect::<Vec<_>>().join(", ");
-            let clothing_str = pretty(&valid_clothing);
-            let pose_str = pretty(rec.pose_and_physics);
+            let valid_poses: Vec<String> = rec
+                .pose_and_physics
+                .iter()
+                .map(|p| p.replace('_', " "))
+                .filter(|p| can_recommend_tag(p, &processed_tokens, config, &custom_neg))
+                .collect();
+
+            let clothing_str = valid_clothing.join(", ");
+            let pose_str = valid_poses.join(", ");
 
             // auto-negative lock filtering: if shortstack is present, do not negative-lock "petite"
             let is_shortstack = processed_tokens.iter().any(|t| t.normalized == "shortstack");
-            let neg_list: Vec<&str> = rec.auto_negative_lock.iter().copied().filter(|n| {
-                if is_shortstack && *n == "petite" {
-                    false
-                } else {
-                    true
-                }
-            }).collect();
-            let neg_str = pretty(&neg_list);
+            let neg_list: Vec<String> = rec
+                .auto_negative_lock
+                .iter()
+                .filter(|n| !(is_shortstack && **n == "petite"))
+                .map(|n| n.replace('_', " "))
+                .collect();
+            let neg_str = neg_list.join(", ");
 
             let mut top_companions = Vec::new();
             for c in valid_clothing.iter().take(2) {
-                top_companions.push(c.replace('_', " "));
+                top_companions.push(c.clone());
             }
-            for p in rec.pose_and_physics.iter().take(2) {
-                top_companions.push(p.replace('_', " "));
+            for p in valid_poses.iter().take(2) {
+                if !top_companions.contains(p) {
+                    top_companions.push(p.clone());
+                }
             }
             let suggested_alt = top_companions.join(", ");
 
@@ -3885,16 +4112,27 @@ pub fn analyze_with_rules(tokens: &[PromptToken], config: &ScanConfig) -> RuleAn
         n == "arms up" || n == "sitting on bed" || n == "on bed" || n == "lying on back" || n == "lying on bed"
     });
     if has_front_view && has_back_biased_pose {
-        changes.push(PromptChange {
-            id: next_change_id,
-            original: "front view".to_string(),
-            action: ChangeAction::Recommendation,
-            reason: "Front-View Angle Lock: Poses like 'arms up, sitting on bed' carry a strong rear-angle bias in diffusion models. Added negative locks ('from behind, back view, over the shoulder, looking back') to guarantee a straight-on front angle.".to_string(),
-            suggested_alternative: "straight-on, facing viewer".to_string(),
-            framing_alternative: String::new(),
-            mode: 2,
-        });
-        next_change_id += 1;
+        let missing: Vec<&str> = ["straight-on", "facing viewer"]
+            .into_iter()
+            .filter(|tag| {
+                let key = canonical_synonym_key(tag);
+                !processed_tokens
+                    .iter()
+                    .any(|t| t.normalized == *tag || canonical_synonym_key(&t.normalized) == key)
+            })
+            .collect();
+        if !missing.is_empty() {
+            changes.push(PromptChange {
+                id: next_change_id,
+                original: String::new(),
+                action: ChangeAction::Recommendation,
+                reason: "Front-View Angle Lock: Poses like 'arms up, sitting on bed' carry a strong rear-angle bias in diffusion models. Added negative locks ('from behind, back view, over the shoulder, looking back') and reinforcement tags to guarantee a straight-on front angle.".to_string(),
+                suggested_alternative: missing.join(", "),
+                framing_alternative: String::new(),
+                mode: 2,
+            });
+            next_change_id += 1;
+        }
     }
 
     // 12. Directive 6 Prop-Preservation & Leg Grounding Card
@@ -3944,8 +4182,8 @@ pub fn analyze_with_rules(tokens: &[PromptToken], config: &ScanConfig) -> RuleAn
 
     // 14. Combo Synergy Recommendation Cards (Mexes Danbooru Taxonomy & 8_combo_synergy_matrix)
     if config.fit_suggestions {
-        generate_combo_synergy_cards(&processed_tokens, &mut changes, &mut next_change_id);
-        generate_prompt_options(&processed_tokens, &mut changes, &mut next_change_id);
+        generate_combo_synergy_cards_with_config(&processed_tokens, config, &mut changes, &mut next_change_id);
+        generate_prompt_options_with_config(&processed_tokens, config, &mut changes, &mut next_change_id);
         dedup_fit_suggestions(&mut changes);
     }
 
@@ -4111,7 +4349,7 @@ const SIZE_WORDS: &[&str] = &[
     "massive", "hyper", "wide", "narrow", "thick", "slim", "plump",
 ];
 const LENGTH_WORDS: &[&str] = &["short", "medium", "long", "very", "absurdly", "shoulder-length", "bob"];
-const COLOR_WORDS: &[&str] = &[
+pub(crate) const COLOR_WORDS: &[&str] = &[
     "black", "white", "silver", "grey", "gray", "blonde", "blond", "brown", "red", "blue", "green", "pink",
     "purple", "orange", "yellow", "aqua", "platinum", "multicolored", "two-tone", "gradient", "streaked",
     "dark", "light", "golden", "teal", "violet", "crimson", "auburn",
@@ -4313,16 +4551,28 @@ fn attribute_conflict(keep: &str, tag: &str, classes: &[&[&str]]) -> bool {
     if keep == tag || tag.contains(keep) || keep.contains(tag) {
         return false;
     }
-    let kw: Vec<&str> = keep.split_whitespace().collect();
-    let tw: Vec<&str> = tag.split_whitespace().collect();
-    if kw.len() < 2 || tw.len() < 2 || tw.len() > 4 {
+    let mut k_count = 0usize;
+    let mut k_last = "";
+    for w in keep.split_whitespace() {
+        k_count += 1;
+        k_last = w;
+    }
+    let mut t_count = 0usize;
+    let mut t_last = "";
+    for w in tag.split_whitespace() {
+        t_count += 1;
+        t_last = w;
+    }
+    if k_count < 2 || t_count < 2 || t_count > 4 {
         return false;
     }
-    if head_word(kw[kw.len() - 1]) != head_word(tw[tw.len() - 1]) {
+    if head_word(k_last) != head_word(t_last) {
         return false;
     }
-    let (km, tm) = (&kw[..kw.len() - 1], &tw[..tw.len() - 1]);
-    classes.iter().any(|class| km.iter().any(|w| class.contains(w)) && tm.iter().any(|w| class.contains(w)))
+    classes.iter().any(|class| {
+        keep.split_whitespace().take(k_count - 1).any(|w| class.contains(&w))
+            && tag.split_whitespace().take(t_count - 1).any(|w| class.contains(&w))
+    })
 }
 
 /// Puts the LoRA box's text into a finished prompt word for word, right after the
@@ -4483,6 +4733,123 @@ pub fn resolve_exclusive_taxonomy_groups(
     }
 }
 
+/// Checks whether a candidate recommendation tag is safe and non-redundant for the current
+/// prompt tokens, target view, generation stage, and user custom negatives.
+pub fn can_recommend_tag(
+    tag: &str,
+    tokens: &[PromptToken],
+    config: &ScanConfig,
+    custom_neg: &HashSet<String>,
+) -> bool {
+    let t = tag.trim().to_lowercase().replace('_', " ");
+    if t.is_empty() || custom_neg.contains(&t) {
+        return false;
+    }
+    let norms: Vec<&str> = tokens.iter().map(|tok| tok.normalized.as_str()).collect();
+    if norms.iter().any(|n| *n == t) {
+        return false;
+    }
+
+    // Stage constraints
+    match config.stage {
+        crate::profiles::GenerationStage::Detailer => {
+            if matches!(
+                t.as_str(),
+                "full body" | "cowboy shot" | "upper body" | "wide shot" | "dutch angle" | "fisheye"
+                    | "standing" | "walking" | "running" | "squatting" | "kneeling" | "contrapposto"
+                    | "outdoors" | "indoors" | "blue sky" | "cloud" | "cityscape" | "forest" | "beach"
+                    | "simple background" | "gradient background" | "dark background" | "depth of field"
+            ) {
+                return false;
+            }
+        }
+        crate::profiles::GenerationStage::Inpaint => {
+            if matches!(t.as_str(), "full body" | "cowboy shot" | "upper body" | "wide shot") {
+                return false;
+            }
+        }
+        crate::profiles::GenerationStage::HiresFix | crate::profiles::GenerationStage::Refiner => {
+            if matches!(t.as_str(), "contrapposto" | "dutch angle" | "fisheye" | "foreshortening") {
+                return false;
+            }
+        }
+        crate::profiles::GenerationStage::Base => {}
+    }
+
+    // Target view constraints
+    let eff_view = detect_effective_view(tokens, config.target_view);
+    match eff_view {
+        TargetView::Turnaround360 => {
+            if matches!(
+                t.as_str(),
+                "close-up" | "portrait" | "upper body" | "cowboy shot" | "dutch angle"
+                    | "depth of field" | "bokeh" | "blurry background" | "blurry foreground" | "sitting" | "foreshortening"
+            ) {
+                return false;
+            }
+        }
+        TargetView::UpperBody => {
+            if matches!(t.as_str(), "full body" | "wide shot" | "walking" | "running" | "squatting" | "kneeling") {
+                return false;
+            }
+        }
+        TargetView::CloseUpPortrait => {
+            if matches!(
+                t.as_str(),
+                "full body" | "cowboy shot" | "wide shot" | "standing" | "walking" | "running"
+                    | "sitting" | "kneeling" | "squatting" | "contrapposto" | "hands on own hips" | "hand on own hip"
+            ) {
+                return false;
+            }
+        }
+        TargetView::FrontView => {
+            if matches!(t.as_str(), "from behind" | "back view" | "looking back" | "from side") {
+                return false;
+            }
+        }
+        TargetView::FromBehind => {
+            if matches!(t.as_str(), "front view" | "straight-on" | "facing viewer" | "cleavage" | "collarbone") {
+                return false;
+            }
+        }
+        TargetView::SideProfile => {
+            if matches!(t.as_str(), "front view" | "from behind" | "straight-on") {
+                return false;
+            }
+        }
+        TargetView::FullBody => {
+            if matches!(t.as_str(), "close-up" | "portrait" | "upper body") {
+                return false;
+            }
+        }
+        TargetView::None => {}
+    }
+
+    let has_sketch = norms.iter().any(|n| matches!(*n, "monochrome" | "greyscale" | "grayscale" | "sketch" | "lineart"));
+    if has_sketch && matches!(t.as_str(), "bokeh" | "lens flare" | "chromatic aberration" | "bloom" | "neon lights" | "blue sky") {
+        return false;
+    }
+    let has_simple_bg = norms.iter().any(|n| matches!(*n, "simple background" | "white background" | "grey background" | "solid background" | "gradient background"));
+    if has_simple_bg && matches!(t.as_str(), "bokeh" | "blurry background" | "blurry foreground" | "depth of field" | "outdoors" | "blue sky" | "cloud") {
+        return false;
+    }
+
+    // Prompt-level semantic & posture conflict checks
+    let is_non_standing = norms.iter().any(|n| matches!(*n, "sitting" | "seated" | "sitting on bed" | "lying" | "lying down" | "kneeling" | "seiza" | "wariza" | "squatting"));
+    if is_non_standing && matches!(t.as_str(), "contrapposto" | "standing" | "walking" | "running") {
+        return false;
+    }
+    if norms.iter().any(|n| *n == "closed eyes") && matches!(t.as_str(), "sparkling eyes" | "looking at viewer" | "looking at another" | "glowing eyes") {
+        return false;
+    }
+    for n in &norms {
+        if tags_conflict(n, &t) || size_conflict(n, &t) || tags_posture_conflict(n, &t) {
+            return false;
+        }
+    }
+    true
+}
+
 pub struct ComboSynergyRule {
     pub name: &'static str,
     pub anatomy_any: &'static [&'static str],
@@ -4541,21 +4908,134 @@ pub const COMBO_SYNERGY_RULES: &[ComboSynergyRule] = &[
         recommend_tags: &["upper body", "cowboy shot"],
         reason: "Petite stature with large weapons can be dwarfed in wide shots. Recommend cowboy shot or upper body to keep head in frame.",
     },
+    ComboSynergyRule {
+        name: "Zettai Ryouiki & Legwear Framing",
+        anatomy_any: &[],
+        garment_any: &["thighhighs", "stockings"],
+        pose_any: &["skirt", "miniskirt", "pleated skirt", "shorts", "denim shorts"],
+        recommend_tags: &["zettai ryouiki", "garter straps"],
+        reason: "Thighhighs paired with a short skirt or shorts naturally frame the thigh band and garter detail.",
+    },
+    ComboSynergyRule {
+        name: "Rain & Wet Street Reflections",
+        anatomy_any: &[],
+        garment_any: &["rain"],
+        pose_any: &["street", "city", "cityscape", "alley", "outdoors"],
+        recommend_tags: &["puddle", "wet", "wet hair", "overcast"],
+        reason: "Rainy outdoor scenes gain atmosphere and grounding from surface puddles and wet textures.",
+    },
+    ComboSynergyRule {
+        name: "Weapon Stance & Action Flow",
+        anatomy_any: &[],
+        garment_any: &["sword", "katana", "greatsword", "scythe"],
+        pose_any: &["standing", "from below", "full body", "cowboy shot"],
+        recommend_tags: &["holding sword", "sword over shoulder", "wind"],
+        reason: "Large bladed weapons look much stronger with an anchored grip or shoulder rest and subtle wind motion.",
+    },
+    ComboSynergyRule {
+        name: "Winged Silhouette & Sky Motion",
+        anatomy_any: &[],
+        garment_any: &["wings", "feathered wings", "bat wings", "black wings", "white wings"],
+        pose_any: &["sky", "outdoors", "rooftop", "cliff"],
+        recommend_tags: &["feathers", "wind", "floating hair"],
+        reason: "Open-air winged characters read more dynamically with drifting feathers and wind-swept hair.",
+    },
+    ComboSynergyRule {
+        name: "Low-Angle Perspective Cohesion",
+        anatomy_any: &[],
+        garment_any: &["from below"],
+        pose_any: &["standing", "full body", "cowboy shot"],
+        recommend_tags: &["looking down", "foreshortening"],
+        reason: "A low camera angle pairs naturally with downward gaze and subtle foreshortening.",
+    },
+    ComboSynergyRule {
+        name: "High-Angle Perspective Cohesion",
+        anatomy_any: &[],
+        garment_any: &["from above"],
+        pose_any: &["sitting", "lying", "kneeling"],
+        recommend_tags: &["looking up", "foreshortening"],
+        reason: "An overhead angle connects the subject with the viewer via upward gaze and perspective depth.",
+    },
+    ComboSynergyRule {
+        name: "Nocturnal City Glow",
+        anatomy_any: &[],
+        garment_any: &["night", "midnight"],
+        pose_any: &["city", "cityscape", "street", "alley", "cyberpunk"],
+        recommend_tags: &["neon lights", "city lights", "lamppost"],
+        reason: "Nighttime urban settings need explicit light sources so shadows don't muddy the subject.",
+    },
 ];
 
-/// A tag offered by a combo card (specific: it knows the garment) isn't offered again by a body-type
-/// "Reinforce …" card; a Reinforce card left with nothing to offer goes.
+/// True when two candidate recommendation tags would contradict each other if applied together
+/// from the same card (framing shots, camera angles, postures, backgrounds, or attribute conflicts).
+pub fn recommendation_pair_conflict(a: &str, b: &str) -> bool {
+    let na = a.trim().to_lowercase().replace('_', " ");
+    let nb = b.trim().to_lowercase().replace('_', " ");
+    if na == nb {
+        return true;
+    }
+    if tags_conflict(&na, &nb) || size_conflict(&na, &nb) || tags_posture_conflict(&na, &nb) {
+        return true;
+    }
+    const SHOT_DISTANCES: &[&str] = &[
+        "upper body", "cowboy shot", "full body", "portrait", "close-up", "wide shot", "lower body",
+    ];
+    if SHOT_DISTANCES.contains(&na.as_str()) && SHOT_DISTANCES.contains(&nb.as_str()) {
+        return true;
+    }
+    const ANGLES: &[&str] = &["from above", "from below", "from side", "from behind", "front view", "straight-on"];
+    if ANGLES.contains(&na.as_str()) && ANGLES.contains(&nb.as_str()) {
+        return true;
+    }
+    const BACKGROUNDS: &[&str] = &[
+        "simple background", "white background", "grey background", "gradient background", "dark background",
+    ];
+    if BACKGROUNDS.contains(&na.as_str()) && BACKGROUNDS.contains(&nb.as_str()) {
+        return true;
+    }
+    const INTERACTIONS: &[&str] = &["facing another", "back-to-back", "looking away"];
+    if INTERACTIONS.contains(&na.as_str()) && INTERACTIONS.contains(&nb.as_str()) {
+        return true;
+    }
+    const HAND_HIP: &[&str] = &["hand on own hip", "hands on own hips"];
+    if HAND_HIP.contains(&na.as_str()) && HAND_HIP.contains(&nb.as_str()) {
+        return true;
+    }
+    const EXPRESSIONS: &[&str] = &["light smile", "smug", "serious", "expressionless"];
+    if EXPRESSIONS.contains(&na.as_str()) && EXPRESSIONS.contains(&nb.as_str()) {
+        return true;
+    }
+    false
+}
+
+/// Deduplicates suggested tags across all `Recommendation` cards in priority order:
+/// Specific rules & Combo Synergy > Reinforce > Prompt Option.
+/// A card left with no tags after deduplication is removed.
 fn dedup_fit_suggestions(changes: &mut Vec<PromptChange>) {
+    let norm = |s: &str| s.trim().to_lowercase().replace('_', " ");
     let is_reinforce = |c: &PromptChange| c.action == ChangeAction::Recommendation && c.reason.starts_with("Reinforce");
-    let combo_tags: Vec<String> = changes
-        .iter()
-        .filter(|c| c.action == ChangeAction::Recommendation && !is_reinforce(c))
-        .flat_map(|c| c.suggested_alternative.split(',').map(|t| t.trim().to_lowercase()).collect::<Vec<_>>())
-        .filter(|t| !t.is_empty())
-        .collect();
+    let is_option = |c: &PromptChange| c.action == ChangeAction::Recommendation && c.reason.starts_with("Prompt Option");
+    let is_priority = |c: &PromptChange| c.action == ChangeAction::Recommendation && !is_reinforce(c) && !is_option(c);
+
+    let mut seen: HashSet<String> = HashSet::new();
+    for c in changes.iter().filter(|c| is_priority(c)) {
+        for t in c.suggested_alternative.split(',').map(norm).filter(|t| !t.is_empty()) {
+            seen.insert(t);
+        }
+    }
+
+    // Pass 1: dedup Reinforce cards against Combo/specific cards
     for c in changes.iter_mut().filter(|c| is_reinforce(c)) {
-        let kept: Vec<&str> =
-            c.suggested_alternative.split(',').map(str::trim).filter(|t| !t.is_empty() && !combo_tags.contains(&t.to_lowercase())).collect();
+        let kept: Vec<String> = c
+            .suggested_alternative
+            .split(',')
+            .map(str::trim)
+            .filter(|t| !t.is_empty() && !seen.contains(&norm(t)))
+            .map(str::to_string)
+            .collect();
+        for t in &kept {
+            seen.insert(norm(t));
+        }
         c.suggested_alternative = kept.join(", ");
         // the card's "• Fit: …" line lists the same tags
         c.reason = c
@@ -4563,8 +5043,11 @@ fn dedup_fit_suggestions(changes: &mut Vec<PromptChange>) {
             .lines()
             .filter_map(|line| match line.strip_prefix("• Fit:") {
                 Some(list) => {
-                    let left: Vec<&str> =
-                        list.split(',').map(str::trim).filter(|t| !t.is_empty() && !combo_tags.contains(&t.to_lowercase())).collect();
+                    let left: Vec<&str> = list
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|t| !t.is_empty() && kept.iter().any(|k| norm(k) == norm(t)))
+                        .collect();
                     (!left.is_empty()).then(|| format!("• Fit: {}", left.join(", ")))
                 }
                 None => Some(line.to_string()),
@@ -4572,17 +5055,44 @@ fn dedup_fit_suggestions(changes: &mut Vec<PromptChange>) {
             .collect::<Vec<_>>()
             .join("\n");
     }
-    changes.retain(|c| !(is_reinforce(c) && c.suggested_alternative.is_empty()));
+
+    // Pass 2: dedup Prompt Option cards against Combo + Reinforce + earlier Prompt Option cards
+    for c in changes.iter_mut().filter(|c| is_option(c)) {
+        let kept: Vec<String> = c
+            .suggested_alternative
+            .split(',')
+            .map(str::trim)
+            .filter(|t| !t.is_empty() && seen.insert(norm(t)))
+            .map(str::to_string)
+            .collect();
+        c.suggested_alternative = kept.join(", ");
+    }
+
+    changes.retain(|c| !((is_reinforce(c) || is_option(c)) && c.suggested_alternative.is_empty()));
 }
 
+#[allow(dead_code)]
 pub fn generate_combo_synergy_cards(
     tokens: &[PromptToken],
     changes: &mut Vec<PromptChange>,
     next_change_id: &mut usize,
 ) {
+    generate_combo_synergy_cards_with_config(tokens, &ScanConfig::default(), changes, next_change_id);
+}
+
+pub fn generate_combo_synergy_cards_with_config(
+    tokens: &[PromptToken],
+    config: &ScanConfig,
+    changes: &mut Vec<PromptChange>,
+    next_change_id: &mut usize,
+) {
     let norms: Vec<&str> = tokens.iter().map(|t| t.normalized.as_str()).collect();
+    let custom_neg: HashSet<String> = crate::parser::parse_prompt(&config.custom_negative_raw)
+        .into_iter()
+        .map(|t| t.normalized)
+        .collect();
     let tag_matches = |norm: &str, target: &str| -> bool {
-        norm == target || norm.split_whitespace().any(|w| w == target)
+        norm == target || crate::parser::has_phrase(norm, target)
     };
     let has_any = |list: &[&str]| -> bool {
         list.is_empty() || list.iter().any(|target| norms.iter().any(|n| tag_matches(n, target)))
@@ -4596,12 +5106,19 @@ pub fn generate_combo_synergy_cards(
         let match_pose = has_any(rule.pose_any);
 
         if match_anatomy && match_garment && match_pose {
-            let missing: Vec<&str> = rule
-                .recommend_tags
-                .iter()
-                .filter(|rec| !norms.iter().any(|n| tag_matches(n, rec)))
-                .copied()
-                .collect();
+            let mut missing: Vec<&str> = Vec::new();
+            for &rec in rule.recommend_tags {
+                if norms.iter().any(|n| tag_matches(n, rec)) {
+                    continue;
+                }
+                if !can_recommend_tag(rec, tokens, config, &custom_neg) {
+                    continue;
+                }
+                if missing.iter().any(|prev| recommendation_pair_conflict(prev, rec)) {
+                    continue;
+                }
+                missing.push(rec);
+            }
 
             if !missing.is_empty() {
                 let suggested_alt = missing.join(", ");
@@ -4624,9 +5141,21 @@ pub fn generate_combo_synergy_cards(
 
 /// Offline context-aware suggestion cards based on what is currently on screen
 /// (missing scene slots matched to setting/subject, generic-tag enrichments, and theme physics).
-/// Capped at 3 new cards so the strip stays focused.
+#[allow(dead_code)]
 pub fn generate_prompt_options(
     tokens: &[PromptToken],
+    changes: &mut Vec<PromptChange>,
+    next_change_id: &mut usize,
+) {
+    generate_prompt_options_with_config(tokens, &ScanConfig::default(), changes, next_change_id);
+}
+
+/// Config-aware offline suggestion cards: adapts to target view, generation stage, aspect ratio,
+/// medium (sketch/monochrome vs colored), multi-character staging, and custom negatives, using only
+/// conflict-free, verified Danbooru tags.
+pub fn generate_prompt_options_with_config(
+    tokens: &[PromptToken],
+    config: &ScanConfig,
     changes: &mut Vec<PromptChange>,
     next_change_id: &mut usize,
 ) {
@@ -4639,17 +5168,31 @@ pub fn generate_prompt_options(
     let has_exact = |w: &str| norms.iter().any(|n| *n == w);
     let slots: Vec<crate::scene::Slot> = tokens.iter().map(crate::scene::slot).collect();
     let has_subject = norms.iter().any(|n| *n == "solo" || crate::two::count_tag(n).is_some());
+    let is_multi = config.two_char
+        || norms.iter().any(|n| crate::two::count_tag(n).is_some_and(|(c, _)| c >= 2))
+        || norms.iter().any(|n| matches!(*n, "multiple girls" | "multiple boys" | "multiple others"));
+    let has_sketch = norms.iter().any(|n| matches!(*n, "monochrome" | "greyscale" | "grayscale" | "sketch" | "lineart"));
+    let has_simple_bg = norms.iter().any(|n| matches!(*n, "simple background" | "white background" | "grey background" | "solid background" | "gradient background"));
+    let custom_neg: HashSet<String> = crate::parser::parse_prompt(&config.custom_negative_raw)
+        .into_iter()
+        .map(|t| t.normalized)
+        .collect();
 
     let mut added = 0usize;
     let mut push_opt = |title: &str, why: &str, candidates: &[&str]| {
-        if added >= 3 {
+        if added >= 6 {
             return;
         }
-        let missing: Vec<&str> = candidates
-            .iter()
-            .copied()
-            .filter(|t| !has_exact(t))
-            .collect();
+        let mut missing: Vec<&str> = Vec::new();
+        for &t in candidates {
+            if has_exact(t) || !can_recommend_tag(t, tokens, config, &custom_neg) {
+                continue;
+            }
+            if missing.iter().any(|prev| recommendation_pair_conflict(prev, t)) {
+                continue;
+            }
+            missing.push(t);
+        }
         if missing.len() < 2 {
             return;
         }
@@ -4670,20 +5213,39 @@ pub fn generate_prompt_options(
         added += 1;
     };
 
-    // 1. Context-matched lighting when the prompt has no lighting effect yet. Time-of-day words (night, evening…)
-    // sort as lighting too, but they say when, not how it's lit, so they don't count here (a `night` prompt is
-    // exactly where the neon / backlight options belong).
+    // 0. Detailer stage: focus strictly on local micro-detail & lighting polish
+    if config.stage == crate::profiles::GenerationStage::Detailer {
+        push_opt(
+            "Detailer Micro-Polish",
+            "Refines crop-level facial, eye, and surface fidelity without adding global framing.",
+            &["eyelashes", "long eyelashes", "parted lips", "light blush", "backlighting"],
+        );
+    }
+
+    // 1. Context-matched lighting when the prompt has no lighting effect yet.
     const TIME_OF_DAY: &[&str] = &["night", "day", "evening", "morning", "afternoon", "midnight", "dusk", "dawn", "dark", "night sky", "starry sky"];
     let lit = tokens
         .iter()
         .zip(&slots)
         .any(|(t, s)| *s == crate::scene::Slot::Light && !TIME_OF_DAY.contains(&t.normalized.as_str()));
-    if !lit {
-        if has("night") || has("cyberpunk") || has("neon") || has("city lights") {
+    if !lit && config.target_view != TargetView::Turnaround360 {
+        if has_sketch {
+            push_opt(
+                "Sketch Shading & Contrast",
+                "Enhances monochrome or sketch linework with clear tonal depth.",
+                &["high contrast", "shadow", "backlighting", "hatching (texture)"],
+            );
+        } else if has("night") || has("cyberpunk") || has("neon") || has("city lights") {
             push_opt(
                 "Night / Neon Lighting",
                 "No lighting tag yet — these fit dark or neon scenes.",
                 &["backlighting", "neon lights", "bokeh", "light particles"],
+            );
+        } else if has("sunset") || has("dusk") || has("evening") {
+            push_opt(
+                "Golden Hour Lighting",
+                "No lighting tag yet — enhances warm sunset tones and silhouettes.",
+                &["backlighting", "lens flare", "sunlight", "bloom"],
             );
         } else if has("indoors") || has("classroom") || has("bedroom") || has("cafe") || has("room") {
             push_opt(
@@ -4697,6 +5259,12 @@ pub fn generate_prompt_options(
                 "No lighting tag yet — adds sunlight and outdoor atmosphere.",
                 &["sunlight", "dappled sunlight", "lens flare", "sunbeam"],
             );
+        } else if has("portrait") || has("close-up") || has_simple_bg {
+            push_opt(
+                "Studio / Portrait Lighting",
+                "No lighting tag yet — sculpts facial features and separates subject.",
+                &["backlighting", "high contrast", "shadow", "depth of field"],
+            );
         } else {
             push_opt(
                 "Lighting & Depth",
@@ -4706,21 +5274,12 @@ pub fn generate_prompt_options(
         }
     }
 
-    // 2. Expression options when a character is present without an expression tag
+    // 2. Expression & gaze options when a character is present without an expression tag
     if has_subject && !slots.contains(&crate::scene::Slot::Expression) {
         push_opt(
             "Expression",
             "Character has no expression tag — pick a subtle mood.",
             &["light smile", "parted lips", "smug", "light blush"],
-        );
-    }
-
-    // 3. Generic-tag enrichment when broad tags are used on screen
-    if has_exact("standing") {
-        push_opt(
-            "Pose Variety",
-            "Refines generic 'standing' with more natural posture cues.",
-            &["contrapposto", "hand on own hip", "head tilt", "leaning forward"],
         );
     } else if has_exact("smiling") || has_exact("smile") {
         push_opt(
@@ -4728,14 +5287,132 @@ pub fn generate_prompt_options(
             "Adds nuance beyond a plain smile.",
             &["parted lips", "blush", "happy", "sparkling eyes"],
         );
+    } else if has_exact("serious") || has_exact("expressionless") {
+        push_opt(
+            "Moody Expression Nuance",
+            "Adds subtle tension to serious or calm expressions.",
+            &["parted lips", "furrowed brow", "shadow", "high contrast"],
+        );
     }
 
-    // 4. Motion / wind physics for long hair, skirts, capes, or ribbons
+    // 3. Generic-tag pose enrichment (or missing pose anchor on Base stage)
+    if has_exact("standing") {
+        push_opt(
+            "Pose Variety",
+            "Refines generic 'standing' with more natural posture cues.",
+            &["contrapposto", "hand on own hip", "head tilt", "leaning forward"],
+        );
+    } else if has_exact("sitting") || has_exact("seated") {
+        push_opt(
+            "Sitting Pose Nuance",
+            "Refines generic 'sitting' with relaxed posture details.",
+            &["crossed legs", "leaning forward", "head tilt", "looking back"],
+        );
+    } else if has_exact("lying") || has_exact("lying down") {
+        push_opt(
+            "Lying Pose Nuance",
+            "Adds natural limb placement to 'lying' poses.",
+            &["on side", "outstretched arm", "head tilt", "looking at viewer"],
+        );
+    } else if has_subject
+        && !slots.contains(&crate::scene::Slot::Pose)
+        && config.stage == crate::profiles::GenerationStage::Base
+        && config.pose == 0
+    {
+        push_opt(
+            "Pose & Limb Anchor",
+            "No pose tag yet — anchors hands and posture to prevent stiff mannequin arms.",
+            &["standing", "sitting", "hand on own hip", "head tilt"],
+        );
+    }
+
+    // 4. Multi-character interaction staging
+    if is_multi
+        && !norms.iter().any(|n| crate::two::is_interaction(n))
+        && config.stage == crate::profiles::GenerationStage::Base
+    {
+        push_opt(
+            "Character Interaction",
+            "Several characters with no shared interaction — links their poses naturally.",
+            &["holding hands", "facing another", "back-to-back", "eye contact"],
+        );
+    }
+
+    // 5. Missing Setting / Background depth when a subject has no setting yet
+    if has_subject
+        && !slots.contains(&crate::scene::Slot::Setting)
+        && !has_simple_bg
+        && config.stage != crate::profiles::GenerationStage::Detailer
+    {
+        if has("portrait") || has("close-up") {
+            push_opt(
+                "Background Polish",
+                "No setting tag yet — keeps focus cleanly on the portrait.",
+                &["simple background", "gradient background", "dark background"],
+            );
+        } else if has("cyberpunk") || has("neon") {
+            push_opt(
+                "Urban Cyberpunk Setting",
+                "Grounds cyberpunk elements in a cohesive city backdrop.",
+                &["cityscape", "alley", "neon lights", "night"],
+            );
+        } else {
+            push_opt(
+                "Scene & Atmosphere",
+                "No setting tag yet — grounds the character in an environment.",
+                &["outdoors", "blue sky", "cloud", "depth of field"],
+            );
+        }
+    }
+
+    // 6. Missing Camera / Composition polish when no camera framing tag is present
+    if has_subject
+        && !slots.contains(&crate::scene::Slot::Camera)
+        && config.target_view == TargetView::None
+        && config.camera_angle == 0
+        && config.stage != crate::profiles::GenerationStage::Detailer
+    {
+        if config.aspect_ratio.is_widescreen() {
+            push_opt(
+                "Widescreen Composition",
+                "Tailored to wide canvas ratios with environmental depth.",
+                &["wide shot", "depth of field", "blurry background", "blurry foreground"],
+            );
+        } else if config.aspect_ratio.is_portrait() {
+            push_opt(
+                "Vertical Portrait Framing",
+                "Tailored to tall 9:16 framing.",
+                &["full body", "cowboy shot", "from below", "foreshortening"],
+            );
+        } else {
+            push_opt(
+                "Composition & Camera",
+                "No camera framing tag yet — adds dynamic perspective.",
+                &["cowboy shot", "from below", "dutch angle", "depth of field"],
+            );
+        }
+    }
+
+    // 7. Theme & Material FX (non-exclusive so multiple orthogonal accents can fire)
     if has("long hair") || has("skirt") || has("dress") || has("cape") || has("ribbon") {
         push_opt(
             "Motion & Flow",
             "Adds life to long hair and loose fabric already in your prompt.",
             &["wind", "floating hair", "wind lift", "floating clothes"],
+        );
+    }
+    if has("beach") || has("ocean") || has("rain") || has("pool") || has("swimsuit") || has("bikini") {
+        push_opt(
+            "Water & Surface FX",
+            "Enhances water/swimwear scenes with realistic surface detail.",
+            &["wet", "water drop", "wet hair", "shiny skin"],
+        );
+    }
+    if has("sword") || has("magic") || has("witch") || has("armor") || has("wings") {
+        push_opt(
+            "Fantasy & FX",
+            "Adds atmospheric energy to fantasy/action elements.",
+            &["glowing", "magic circle", "sparkle", "light particles"],
         );
     }
 }
@@ -4769,6 +5446,7 @@ mod tests {
             lora_tags_raw: String::new(), arranged: false, natural: false, two_char: false, char2_prompt_raw: String::new(), char2_lora_tags_raw: String::new(), char_break: false, scene_prompt_raw: String::new(), more_chars: Vec::new(),
 
             detail: crate::profiles::DetailLevel::Balanced,
+            ..Default::default()
         }
     }
 
@@ -6239,6 +6917,95 @@ mod tests {
         assert!(!res.changes.iter().any(|c| c.action == ChangeAction::SizeConflict && c.original == "slender"));
         assert!(!res.changes.iter().any(|c| c.action == ChangeAction::SizeConflict && c.original == "gigantic breasts"));
         assert!(!res.changes.iter().any(|c| c.action == ChangeAction::SizeConflict && c.original == "wide hips"));
+    }
+
+    #[test]
+    fn refined_recommendation_cards_respect_context_conflicts_and_real_tags() {
+        let mut config = cfg(TargetView::None);
+
+        // 1. Detailer stage only recommends local micro-polish, never global setting/framing
+        config.stage = crate::profiles::GenerationStage::Detailer;
+        let (det_res, _) = run("1girl, solo, smile", &config);
+        for c in det_res.changes.iter().filter(|c| c.action == ChangeAction::Recommendation) {
+            assert!(!c.suggested_alternative.contains("wide shot") && !c.suggested_alternative.contains("outdoors"), "{c:?}");
+        }
+        assert!(det_res.changes.iter().any(|c| c.reason.contains("Detailer Micro-Polish")), "{:?}", det_res.changes);
+
+        // 2. Monochrome sketch gets shading/contrast instead of bokeh or blue sky
+        config.stage = crate::profiles::GenerationStage::Base;
+        let (sk_res, _) = run("1girl, solo, monochrome, sketch", &config);
+        assert!(sk_res.changes.iter().any(|c| c.reason.contains("Sketch Shading & Contrast")), "{:?}", sk_res.changes);
+        for c in sk_res.changes.iter().filter(|c| c.action == ChangeAction::Recommendation) {
+            assert!(!c.suggested_alternative.contains("bokeh") && !c.suggested_alternative.contains("blue sky"), "{c:?}");
+        }
+
+        // 3. Sitting + wide hips does not recommend standing-only contrapposto; closed eyes + smile excludes sparkling eyes
+        let (sit_res, _) = run("1girl, solo, sitting, wide hips, smile, closed eyes", &config);
+        for c in sit_res.changes.iter().filter(|c| c.action == ChangeAction::Recommendation) {
+            assert!(!c.suggested_alternative.contains("contrapposto"), "{c:?}");
+            assert!(!c.suggested_alternative.contains("sparkling eyes"), "{c:?}");
+        }
+
+        // 4. Custom negative excludes matching tags from all Recommendation cards
+        config.custom_negative_raw = "zettai ryouiki, garter straps, bokeh".into();
+        let (neg_res, _) = run("1girl, solo, thighhighs, pleated skirt, night, city", &config);
+        for c in neg_res.changes.iter().filter(|c| c.action == ChangeAction::Recommendation) {
+            assert!(!c.suggested_alternative.contains("zettai ryouiki") && !c.suggested_alternative.contains("bokeh"), "{c:?}");
+        }
+
+        // 5. New Combo Synergy rules fire and use real Danbooru tags
+        config.custom_negative_raw.clear();
+        let (rain_res, _) = run("1girl, solo, rain, street, thighhighs, pleated skirt", &config);
+        assert!(rain_res.changes.iter().any(|c| c.reason.contains("Rain & Wet Street Reflections") && c.suggested_alternative.contains("puddle")), "{:?}", rain_res.changes);
+        assert!(rain_res.changes.iter().any(|c| c.reason.contains("Zettai Ryouiki") && c.suggested_alternative.contains("zettai ryouiki")), "{:?}", rain_res.changes);
+
+        if let Some(list) = crate::danbooru::local() {
+            for rule in COMBO_SYNERGY_RULES {
+                for t in rule.recommend_tags {
+                    assert!(list.get(t).is_some(), "Combo rule '{}' tag '{t}' missing from selected_tags.csv", rule.name);
+                }
+            }
+            for p in [
+                "1girl, solo, monochrome, sketch",
+                "1girl, solo, serious, classroom",
+                "2girls, beach, swimsuit",
+                "1girl, solo, sunset, shrine",
+                "1girl, solo, portrait",
+            ] {
+                for c in run(p, &config).0.changes.iter().filter(|c| c.reason.starts_with("Prompt Option")) {
+                    for t in c.suggested_alternative.split(',').map(str::trim) {
+                        assert!(list.get(t).is_some(), "Prompt Option tag '{t}' (from '{p}') missing from selected_tags.csv");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn recommendation_cards_never_bundle_mutually_exclusive_tags() {
+        let config = cfg(TargetView::None);
+        for p in ["1girl, solo", "2girls", "1girl, solo, portrait", "1girl, solo, large breasts, shirt"] {
+            let (res, _) = run(p, &config);
+            for c in res.changes.iter().filter(|c| c.action == ChangeAction::Recommendation) {
+                let tags: Vec<&str> = c.suggested_alternative.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+                for i in 0..tags.len() {
+                    for j in (i + 1)..tags.len() {
+                        assert!(
+                            !recommendation_pair_conflict(tags[i], tags[j]),
+                            "Card '{}' for '{p}' bundled conflicting tags '{}' and '{}'",
+                            c.reason, tags[i], tags[j]
+                        );
+                    }
+                }
+            }
+        }
+        // UpperBody lower-body swap does not force "slender build" on curvy characters
+        let upper = cfg(TargetView::UpperBody);
+        let (_, out) = run("1girl, large breasts, boots", &upper);
+        assert!(!out.contains("slender build"), "UpperBody swap should not slim down busty characters: {out}");
+        // Front-View card does not repeat when straight-on & facing viewer are already present
+        let (fv, _) = run("1girl, front view, straight-on, facing viewer, sitting on bed", &config);
+        assert!(!fv.changes.iter().any(|c| c.reason.contains("Front-View Angle Lock")));
     }
 }
 

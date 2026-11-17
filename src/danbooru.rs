@@ -17,6 +17,8 @@ pub struct TagInfo {
 pub struct TagList {
     tags: Vec<TagInfo>,
     by_name: HashMap<String, usize>,
+    /// Inverted index from stemmed content word -> sorted, deduplicated indices into `tags` (non-character tags only).
+    word_index: HashMap<String, Vec<usize>>,
 }
 
 static LIST: OnceLock<TagList> = OnceLock::new();
@@ -73,7 +75,19 @@ fn parse(text: &str) -> TagList {
         });
     }
     let by_name = tags.iter().enumerate().map(|(i, t)| (t.name.clone(), i)).collect();
-    TagList { tags, by_name }
+    let mut word_index: HashMap<String, Vec<usize>> = HashMap::new();
+    for (i, t) in tags.iter().enumerate() {
+        if t.character {
+            continue;
+        }
+        for w in similar_words(&t.name) {
+            let entry = word_index.entry(w).or_default();
+            if entry.last().copied() != Some(i) {
+                entry.push(i);
+            }
+        }
+    }
+    TagList { tags, by_name, word_index }
 }
 
 /// The tag list, downloading the small CSV (~300 KB) the first time if the tagger
@@ -121,6 +135,13 @@ const STOPWORDS: &[&str] = &[
     "being", "wearing", "looking", "a", "an", "of", "in", "on", "at", "to", "by", "as", "or", "but", "out",
 ];
 
+fn similar_words(t: &str) -> Vec<String> {
+    t.split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.len() >= 3 && !STOPWORDS.contains(w))
+        .map(|w| w.strip_suffix('s').filter(|s| s.len() >= 3).unwrap_or(w).to_string())
+        .collect()
+}
+
 impl TagList {
     pub fn get(&self, tag: &str) -> Option<&TagInfo> {
         self.by_name.get(&key(tag)).map(|&i| &self.tags[i])
@@ -142,33 +163,32 @@ impl TagList {
     /// with hundreds of tags ("eyes", "hair") don't count, so "downcast eyes" doesn't
     /// suggest "blue eyes".
     pub fn similar(&self, tag: &str, n: usize) -> Vec<&TagInfo> {
-        let words = |t: &str| -> Vec<String> {
-            t.split(|c: char| !c.is_alphanumeric())
-                .filter(|w| w.len() >= 3 && !STOPWORDS.contains(w))
-                .map(|w| w.strip_suffix('s').filter(|s| s.len() >= 3).unwrap_or(w).to_string())
-                .collect()
-        };
-        let want = words(&key(tag));
-        let freq = |w: &str| self.tags.iter().filter(|t| !t.character && words(&t.name).iter().any(|x| x == w)).count();
-        let weights: Vec<(String, f32)> = want
-            .iter()
-            .filter_map(|w| {
-                let f = freq(w);
-                (f > 0 && f <= 40).then(|| (w.clone(), 1.0 / f as f32))
-            })
-            .collect();
+        let want = similar_words(&key(tag));
+        let mut weights: Vec<(&[usize], f32)> = Vec::new();
+        let mut seen_words: HashSet<String> = HashSet::new();
+        for w in want {
+            if !seen_words.insert(w.clone()) {
+                continue;
+            }
+            if let Some(postings) = self.word_index.get(&w) {
+                let f = postings.len();
+                if f > 0 && f <= 40 {
+                    weights.push((postings.as_slice(), 1.0 / f as f32));
+                }
+            }
+        }
         if weights.is_empty() {
             return Vec::new();
         }
-        let mut scored: Vec<(f32, &TagInfo)> = self
-            .tags
-            .iter()
-            .filter(|t| !t.character)
-            .filter_map(|t| {
-                let tw = words(&t.name);
-                let score: f32 = weights.iter().filter(|(w, _)| tw.contains(w)).map(|(_, x)| x).sum();
-                (score > 0.0).then_some((score, t))
-            })
+        let mut scores: HashMap<usize, f32> = HashMap::new();
+        for (postings, weight) in weights {
+            for &idx in postings {
+                *scores.entry(idx).or_insert(0.0) += weight;
+            }
+        }
+        let mut scored: Vec<(f32, &TagInfo)> = scores
+            .into_iter()
+            .map(|(idx, score)| (score, &self.tags[idx]))
             .collect();
         scored.sort_by(|a, b| b.0.total_cmp(&a.0).then(b.1.count.cmp(&a.1.count)));
         scored.into_iter().take(n).map(|(_, t)| t).collect()
@@ -983,6 +1003,7 @@ mod tests {
             scene_prompt_raw: plan.scene.join(", "),
             more_chars: Vec::new(),
             detail: DetailLevel::Balanced,
+            ..Default::default()
         };
 
         let result = crate::two::combine_section_blocks(&[merged_char], &config, true, None);

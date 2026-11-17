@@ -28,7 +28,7 @@
 
 use crate::analyzer::{self, ScanConfig};
 use crate::detector::{self, PersonBox};
-use crate::profiles::{CheckpointProfile, DetailLevel, TargetView};
+use crate::profiles::{AspectRatio, CheckpointProfile, DetailLevel, GenerationStage, NegativeStrictness, TargetView};
 use crate::condenser::ExportFormat;
 use crate::{condenser, parser, scene, two};
 use anyhow::{anyhow, Context, Result};
@@ -40,7 +40,10 @@ const USAGE: &str = "usage: prompt-condenser --prompt \"<text>\" | - [--checkpoi
                      [--view none|turnaround|360|upper-body|close-up|front|from-behind|side|full-body] \
                      [--bust none|flat|small|medium|large|huge|gigantic] \
                      [--frame none|petite|shortstack|thick|pear|hourglass|muscular] [--no-fit-suggestions] \
-                     [--exaggerated] [--widescreen | --aspect 16:9|21:9] \
+                     [--exaggerated] [--widescreen | --aspect default|16:9|21:9|9:16|1:1] \
+                     [--stage base|hires|detailer|refiner|inpaint] \
+                     [--stages base,hires,detailer,...] \
+                     [--neg-strictness light|balanced|strict] [--negative \"<tags>\"] \
                      [--vrp --char \"<prompt>\" --char \"<prompt>\" (2-4) [--image <path>] [--regions \"x,y,w,h;...\"]] \
                      [--export comfyui|webui|novelai|plain]";
 
@@ -52,7 +55,11 @@ struct Options {
     arranged: bool,
     natural: bool,
     exaggerated: bool,
-    widescreen: bool,
+    aspect_ratio: AspectRatio,
+    stage: GenerationStage,
+    stages: Vec<GenerationStage>,
+    neg_strictness: NegativeStrictness,
+    custom_negative: String,
     view: TargetView,
     /// `--bust` / `--frame`: indexes into `profiles::BUSTS` / `FRAMES` (0 = none).
     bust: usize,
@@ -76,7 +83,11 @@ impl Default for Options {
             arranged: false,
             natural: false,
             exaggerated: false,
-            widescreen: false,
+            aspect_ratio: AspectRatio::Default,
+            stage: GenerationStage::Base,
+            stages: Vec::new(),
+            neg_strictness: NegativeStrictness::Balanced,
+            custom_negative: String::new(),
             view: TargetView::None,
             bust: 0,
             frame: 0,
@@ -210,13 +221,38 @@ fn parse_args(args: &[String], stdin: impl FnOnce() -> Result<String>) -> Result
             "--regions" => opts.regions = Some(parse_regions(it.next().ok_or_else(|| anyhow!("--regions needs boxes\n{USAGE}"))?)?),
             "--natural" => opts.natural = true,
             "--exaggerated" | "--exaggerated-proportions" => opts.exaggerated = true,
-            "--widescreen" => opts.widescreen = true,
+            "--widescreen" => opts.aspect_ratio = AspectRatio::Widescreen16x9,
             "--aspect" => {
-                let v = it.next().ok_or_else(|| anyhow!("--aspect needs a ratio (e.g. 16:9)\n{USAGE}"))?;
-                let norm = v.trim().to_ascii_lowercase();
-                if matches!(norm.as_str(), "16:9" | "21:9" | "wide" | "widescreen") {
-                    opts.widescreen = true;
+                let v = it.next().ok_or_else(|| anyhow!("--aspect needs a ratio (e.g. 16:9, 21:9, 9:16, 1:1)\n{USAGE}"))?;
+                opts.aspect_ratio = AspectRatio::from_name(v).ok_or_else(|| {
+                    anyhow!("unknown aspect ratio {v}: use default, 16:9, 21:9, 9:16 or 1:1")
+                })?;
+            }
+            "--stage" => {
+                let v = it.next().ok_or_else(|| anyhow!("--stage needs a stage name\n{USAGE}"))?;
+                opts.stage = GenerationStage::from_name(v).ok_or_else(|| {
+                    anyhow!("unknown stage {v}: use base, hires, detailer, refiner or inpaint")
+                })?;
+            }
+            "--stages" => {
+                let v = it.next().ok_or_else(|| anyhow!("--stages needs a comma-separated list\n{USAGE}"))?;
+                for part in v.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                    let s = GenerationStage::from_name(part).ok_or_else(|| {
+                        anyhow!("unknown stage {part}: use base, hires, detailer, refiner or inpaint")
+                    })?;
+                    if !opts.stages.contains(&s) {
+                        opts.stages.push(s);
+                    }
                 }
+            }
+            "--neg-strictness" => {
+                let v = it.next().ok_or_else(|| anyhow!("--neg-strictness needs light, balanced or strict\n{USAGE}"))?;
+                opts.neg_strictness = NegativeStrictness::from_name(v).ok_or_else(|| {
+                    anyhow!("unknown negative strictness {v}: use light, balanced or strict")
+                })?;
+            }
+            "--negative" => {
+                opts.custom_negative = it.next().ok_or_else(|| anyhow!("--negative needs tags\n{USAGE}"))?.clone();
             }
             "--export" => {
                 let v = it.next().ok_or_else(|| anyhow!("--export needs a format\n{USAGE}"))?;
@@ -274,6 +310,10 @@ fn config_for(o: &Options) -> ScanConfig {
         scene_prompt_raw: String::new(),
         more_chars: Vec::new(),
         detail: DetailLevel::Balanced,
+        aspect_ratio: if o.vrp { AspectRatio::Default } else { o.aspect_ratio },
+        stage: o.stage,
+        negative_strictness: o.neg_strictness,
+        custom_negative_raw: o.custom_negative.clone(),
     }
 }
 
@@ -303,73 +343,10 @@ fn change_json(c: &crate::analyzer::PromptChange) -> serde_json::Value {
     })
 }
 
-/// True when `prompt` describes a single character (and not a group/couple/crowd).
-fn is_single_character_prompt(prompt: &str) -> bool {
-    let toks = parser::parse_prompt(prompt);
-    let has_multi = toks.iter().any(|t| {
-        let n = t.normalized.as_str();
-        matches!(n, "multiple girls" | "multiple boys" | "crowd" | "group" | "couple")
-            || crate::two::count_tag(n).is_some_and(|(cnt, _)| cnt >= 2)
-    });
-    if has_multi {
-        return false;
-    }
-    toks.iter().any(|t| {
-        let n = t.normalized.as_str();
-        n == "solo" || crate::two::count_tag(n).is_some_and(|(cnt, _)| cnt == 1)
-    })
-}
-
-/// ComfyUI 16:9 / widescreen single-character guard: prevents extra people or clones
-/// from spawning in the extra horizontal space.
-fn apply_widescreen_single_char_guard(positive: &str, negative: &str, checkpoint: CheckpointProfile) -> (String, String) {
-    if !is_single_character_prompt(positive) {
-        return (positive.to_string(), negative.to_string());
-    }
-    let toks = parser::parse_prompt(positive);
-    let has_norm = |tag: &str| toks.iter().any(|t| t.normalized == tag);
-
-    let mut pos_add: Vec<&str> = Vec::new();
-    if !has_norm("solo") {
-        pos_add.push("solo");
-    }
-    if checkpoint.supports_natural_language() {
-        if !has_norm("single character only") {
-            pos_add.push("single character only");
-        }
-        if !has_norm("one person alone in frame") {
-            pos_add.push("one person alone in frame");
-        }
-    }
-    // (not `solo focus`: on Danbooru it means several people with one in focus, which invites the extra people)
-
-    let new_pos = if pos_add.is_empty() {
-        positive.to_string()
-    } else if positive.trim().is_empty() {
-        pos_add.join(", ")
-    } else {
-        format!("{}, {}", positive.trim().trim_end_matches(','), pos_add.join(", "))
-    };
-
-    // Flux runs at CFG 1 without a negative prompt: only the positive part applies there
-    if checkpoint.default_negative().is_empty() {
-        return (new_pos, negative.to_string());
-    }
-    const WIDE_SOLO_NEG: &str = "2girls, 2boys, multiple girls, multiple boys, multiple views, split screen, \
-        clone, cloned, duplicate, twin, twins, doppelganger, extra people, crowd, background characters, two people";
-    let combined_neg = if negative.trim().is_empty() {
-        WIDE_SOLO_NEG.to_string()
-    } else {
-        format!("{}, {}", negative.trim().trim_end_matches(','), WIDE_SOLO_NEG)
-    };
-    let new_neg = condenser::merge_negative(&combined_neg, &new_pos);
-    (new_pos, new_neg)
-}
-
 /// The JSON `--prompt` prints.
 fn condense(o: &Options, detected: &Detected) -> serde_json::Value {
     let config = config_for(o);
-    let (result, out, mut positive) = clean(&o.text, &config, true);
+    let (result, out, positive) = clean(&o.text, &config, true);
     let mut changes: Vec<serde_json::Value> = result.changes.iter().map(change_json).collect();
 
     // --vrp: each character on its own, like the window's multi-character tabs
@@ -392,15 +369,13 @@ fn condense(o: &Options, detected: &Detected) -> serde_json::Value {
 
     // nothing the scene or a character asks for goes into the negative
     let asked = std::iter::once(positive.clone()).chain(regions_prompts.iter().cloned()).collect::<Vec<_>>().join(",\n");
-    let mut negative = condenser::recommended_negative(&config, &asked);
-    if o.widescreen && !o.vrp {
-        let (guarded_pos, guarded_neg) = apply_widescreen_single_char_guard(&positive, &negative, config.checkpoint);
-        positive = guarded_pos;
-        negative = guarded_neg;
-    }
+    let negative = condenser::recommended_negative(&config, &asked);
     let mut v = serde_json::json!({
         "checkpoint": format!("{:?}", config.checkpoint),
         "view": format!("{:?}", config.target_view),
+        "aspect_ratio": config.aspect_ratio.display_name(),
+        "stage": config.stage.display_name(),
+        "negative_strictness": config.negative_strictness.display_name(),
         "positive": positive,
         "negative": negative,
         "changes": changes,
@@ -409,6 +384,28 @@ fn condense(o: &Options, detected: &Detected) -> serde_json::Value {
         "chunks_before": out.before_chunks,
         "chunks_after": out.after_chunks,
     });
+    if !o.stages.is_empty() {
+        let mut stages_map = serde_json::Map::new();
+        for &st in &o.stages {
+            let mut sc = config.clone();
+            sc.stage = st;
+            let (sr, sout, spos) = clean(&o.text, &sc, true);
+            let sneg = condenser::recommended_negative(&sc, &spos);
+            let schanges: Vec<serde_json::Value> = sr.changes.iter().map(change_json).collect();
+            stages_map.insert(
+                st.cli_key().to_string(),
+                serde_json::json!({
+                    "stage": st.display_name(),
+                    "positive": condenser::format_prompt(&spos, o.export),
+                    "negative": condenser::format_prompt(&sneg, o.export),
+                    "tokens_after": sout.after_tokens,
+                    "chunks_after": sout.after_chunks,
+                    "changes": schanges,
+                }),
+            );
+        }
+        v["stages"] = serde_json::Value::Object(stages_map);
+    }
     // --export: the copyable texts in another tool's syntax (the VRP node reads ComfyUI's)
     let all = std::iter::once(positive.as_str()).chain(regions_prompts.iter().map(String::as_str)).collect::<Vec<_>>().join(", ");
     if let Some(note) = condenser::export_warning(&all, o.export) {
@@ -482,18 +479,57 @@ pub fn run_prompt_cli(args: &[String]) -> Result<()> {
 mod tests {
     #[test]
     fn widescreen_guard_is_for_one_character_and_never_adds_solo_focus() {
-        let (p, n) = apply_widescreen_single_char_guard("1girl, red hair, beach", "lowres", CheckpointProfile::PonyV6);
+        let (p, n) = condenser::apply_widescreen_single_char_guard("1girl, red hair, beach", "lowres", CheckpointProfile::PonyV6);
         assert!(p.contains("solo") && !p.contains("solo focus"), "{p}");
         assert!(n.contains("multiple girls") && n.contains("clone") && n.starts_with("lowres"), "{n}");
         // Anima reads plain words: the two phrases too
-        let (p, _) = apply_widescreen_single_char_guard("1girl, beach", "lowres", CheckpointProfile::Anima);
+        let (p, _) = condenser::apply_widescreen_single_char_guard("1girl, beach", "lowres", CheckpointProfile::Anima);
         assert!(p.contains("single character only"), "{p}");
-        // Flux: no negative
-        let (_, n) = apply_widescreen_single_char_guard("1girl, beach", "", CheckpointProfile::Flux);
+        // Flux: no negative, and period formatting stays valid
+        let (p, n) = condenser::apply_widescreen_single_char_guard("A girl on a beach.", "", CheckpointProfile::Flux);
         assert!(n.is_empty(), "{n}");
-        // two characters: untouched
-        let (p, n) = apply_widescreen_single_char_guard("2girls, beach", "lowres", CheckpointProfile::PonyV6);
+        assert!(!p.contains(".,"), "Flux prose should not have '.,': {p}");
+        // two characters (`2girls` OR `1girl, 1boy`): untouched
+        let (p, n) = condenser::apply_widescreen_single_char_guard("2girls, beach", "lowres", CheckpointProfile::PonyV6);
         assert_eq!((p.as_str(), n.as_str()), ("2girls, beach", "lowres"));
+        let (p, n) = condenser::apply_widescreen_single_char_guard("1girl, 1boy, beach", "lowres", CheckpointProfile::PonyV6);
+        assert_eq!((p.as_str(), n.as_str()), ("1girl, 1boy, beach", "lowres"));
+    }
+
+    #[test]
+    fn integrated_widescreen_and_multistage_pipeline() {
+        let no_stdin = || -> Result<String> { panic!("stdin not expected") };
+        // Integrated 16:9 widescreen puts `solo` in SubjectCount (near front, not tacked at the end)
+        let o = parse_args(&args(&["1girl, red hair, smile, beach", "--checkpoint", "pony", "--aspect", "16:9"]), no_stdin).unwrap();
+        let v = condense(&o, &Detected::default());
+        let pos = v["positive"].as_str().unwrap();
+        let neg = v["negative"].as_str().unwrap();
+        assert!(pos.contains("solo") && pos.find("solo").unwrap() < pos.find("beach").unwrap(), "{pos}");
+        assert!(neg.contains("multiple girls") && neg.contains("clone"), "{neg}");
+
+        // Flux 16:9 integrates cleanly into prose before the final period
+        let o = parse_args(&args(&["1girl, red hair, beach", "--checkpoint", "flux", "--widescreen"]), no_stdin).unwrap();
+        let v = condense(&o, &Detected::default());
+        let pos = v["positive"].as_str().unwrap();
+        assert!(pos.contains("one person alone in frame") && pos.ends_with('.') && !pos.contains(".,"), "{pos}");
+
+        // Detailer stage strips global framing/setting/multi-person tags and softens weights
+        let o = parse_args(
+            &args(&["2girls, (blue eyes:1.35), smile, full body, beach, sunset", "--checkpoint", "anima", "--stage", "detailer"]),
+            no_stdin,
+        ).unwrap();
+        let v = condense(&o, &Detected::default());
+        let pos = v["positive"].as_str().unwrap();
+        let neg = v["negative"].as_str().unwrap();
+        assert!(!pos.contains("full body") && !pos.contains("beach") && !pos.contains("2girls"), "{pos}");
+        assert!(pos.contains("blue eyes") && !pos.contains("1.35"), "{pos}");
+        assert!(neg.contains("multiple views"), "{neg}");
+
+        // Synonym condensation: `close up` + `close-up` condenses to one
+        let o = parse_args(&args(&["1girl, close-up, close up, smile", "--checkpoint", "anima"]), no_stdin).unwrap();
+        let v = condense(&o, &Detected::default());
+        let pos = v["positive"].as_str().unwrap();
+        assert_eq!(pos.matches("close").count(), 1, "{pos}");
     }
 
     use super::*;
@@ -728,5 +764,145 @@ mod tests {
         let wrong = condense(&Options { regions: Some(vec![[0.0, 0.0, 1.0, 1.0]]), ..o }, &Detected::default());
         assert_eq!(wrong["regions_source"], "strips");
         assert_eq!(wrong["warnings"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn portrait_aspect_and_ultrawide_guards() {
+        let no_stdin = || -> Result<String> { panic!("stdin not expected") };
+        // Portrait 9:16 adds solo on non-Flux single-char and guards against split-screen/4koma
+        let o = parse_args(&args(&["1girl, red hair", "--checkpoint", "anima", "--aspect", "9:16"]), no_stdin).unwrap();
+        let v = condense(&o, &Detected::default());
+        let pos = v["positive"].as_str().unwrap();
+        let neg = v["negative"].as_str().unwrap();
+        assert!(pos.contains("solo"), "{pos}");
+        assert!(neg.contains("split screen") && neg.contains("4koma"), "{neg}");
+
+        // Flux + widescreen does not leak `solo`
+        let o = parse_args(&args(&["1girl, red hair", "--checkpoint", "flux", "--aspect", "21:9"]), no_stdin).unwrap();
+        let v = condense(&o, &Detected::default());
+        let pos = v["positive"].as_str().unwrap();
+        assert!(!pos.to_lowercase().contains("solo"), "{pos}");
+        assert!(pos.to_lowercase().contains("single character only"), "{pos}");
+    }
+
+    #[test]
+    fn multistage_batch_and_stage_guards() {
+        let no_stdin = || -> Result<String> { panic!("stdin not expected") };
+        let o = parse_args(
+            &args(&[
+                "score_9, 1girl, (blue eyes:1.35), dutch angle, full body, beach, smile, seated, sitting",
+                "--checkpoint",
+                "pony",
+                "--aspect",
+                "16:9",
+                "--stages",
+                "base,hires,detailer,refiner,inpaint",
+            ]),
+            no_stdin,
+        )
+        .unwrap();
+        let v = condense(&o, &Detected::default());
+        let stages = v["stages"].as_object().expect("stages object");
+        assert_eq!(stages.len(), 5);
+
+        let base_pos = stages["base"]["positive"].as_str().unwrap();
+        assert!(base_pos.contains("solo") && base_pos.contains("full body"), "{base_pos}");
+        // Synonym condensation: seated + sitting -> one
+        assert_eq!(base_pos.matches("sitting").count() + base_pos.matches("seated").count(), 1, "{base_pos}");
+
+        // Detailer drops global framing, setting, lens distortion, AND does not inject widescreen solo clauses
+        let det_pos = stages["detailer"]["positive"].as_str().unwrap();
+        let det_neg = stages["detailer"]["negative"].as_str().unwrap();
+        assert!(!det_pos.contains("full body") && !det_pos.contains("beach") && !det_pos.contains("dutch angle"), "{det_pos}");
+        assert!(!det_pos.contains("single character only"), "{det_pos}");
+        assert!(det_pos.contains("blue eyes") && !det_pos.contains("1.35"), "{det_pos}");
+        assert!(det_neg.contains("wide-angle") && det_neg.contains("out of focus"), "{det_neg}");
+
+        // Refiner drops Pony score tags and softens weights <= 1.10
+        let ref_pos = stages["refiner"]["positive"].as_str().unwrap();
+        assert!(!ref_pos.contains("score_9") && !ref_pos.contains("score 9"), "{ref_pos}");
+        assert!(!ref_pos.contains("1.35"), "{ref_pos}");
+
+        // Inpaint strips cropped/out of frame/cut off from negative
+        let inp_neg = stages["inpaint"]["negative"].as_str().unwrap();
+        assert!(!inp_neg.contains("cropped") && !inp_neg.contains("out of frame"), "{inp_neg}");
+    }
+
+    #[test]
+    fn multichar_negative_does_not_suppress_multiple_girls() {
+        let no_stdin = || -> Result<String> { panic!("stdin not expected") };
+        let o = parse_args(&args(&["2girls, beach", "--checkpoint", "anima", "--aspect", "16:9"]), no_stdin).unwrap();
+        let v = condense(&o, &Detected::default());
+        let neg = v["negative"].as_str().unwrap();
+        assert!(!neg.contains("multiple girls") && !neg.contains("extra people"), "{neg}");
+    }
+
+    #[test]
+    fn parser_handles_escaped_parens_without_corrupting_commas() {
+        let toks = parser::parse_prompt(r"kay \(girls und panzer\), 1girl, smile");
+        assert_eq!(toks.len(), 3, "{toks:?}");
+        assert_eq!(toks[1].normalized, "1girl");
+        assert_eq!(toks[2].normalized, "smile");
+    }
+
+    #[test]
+    fn negative_strictness_and_style_bleed_protection() {
+        let no_stdin = || -> Result<String> { panic!("stdin not expected") };
+        // Light strictness trims default negative to core quality tags
+        let light = condense(
+            &parse_args(&args(&["1girl, red hair", "--checkpoint", "anima", "--neg-strictness", "light"]), no_stdin).unwrap(),
+            &Detected::default(),
+        );
+        let light_neg = light["negative"].as_str().unwrap();
+        assert!(light_neg.contains("worst quality"), "{light_neg}");
+        assert!(!light_neg.contains("watermark") && !light_neg.contains("mutated hands"), "{light_neg}");
+
+        // Strict adds extra artifact/anatomy suppression; anime triggers 2D/3D bleed guard; custom negative merges cleanly
+        let strict = condense(
+            &parse_args(
+                &args(&[
+                    "1girl, anime, red hair",
+                    "--checkpoint",
+                    "anima",
+                    "--neg-strictness",
+                    "strict",
+                    "--negative",
+                    "bad teeth, red hair",
+                ]),
+                no_stdin,
+            )
+            .unwrap(),
+            &Detected::default(),
+        );
+        let strict_neg = strict["negative"].as_str().unwrap();
+        assert!(strict_neg.contains("mutated hands") && strict_neg.contains("3d"), "{strict_neg}");
+        assert!(strict_neg.contains("bad teeth") && !strict_neg.contains("red hair"), "{strict_neg}");
+
+        // Monochrome + sketch positive strips sketch/monochrome from negative
+        let sketch = condense(
+            &parse_args(&args(&["1girl, monochrome, sketch", "--checkpoint", "anima", "--negative", "sketch, blurry"]), no_stdin).unwrap(),
+            &Detected::default(),
+        );
+        let sketch_neg = sketch["negative"].as_str().unwrap();
+        assert!(!sketch_neg.contains("sketch") && sketch_neg.contains("blurry"), "{sketch_neg}");
+    }
+
+    #[test]
+    fn recommended_card_system_suggests_diverse_contextual_options() {
+        let no_stdin = || -> Result<String> { panic!("stdin not expected") };
+        let v = condense(
+            &parse_args(&args(&["1girl, solo, sitting, sword", "--checkpoint", "anima"]), no_stdin).unwrap(),
+            &Detected::default(),
+        );
+        let reasons: Vec<&str> = v["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|c| c["reason"].as_str())
+            .filter(|r| r.starts_with("Prompt Option"))
+            .collect();
+        assert!(reasons.len() >= 4, "expected rich Prompt Option cards, got: {reasons:?}");
+        assert!(reasons.iter().any(|r| r.contains("Sitting Pose Nuance")), "{reasons:?}");
+        assert!(reasons.iter().any(|r| r.contains("Fantasy & FX")), "{reasons:?}");
     }
 }

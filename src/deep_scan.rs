@@ -122,7 +122,7 @@ pub(crate) fn wire_deep_scan(ui: &AppWindow, state: &State) {
                                     let tokens = ai_engine::request_tokens(&req);
                                     let rules: Vec<PromptChange> =
                                         st.changes.iter().chain(st.others.iter().flat_map(|o| o.changes.iter())).cloned().collect();
-                                    let cards = ai_engine::convert_ai_changes_for(&ai_out.changes, &tokens, &rules, req.config.two_char);
+                                    let cards = ai_engine::convert_ai_changes_with_config(&ai_out.changes, &tokens, &rules, &req.config);
                                     // on the 2 Characters tab, a card about character 2's tags goes with character 2
                                     let norms = |p: &str| parser::parse_prompt(p).into_iter().map(|t| t.normalized).collect::<Vec<_>>();
                                     // on the multi-character tabs, a card about one character's tags goes with that character

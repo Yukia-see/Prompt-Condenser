@@ -247,6 +247,64 @@ pub fn prompt_guidance(raw_prompt: &str, config: &ScanConfig) -> Vec<String> {
         g.push("No lighting or time of day yet: add one that suits the place.".into());
     }
 
+    // Aspect ratio & generation stage awareness
+    use crate::profiles::{AspectRatio, GenerationStage};
+    match config.aspect_ratio {
+        AspectRatio::Widescreen16x9 | AspectRatio::Ultrawide21x9 if !config.two_char && !scenery => {
+            g.push(format!(
+                "Aspect ratio is {}: compose horizontally with foreground/background depth, and keep a single character \
+                 strictly alone (retain 'solo' on tag checkpoints, never 'solo focus').",
+                config.aspect_ratio.display_name()
+            ));
+        }
+        AspectRatio::Portrait9x16 => {
+            g.push("Aspect ratio is 9:16 Portrait: favor vertical composition and head-to-toe or tall architectural framing.".into());
+        }
+        _ => {}
+    }
+    match config.stage {
+        GenerationStage::HiresFix => {
+            g.push("Generation stage is HiresFix: preserve the exact pose and framing; soften weights <= 1.15 and avoid multi-view/turnaround tags.".into());
+        }
+        GenerationStage::Detailer => {
+            g.push("Generation stage is Detailer crop: focus strictly on local facial, eye, skin, and fabric micro-details; never add global framing ('full body', 'wide shot') or broad scenery.".into());
+        }
+        GenerationStage::Refiner => {
+            g.push("Generation stage is Refiner: refine lighting and surface fidelity with gentle weights (<= 1.10); omit base LoRAs and score/rating tags.".into());
+        }
+        GenerationStage::Inpaint => {
+            g.push("Generation stage is Inpaint: keep the masked region cohesive with surrounding lighting; avoid global framing tags and never put 'cropped' or 'out of frame' in the negative.".into());
+        }
+        GenerationStage::Base => {}
+    }
+
+    // Medium / style coherence & lighting/depth motivation
+    let is_sketch = norms.iter().any(|n| matches!(*n, "monochrome" | "greyscale" | "grayscale" | "sketch" | "lineart"));
+    let is_simple_bg = norms.iter().any(|n| matches!(*n, "simple background" | "white background" | "grey background" | "solid background"));
+    if is_sketch {
+        g.push("Medium is sketch/monochrome: preserve lineart/tonal style; never inject color tags, bokeh, or lens flare.".into());
+    }
+    const TIME_TAGS: &[&str] = &["night", "midnight", "sunset", "sunrise", "dusk", "dawn", "evening", "twilight", "night sky", "starry sky"];
+    const LIGHT_SOURCES: &[&str] = &["sunlight", "moonlight", "neon lights", "city lights", "backlighting", "light rays", "sunbeam", "dappled sunlight", "lamppost", "lantern", "candlelight", "firelight", "glowing"];
+    if norms.iter().any(|n| TIME_TAGS.contains(n))
+        && !norms.iter().any(|n| LIGHT_SOURCES.iter().any(|l| *n == *l || n.contains(l)))
+        && config.detail != DetailLevel::Faithful
+        && config.stage != GenerationStage::Detailer
+    {
+        g.push("A time of day is specified without a light source: add a motivated light tag (e.g. moonlight, neon lights, sunbeam, backlighting) to anchor shadows and rim contrast.".into());
+    }
+    if is_simple_bg {
+        g.push("Background is intentionally simple/studio: keep it clean and avoid inventing clutter, scenery, or bokeh.".into());
+    }
+
+    // User custom negative exclusions
+    if !config.custom_negative_raw.trim().is_empty() {
+        g.push(format!(
+            "User negative exclusions ({}): never add or suggest these in improved_prompt or changes.",
+            config.custom_negative_raw.trim()
+        ));
+    }
+
     // What the rule engine already found
     if config.resolve_conflicts_enabled {
         let rules = crate::analyzer::analyze_with_rules(&tokens, config);
@@ -413,10 +471,13 @@ pub fn build_ai_system_and_user_prompt_for(raw_prompt: &str, config: &ScanConfig
             quality_tags.join(", ")
         )
     };
+    let effective_cap = config.stage.weight_cap(config.checkpoint);
     let weights = if config.checkpoint == CheckpointProfile::Anima && config.pinned_emphasis_raw.trim().is_empty() {
-        "Write clean, unweighted canonical Danbooru tags with spaces instead of underscores; do not add (tag:1.1) weight syntax unless explicitly pinned.".to_string()
+        format!(
+            "Write clean, unweighted canonical Danbooru tags with spaces instead of underscores; do not add (tag:1.1) weight syntax unless explicitly pinned (never above {effective_cap:.2})."
+        )
     } else if config.checkpoint.uses_explicit_weights() {
-        format!("Use (tag:weight) syntax sparingly; never above {:.2}.", config.checkpoint.max_safe_weight())
+        format!("Use (tag:weight) syntax sparingly; never above {effective_cap:.2}.")
     } else {
         "This checkpoint ignores weights: write natural-language sentences, no (tag:1.2) syntax.".to_string()
     };
@@ -429,13 +490,37 @@ pub fn build_ai_system_and_user_prompt_for(raw_prompt: &str, config: &ScanConfig
         } else {
             format!(", plus '{view_negs}' for the target framing")
         };
+        let (count_range, strict_note) = match config.negative_strictness {
+            crate::profiles::NegativeStrictness::Light => (
+                "6-12",
+                "STRICTNESS = LIGHT: keep it minimal (core quality + critical framing/opposite locks only; avoid bloated lists).",
+            ),
+            crate::profiles::NegativeStrictness::Balanced => (
+                "12-22",
+                "STRICTNESS = BALANCED: combine checkpoint defaults, framing/posture opposites, and style/scene bleed guards.",
+            ),
+            crate::profiles::NegativeStrictness::Strict => (
+                "18-32",
+                "STRICTNESS = STRICT: add comprehensive anatomy/hand/finger error tags, exposure/artifact guards, clone prevention, and scene/style opposites.",
+            ),
+        };
+        let stage_neg_hint = match config.stage {
+            crate::profiles::GenerationStage::Inpaint => " Stage is Inpaint: NEVER include 'cropped', 'out of frame', or 'cut off'.",
+            crate::profiles::GenerationStage::Detailer => " Stage is Detailer: include 'wide shot, full body, out of focus, extra people'.",
+            _ => "",
+        };
+        let custom_neg_hint = if config.custom_negative_raw.trim().is_empty() {
+            String::new()
+        } else {
+            format!(" Also respect user's custom negative exclusions: {}.", config.custom_negative_raw.trim())
+        };
         format!(
-            "REQUIRED, never empty. Write 12-30 comma-separated negative tags that protect improved_prompt: start from \
-             this checkpoint's usual negatives ({}{view_hint}), then add concrete Danbooru tags for what would pull the \
+            "REQUIRED, never empty. {strict_note} Write {count_range} comma-separated negative tags that protect improved_prompt: \
+             start from this checkpoint's usual negatives ({}{view_hint}), then add concrete Danbooru tags for what would pull the \
              image away from THIS scene (e.g. 'full body, lower body' for an upper-body shot, 'crowd, multiple girls' \
-             when solo, 'indoors' when outdoors, 'daytime, bright sunlight' for a night scene: name the OPPOSITE of \
+             when solo, 'indoors' when outdoors, 'daytime, sunlight' for a night scene, 'standing' when sitting: name the OPPOSITE of \
              what this scene has). Write each as a real tag naming the unwanted thing itself, never 'no X', 'wrong X', \
-             'unwanted X' or 'lack of X'. Never include anything improved_prompt asks for.",
+             'unwanted X' or 'lack of X'. Never include anything improved_prompt asks for.{stage_neg_hint}{custom_neg_hint}",
             config.checkpoint.default_negative()
         )
     };
@@ -531,6 +616,12 @@ pub fn build_ai_system_and_user_prompt_for(raw_prompt: &str, config: &ScanConfig
         },
         format!("Cleanup: {cleanup}"),
     ];
+    if config.stage != crate::profiles::GenerationStage::Base {
+        context.push(format!("Generation stage: {}.", config.stage.display_name()));
+    }
+    if config.aspect_ratio != crate::profiles::AspectRatio::Default {
+        context.push(format!("Canvas aspect ratio: {}.", config.aspect_ratio.display_name()));
+    }
     for (list, idx, what) in [
         (crate::profiles::CAMERA_ANGLES, config.camera_angle, "camera angle"),
         (crate::profiles::POSES, config.pose, "pose"),
@@ -812,8 +903,11 @@ pub(crate) fn improved_prompt_step(config: &ScanConfig) -> String {
             add_limit = if prose { "Add at most 1-2 descriptive details" } else { "Add at most 3 tags" }
         ),
         DetailLevel::Balanced => format!(
-            "{base} Fill gaps: if there's no lighting, background/setting or expression, add specific ones that fit THIS \
-             scene's setting, time of day and mood. Invent them from the scene; don't reuse stock phrases."
+            "{base} Fill gaps thoughtfully: order tags cleanly (Quality -> Count -> Identity/Body -> Hair/Eyes -> \
+             Outfit/Material -> Pose/Limb Anchors/Expression -> Camera/Depth -> Setting/Light/Atmosphere). If lighting, \
+             setting, pose anchor, or expression is missing, add concrete Danbooru tags motivated by the scene's theme \
+             and time of day. Never pad with cliché 'bokeh, depth of field' on simple backgrounds, sketches, turnarounds, \
+             or Detailer crops."
         ),
         DetailLevel::Rich => format!(
             "{base} DETAIL LEVEL = RICH: turn it into a detailed, vivid description of the same scene. Go through this \
@@ -823,7 +917,7 @@ pub(crate) fn improved_prompt_step(config: &ScanConfig) -> String {
              POSE (body position, what the hands do, head tilt, where the gaze goes); \
              SETTING (foreground, background, props, architecture or nature details); \
              LIGHT (light source, its direction and color, time of day, shadows, reflections); \
-             CAMERA (shot type, angle, lens feel, depth of field); \
+             CAMERA (shot type, angle, lens feel, depth of field — skip depth/blur on simple backgrounds or turnarounds); \
              ATMOSPHERE (mood, weather, particles like petals or dust, color palette, art style or medium). \
              Write descriptive pairs instead of bare tags ('flowing silver hair' rather than 'silver hair', 'red silk \
              kimono with gold embroidery' rather than 'kimono'); enriching a user's tag this way still counts as keeping it. \

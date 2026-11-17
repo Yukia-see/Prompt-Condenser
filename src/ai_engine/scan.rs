@@ -128,16 +128,22 @@ pub fn run_ai_scan(req: &AiScanRequest) -> Result<(AiJsonOutput, String)> {
         }
     }
     let mut rescans = 0;
-    while !scan_problems(&best, req).is_empty() && rescans < 2 && !budget.spent() && !cancelled() {
+    let req_tokens = request_tokens(req);
+    let req_rules = rules_for_request(req, &req_tokens);
+    while !scan_problems_with(&best, req, &req_tokens, &req_rules).is_empty()
+        && rescans < 2
+        && !budget.spent()
+        && !cancelled()
+    {
         rescans += 1;
         let Ok(next) = scan_once(req, &http, &base, &system, &prompt, &mut send_think, &mut seed) else { continue };
-        merge_scan(&mut best, next, req);
+        merge_scan_with(&mut best, next, req, &req_tokens, &req_rules);
     }
     best.recommended_negative = clean_negative(&best.recommended_negative);
-    enforce_checkpoint_rules(&mut best, req.config.checkpoint);
+    enforce_checkpoint_rules_with_config(&mut best, &req.config);
     enforce_body_choices(&mut best, &req.config);
     let mut placement = model_placement(&req.host, &req.model).unwrap_or_else(|| "unknown device".to_string());
-    let missing = scan_problems(&best, req);
+    let missing = scan_problems_with(&best, req, &req_tokens, &req_rules);
     if rescans > 0 {
         placement.push_str(&format!(" • re-scanned {rescans}×"));
     }
@@ -226,28 +232,8 @@ pub fn request_tokens(req: &AiScanRequest) -> Vec<crate::parser::PromptToken> {
     t
 }
 
-pub(crate) fn cards_ok(o: &AiJsonOutput, req: &AiScanRequest) -> bool {
-    if o.improved_prompt.trim().is_empty() {
-        return false;
-    }
-    let tokens = request_tokens(req);
-    // Layout tags (quality, group count, "far left"…) are added by the app itself (`two::combine`,
-    // `ensure_quality_tags`), so they are no change that needs a card. Counting them made every
-    // 3-4 character scan re-scan twice and end with "still missing: cards".
-    // A layout tag the user wrote (their own `2girls`, `left`…) is content: changing it to `3girls`
-    // must still need a card. Only layout the AI added on top is ignored.
-    let before: std::collections::HashSet<String> = tokens.iter().map(|t| t.normalized.clone()).collect();
-    let multi = req.config.two_char;
-    let content = |t: &String| before.contains(t) || !(is_quality_tag_any(t) || (multi && is_layout_tag(t, CheckpointProfile::Flux)));
-    let after: std::collections::HashSet<String> = crate::parser::parse_prompt(&o.improved_prompt)
-        .into_iter()
-        .map(|t| t.normalized)
-        .filter(content)
-        .collect();
-    if before == after {
-        return true; // nothing to change, so no cards needed
-    }
-    let rules = if req.config.two_char {
+fn rules_for_request(req: &AiScanRequest, tokens: &[crate::parser::PromptToken]) -> Vec<PromptChange> {
+    if req.config.two_char {
         let mut r = Vec::new();
         let add_for = |prompt: &str, r: &mut Vec<PromptChange>| {
             let t = crate::parser::parse_prompt(prompt);
@@ -260,9 +246,44 @@ pub(crate) fn cards_ok(o: &AiJsonOutput, req: &AiScanRequest) -> bool {
         }
         r
     } else {
-        crate::analyzer::analyze_with_rules(&tokens, &req.config).changes
+        crate::analyzer::analyze_with_rules(tokens, &req.config).changes
+    }
+}
+
+pub(crate) fn cards_ok(o: &AiJsonOutput, req: &AiScanRequest) -> bool {
+    let tokens = request_tokens(req);
+    let rules = rules_for_request(req, &tokens);
+    cards_ok_with(o, req, &tokens, &rules)
+}
+
+fn cards_ok_with(
+    o: &AiJsonOutput,
+    req: &AiScanRequest,
+    tokens: &[crate::parser::PromptToken],
+    rules: &[PromptChange],
+) -> bool {
+    if o.improved_prompt.trim().is_empty() {
+        return false;
+    }
+    // Layout tags (quality, group count, "far left"…) are added by the app itself (`two::combine`,
+    // `ensure_quality_tags`), so they are no change that needs a card. Counting them made every
+    // 3-4 character scan re-scan twice and end with "still missing: cards".
+    // A layout tag the user wrote (their own `2girls`, `left`…) is content: changing it to `3girls`
+    // must still need a card. Only layout the AI added on top is ignored.
+    let before: std::collections::HashSet<String> = tokens.iter().map(|t| t.normalized.clone()).collect();
+    let multi = req.config.two_char;
+    let content = |t: &String| {
+        before.contains(t) || !(is_quality_tag_any(t) || (multi && is_layout_tag(t, req.config.checkpoint)))
     };
-    if !convert_ai_changes_for(&o.changes, &tokens, &rules, multi).is_empty() {
+    let after: std::collections::HashSet<String> = crate::parser::parse_prompt(&o.improved_prompt)
+        .into_iter()
+        .map(|t| t.normalized)
+        .filter(content)
+        .collect();
+    if before == after {
+        return true; // nothing to change, so no cards needed
+    }
+    if !convert_ai_changes_with_config(&o.changes, tokens, rules, &req.config).is_empty() {
         return true;
     }
     // If the improved prompt has edits and all edits are already handled by existing rule cards,
@@ -282,6 +303,17 @@ pub(crate) fn dynamic_ok(o: &AiJsonOutput, req: &AiScanRequest) -> bool {
 
 /// What a scan is missing, in words for the status bar (empty = complete).
 pub fn scan_problems(o: &AiJsonOutput, req: &AiScanRequest) -> Vec<&'static str> {
+    let tokens = request_tokens(req);
+    let rules = rules_for_request(req, &tokens);
+    scan_problems_with(o, req, &tokens, &rules)
+}
+
+fn scan_problems_with(
+    o: &AiJsonOutput,
+    req: &AiScanRequest,
+    tokens: &[crate::parser::PromptToken],
+    rules: &[PromptChange],
+) -> Vec<&'static str> {
     let mut p = Vec::new();
     if !analysis_ok(o) {
         p.push("scene analysis");
@@ -289,7 +321,7 @@ pub fn scan_problems(o: &AiJsonOutput, req: &AiScanRequest) -> Vec<&'static str>
     if !negative_ok(o, req) {
         p.push("negative prompt");
     }
-    if !cards_ok(o, req) {
+    if !cards_ok_with(o, req, tokens, rules) {
         p.push("cards");
     }
     if !dynamic_ok(o, req) {
@@ -301,12 +333,24 @@ pub fn scan_problems(o: &AiJsonOutput, req: &AiScanRequest) -> Vec<&'static str>
 /// Fills the parts `best` is missing from a re-scan. The rewrite, its cards and its
 /// dynamic version belong together, so they're taken as a set.
 pub(crate) fn merge_scan(best: &mut AiJsonOutput, next: AiJsonOutput, req: &AiScanRequest) {
+    let tokens = request_tokens(req);
+    let rules = rules_for_request(req, &tokens);
+    merge_scan_with(best, next, req, &tokens, &rules);
+}
+
+fn merge_scan_with(
+    best: &mut AiJsonOutput,
+    next: AiJsonOutput,
+    req: &AiScanRequest,
+    tokens: &[crate::parser::PromptToken],
+    rules: &[PromptChange],
+) {
     if !analysis_ok(best) && analysis_ok(&next) {
         best.scene_summary = next.scene_summary.clone();
         best.scene_breakdown = next.scene_breakdown.clone();
         best.issues = next.issues.clone();
     }
-    if !cards_ok(best, req) && cards_ok(&next, req) {
+    if !cards_ok_with(best, req, tokens, rules) && cards_ok_with(&next, req, tokens, rules) {
         best.improved_prompt = next.improved_prompt.clone();
         best.changes = next.changes.clone();
         best.dynamic_prompt = next.dynamic_prompt.clone();
@@ -333,12 +377,22 @@ pub(crate) fn generate_negative(req: &AiScanRequest, positive: &str) -> Result<S
     } else {
         format!(", plus '{view_negs}' for the target framing")
     };
+    let (count_range, strict_hint) = match req.config.negative_strictness {
+        crate::profiles::NegativeStrictness::Light => ("6-12", "Keep it minimal (core quality + critical framing/opposite locks only)."),
+        crate::profiles::NegativeStrictness::Balanced => ("12-22", "Balance checkpoint defaults, framing/pose opposites, and style/scene bleed guards."),
+        crate::profiles::NegativeStrictness::Strict => ("18-32", "Be comprehensive: anatomy/hand/finger guards, exposure/artifact guards, clone prevention, and scene/style opposites."),
+    };
+    let stage_hint = match req.config.stage {
+        crate::profiles::GenerationStage::Inpaint => " Stage is Inpaint: NEVER include 'cropped', 'out of frame', or 'cut off'.",
+        crate::profiles::GenerationStage::Detailer => " Stage is Detailer: include 'wide shot, full body, out of focus, extra people'.",
+        _ => "",
+    };
     let prompt = format!(
-        "Positive prompt:\n{positive}\n\nWrite a negative prompt of 12-30 comma-separated tags: start from these usual \
+        "Positive prompt:\n{positive}\n\n{strict_hint} Write a negative prompt of {count_range} comma-separated tags: start from these usual \
          negatives ({}{view_hint}), then add concrete Danbooru tags for things that would spoil THIS scene (e.g. 'full body, lower body' \
-         for an upper body shot, 'crowd, multiple girls' when solo, the opposite of its setting, time of day or mood), \
+         for an upper body shot, 'crowd, multiple girls' when solo, 'standing' when sitting, the opposite of its setting, time of day or mood), \
          each a real Danbooru tag naming the unwanted thing. Never 'no X', 'wrong X' or 'unwanted X'; never anything \
-         the positive prompt asks for.",
+         the positive prompt asks for.{stage_hint}",
         req.config.checkpoint.default_negative()
     );
     let body = json!({
@@ -358,23 +412,39 @@ pub(crate) fn generate_negative(req: &AiScanRequest, positive: &str) -> Result<S
 
 /// Removes negative tags that backfire or say nothing: "no smile" in a negative prompt
 /// fights the smile; "wrong framing" means nothing to the model. "no humans" is a real tag.
+/// Preserves grouped weights `(worst quality, low quality:1.4)` and score/rating underscores (`score_4`, `rating_safe`).
 pub fn clean_negative(negative: &str) -> String {
-    negative
-        .split(',')
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
-        .map(|t| t.replace('_', " "))
-        .map(|t| t.strip_prefix("unwanted ").map(str::to_string).unwrap_or(t))
-        .filter(|t| {
-            let l = t.to_lowercase();
-            l == "no humans"
-                || !(l.starts_with("no ")
-                    || l.starts_with("wrong ")
-                    || l.starts_with("non-")
-                    || l.starts_with("non ")
-                    || l.starts_with("lack of ")
-                    || l.starts_with("not ")
-                    || l.starts_with("without "))
+    crate::parser::parse_prompt(negative)
+        .into_iter()
+        .filter_map(|t| {
+            let raw = t.raw.trim();
+            if raw.is_empty() {
+                return None;
+            }
+            let l = t.normalized.as_str();
+            if l == "no humans" {
+                return Some(if raw.contains(':') { raw.to_string() } else { "no humans".to_string() });
+            }
+            let cleaned_norm = l.strip_prefix("unwanted ").unwrap_or(l).trim();
+            if cleaned_norm.starts_with("no ")
+                || cleaned_norm.starts_with("wrong ")
+                || cleaned_norm.starts_with("non-")
+                || cleaned_norm.starts_with("non ")
+                || cleaned_norm.starts_with("lack of ")
+                || cleaned_norm.starts_with("not ")
+                || cleaned_norm.starts_with("without ")
+            {
+                return None;
+            }
+            let keep_underscores = l.starts_with("score ") || l.starts_with("rating ");
+            if raw.contains(':') || raw.starts_with('(') || raw.starts_with('[') || keep_underscores {
+                let s = raw.strip_prefix("unwanted ").unwrap_or(raw).trim();
+                Some(s.to_string())
+            } else {
+                let s = raw.replace('_', " ");
+                let s = s.strip_prefix("unwanted ").unwrap_or(&s).trim();
+                Some(s.to_string())
+            }
         })
         .collect::<Vec<_>>()
         .join(", ")

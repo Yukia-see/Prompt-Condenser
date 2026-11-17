@@ -178,10 +178,28 @@ pub fn convert_ai_changes_for(
     rule_changes: &[PromptChange],
     multi: bool,
 ) -> Vec<PromptChange> {
+    let mut cfg = ScanConfig::default();
+    cfg.two_char = multi;
+    convert_ai_changes_with_config(ai_items, prompt_tokens, rule_changes, &cfg)
+}
+
+/// Config-aware `convert_ai_changes`: also rejects AI additions that conflict with
+/// existing prompt tags, target view, generation stage, or user custom negative tags.
+pub fn convert_ai_changes_with_config(
+    ai_items: &[AiChangeItem],
+    prompt_tokens: &[crate::parser::PromptToken],
+    rule_changes: &[PromptChange],
+    config: &ScanConfig,
+) -> Vec<PromptChange> {
     use crate::parser::parse_prompt;
     use std::collections::HashSet;
 
+    let multi = config.two_char;
     let in_prompt: HashSet<&str> = prompt_tokens.iter().map(|t| t.normalized.as_str()).collect();
+    let custom_neg: HashSet<String> = parse_prompt(&config.custom_negative_raw)
+        .into_iter()
+        .map(|t| t.normalized)
+        .collect();
     let covered: HashSet<String> = rule_changes
         .iter()
         .flat_map(|c| parse_prompt(&c.original))
@@ -214,7 +232,7 @@ pub fn convert_ai_changes_for(
         }
 
         if targets.is_empty() {
-            // A new detail: keep it only if it adds something not already in the prompt.
+            // A new detail: keep only non-conflicting tags not already in prompt or custom negative.
             if suggestion.is_empty() || suggestion.iter().all(|t| in_prompt.contains(t.as_str())) {
                 continue;
             }
@@ -225,6 +243,10 @@ pub fn convert_ai_changes_for(
             if targets.iter().any(|t| covered.contains(t)) {
                 continue; // a rule card already handles it
             }
+            // Do not suggest replacing with something in custom negative
+            if !suggestion.is_empty() && suggestion.iter().all(|t| custom_neg.contains(t)) {
+                continue;
+            }
             // Same text back is only a change if the weight differs (reweight)
             if item.suggested_alternative.trim() == item.original.trim() && item.framing_alternative.trim().is_empty() {
                 continue;
@@ -233,17 +255,23 @@ pub fn convert_ai_changes_for(
                 continue; // same tag back, no weight change
             }
         }
-        // For additions, show only what is actually new
+        // For additions, show only what is actually new and compatible with the prompt/config
         let added_text = if targets.is_empty() {
             parse_prompt(&item.suggested_alternative)
                 .into_iter()
-                .filter(|t| !in_prompt.contains(t.normalized.as_str()))
+                .filter(|t| {
+                    !in_prompt.contains(t.normalized.as_str())
+                        && crate::analyzer::can_recommend_tag(&t.normalized, prompt_tokens, config, &custom_neg)
+                })
                 .map(|t| t.raw)
                 .collect::<Vec<_>>()
                 .join(", ")
         } else {
             String::new()
         };
+        if targets.is_empty() && added_text.is_empty() {
+            continue;
+        }
         let key = if targets.is_empty() { suggestion.join(",") } else { targets.join(",") };
         if !seen.insert(key) {
             continue;

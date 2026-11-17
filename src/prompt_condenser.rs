@@ -1526,9 +1526,16 @@ pub struct Merged {
 // ---------------------------------------------------------------------------
 // Phase 4: Layer-based conflict rules
 // ---------------------------------------------------------------------------
-pub fn can_coexist(tag_a: &str, tag_b: &str) -> bool {
-    let na = norm_tag(tag_a);
-    let nb = norm_tag(tag_b);
+fn norm_cow(tag: &str) -> std::borrow::Cow<'_, str> {
+    let trimmed = tag.trim();
+    if trimmed.bytes().all(|b| !b.is_ascii_uppercase() && b != b'_') && trimmed.is_ascii() {
+        std::borrow::Cow::Borrowed(trimmed)
+    } else {
+        std::borrow::Cow::Owned(norm_tag(trimmed))
+    }
+}
+
+pub fn can_coexist_norm(na: &str, nb: &str) -> bool {
     if na == nb {
         return true;
     }
@@ -1537,13 +1544,17 @@ pub fn can_coexist(tag_a: &str, tag_b: &str) -> bool {
         .any(|&(a, b)| (a == na && b == nb) || (a == nb && b == na))
 }
 
-pub fn is_occluded_by(covering_tag: &str, inner_tag: &str) -> bool {
-    let nc = norm_tag(covering_tag);
-    let ni = norm_tag(inner_tag);
+pub fn can_coexist(tag_a: &str, tag_b: &str) -> bool {
+    let na = norm_cow(tag_a);
+    let nb = norm_cow(tag_b);
+    can_coexist_norm(&na, &nb)
+}
+
+pub fn is_occluded_by_norm(nc: &str, ni: &str) -> bool {
     if nc == ni {
         return false;
     }
-    if can_coexist(&nc, &ni) {
+    if can_coexist_norm(nc, ni) {
         return false;
     }
     if OCCLUSION_SUPPRESSIONS
@@ -1560,6 +1571,12 @@ pub fn is_occluded_by(covering_tag: &str, inner_tag: &str) -> bool {
         }
     }
     false
+}
+
+pub fn is_occluded_by(covering_tag: &str, inner_tag: &str) -> bool {
+    let nc = norm_cow(covering_tag);
+    let ni = norm_cow(inner_tag);
+    is_occluded_by_norm(&nc, &ni)
 }
 
 pub fn resolve_layer_conflicts(tags: &[String]) -> (Vec<String>, Vec<(String, String)>) {

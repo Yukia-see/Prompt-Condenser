@@ -192,6 +192,7 @@ component PillButton inherits Rectangle {
     background: !root.enabled ? M3.surface-container
         : root.primary ? (ta.has-hover ? M3.primary.brighter(0.12) : M3.primary)
         : (ta.has-hover ? M3.secondary-container : M3.surface-container-high);
+    animate background { duration: 120ms; }
     label := Text {
         text: root.text;
         font-size: 12px;
@@ -224,6 +225,7 @@ component FilterChip inherits Rectangle {
     border-color: !root.enabled ? M3.outline-variant : (root.checked ? M3.primary : M3.outline-variant);
     background: !root.enabled ? M3.surface-container
         : root.checked ? M3.secondary-container : M3.surface-container;
+    animate background { duration: 120ms; }
     lbl := Text {
         text: (root.checked ? "✓ " : "") + root.text;
         font-size: 11px;
@@ -966,6 +968,8 @@ component CharacterCard inherits M3Card {
     /// "+ Quality" (character 1 / Before only; hidden for Flux): the checkpoint's quality tags in front.
     in property <bool> quality-button: false;
     callback add-quality();
+    in property <bool> paste-button: false;
+    callback paste-prompt();
     border-color: M3.outline;
 
     VerticalLayout {
@@ -982,6 +986,10 @@ component CharacterCard inherits M3Card {
                 // the title and stats shorten with "…" on a narrow window, so the buttons stay visible
                 Text { text: root.title; font-size: 11px; font-weight: 700; color: M3.error; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; min-width: 40px; }
                 Text { text: root.stats; font-size: 11px; color: root.stats-warn ? M3.warning : M3.on-surface-variant; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; min-width: 0px; horizontal-alignment: right; }
+                if root.paste-button : PillButton {
+                    text: "📋 Paste";
+                    clicked => { root.paste-prompt(); }
+                }
                 if root.quality-button : PillButton {
                     text: "+ Quality";
                     clicked => { root.add-quality(); }
@@ -1167,12 +1175,18 @@ component PromptColumn inherits VerticalLayout {
 
     in property <bool> quality-available: false;
     callback add-quality();
+    callback paste-prompt();
+    in-out property <int> aspect-index: 0;
+    in-out property <int> stage-index: 0;
+    callback stage-changed();
     in property <string> negative-plain;
     in property <string> negative-note;
     in property <bool> negative-available;
     /// The negative box open; collapsed it is a slim strip under After, which then takes the full width.
     in-out property <bool> negative-expanded: true;
     in property <string> negative-tokens;
+    in-out property <int> negative-strictness-index: 1;
+    in-out property <string> custom-negative: "";
     /// Zen mode: the output header row is hidden (After keeps its own Copy).
     in property <bool> zen: false;
     in-out property <bool> output-collapsed: false;
@@ -1204,6 +1218,8 @@ component PromptColumn inherits VerticalLayout {
             stats: root.before-stats;
             stats-warn: root.before-stats-warn;
             text <=> root.raw-prompt;
+            paste-button: true;
+            paste-prompt => { root.paste-prompt(); }
             quality-button: root.quality-available;
             add-quality => { root.add-quality(); }
             lora-text <=> root.lora-tags;
@@ -1311,6 +1327,8 @@ component PromptColumn inherits VerticalLayout {
             stats: root.before-stats;
             stats-warn: root.before-stats-warn;
             text <=> root.raw-prompt;
+            paste-button: true;
+            paste-prompt => { root.paste-prompt(); }
             quality-button: root.quality-available;
             add-quality => { root.add-quality(); }
             lora-text <=> root.lora-tags;
@@ -1388,6 +1406,8 @@ component PromptColumn inherits VerticalLayout {
                 stats: root.before-stats;
                 stats-warn: root.before-stats-warn;
                 text <=> root.raw-prompt;
+            paste-button: true;
+            paste-prompt => { root.paste-prompt(); }
             quality-button: root.quality-available;
             add-quality => { root.add-quality(); }
                 lora-text <=> root.lora-tags;
@@ -1513,6 +1533,20 @@ component PromptColumn inherits VerticalLayout {
                 vertical-alignment: center;
                 overflow: elide;
                 horizontal-stretch: 1;
+            }
+
+            // Stage Quick-Switcher for Multi-Stage ComfyUI Pipelines
+            HorizontalLayout {
+                spacing: 4px;
+                alignment: center;
+                for st[idx] in ["Base", "Hires", "Detailer", "Refiner", "Inpaint"] : FilterChip {
+                    text: st;
+                    checked: root.stage-index == idx;
+                    toggled => {
+                        root.stage-index = idx;
+                        root.stage-changed();
+                    }
+                }
             }
 
             Rectangle { horizontal-stretch: 1; }
@@ -1706,6 +1740,18 @@ component PromptColumn inherits VerticalLayout {
                             clicked => { root.negative-expanded = false; }
                         }
                     }
+                    HorizontalLayout {
+                        spacing: 4px;
+                        SectionLabel { text: "Strictness:"; vertical-alignment: center; }
+                        for st[idx] in ["Light", "Balanced", "Strict"] : FilterChip {
+                            text: st;
+                            checked: root.negative-strictness-index == idx;
+                            toggled => {
+                                root.negative-strictness-index = idx;
+                                root.edited();
+                            }
+                        }
+                    }
                     neg-scroll := ScrollView {
                         vertical-stretch: 1;
                         VerticalLayout {
@@ -1721,6 +1767,13 @@ component PromptColumn inherits VerticalLayout {
                                 selection-background-color: #D0BCFF99;
                             }
                         }
+                    }
+                    LineEdit {
+                        height: 28px;
+                        font-size: 11px;
+                        placeholder-text: "Custom negative tags (auto-deduped against positive)...";
+                        text <=> root.custom-negative;
+                        edited => { root.edited(); }
                     }
                     Text {
                         text: root.negative-note;
@@ -1822,6 +1875,10 @@ export component AppWindow inherits Window {
     // Dropdowns
     in-out property <int> checkpoint_index: 0;
     in-out property <int> target_view_index: 0;
+    in-out property <int> aspect_index: 0;   // 0 Auto, 1 16:9, 2 21:9, 3 9:16, 4 1:1
+    in-out property <int> stage_index: 0;    // 0 Base, 1 HiresFix, 2 Detailer, 3 Refiner, 4 Inpaint
+    in-out property <int> negative_strictness_index: 1; // 0 Light, 1 Balanced, 2 Strict
+    in-out property <string> custom_negative: "";
     in-out property <int> ai_mode_index: 0;   // 0 = GPU, 1 = CPU only, 2 = AI off
     in-out property <[string]> angle_labels: [];
     in-out property <int> angle_index: 0;      // index into profiles::CAMERA_ANGLES
@@ -2082,6 +2139,7 @@ export component AppWindow inherits Window {
     callback after_view_changed(int);
     callback copy_recommended_negative_requested();
     callback add_quality_requested();   // "+ Quality": the checkpoint's quality tags in front of Before
+    callback paste_prompt_requested();  // "📋 Paste": clipboard text into Before + condense
     callback zoom_in_requested();
     callback zoom_out_requested();
 
@@ -2245,6 +2303,14 @@ export component AppWindow inherits Window {
                                     model: ["Faithful", "Balanced", "Rich"];
                                     current-index <=> root.detail_index;
                                     selected => { root.ai_settings_changed(); }
+                                }
+
+                                SectionLabel { text: "Aspect:"; vertical-alignment: center; }
+                                ComboBox {
+                                    width: 105px;
+                                    model: ["Auto", "16:9 Wide", "21:9 Ultra", "9:16 Tall", "1:1 Square"];
+                                    current-index <=> root.aspect_index;
+                                    selected => { root.analyze_requested(); }
                                 }
 
                                 SectionLabel { text: "LLM:"; vertical-alignment: center; }
@@ -3187,16 +3253,16 @@ export component AppWindow inherits Window {
                                     border-radius: 6px;
                                     accessible-role: button;
                                     accessible-label: "💡 Ideas (banner)";
-                                    background: ideas-ta.has-hover && root.ollama_connected && !root.ideas_busy ? M3.secondary-container : transparent;
+                                    background: ideas-ta.has-hover && !root.ideas_busy ? M3.secondary-container : transparent;
                                     ideas-lbl := Text {
                                         text: root.ideas_busy ? "💡 Thinking…" : "💡 Ideas";
                                         font-size: 11px;
                                         font-weight: 700;
-                                        color: root.ollama_connected && !root.ideas_busy ? M3.primary : M3.outline;
+                                        color: !root.ideas_busy ? M3.primary : M3.outline;
                                         vertical-alignment: center;
                                     }
                                     ideas-ta := TouchArea {
-                                        enabled: root.ollama_connected && !root.ideas_busy;
+                                        enabled: !root.ideas_busy;
                                         mouse-cursor: MouseCursor.pointer;
                                         clicked => { root.ideas_requested(); }
                                     }
@@ -3245,7 +3311,7 @@ export component AppWindow inherits Window {
                             card-filter: root.card_filter;
                             filter-counts: root.card_filter_counts;
                             fixes-expanded: root.fixes_expanded;
-                            ideas-enabled: root.ollama_connected && root.raw_prompt != "";
+                            ideas-enabled: root.raw_prompt != "";
                             ideas-busy: root.ideas_busy;
                             filter-changed(i) => { root.card_filter_changed(i); }
                             chip-toggled(id, tag) => { root.card_chip_toggled(id, tag); }
@@ -3310,8 +3376,14 @@ export component AppWindow inherits Window {
                             negative-note: root.negative_note;
                             negative-available: root.negative_text != "";
                             negative-expanded <=> root.negative_expanded;
+                            negative-strictness-index <=> root.negative_strictness_index;
+                            custom-negative <=> root.custom_negative;
                             quality-available: root.checkpoint_index != 5;
                             add-quality => { root.add_quality_requested(); }
+                            paste-prompt => { root.paste_prompt_requested(); }
+                            aspect-index <=> root.aspect_index;
+                            stage-index <=> root.stage_index;
+                            stage-changed => { root.analyze_requested(); }
                             negative-tokens: root.negative_tokens;
                             zen: root.zen_mode;
                             edited => { root.analyze_requested(); }

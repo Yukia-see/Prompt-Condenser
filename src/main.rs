@@ -99,6 +99,9 @@ struct AppState {
     extra_key: Option<AiKey>,
     /// Check Result cards whose "Add It" puts a tag in the negative: card id → tag.
     check_neg: std::collections::HashMap<usize, String>,
+    /// Per-option negative guards for 💡 Ideas cards (`card_id -> Vec<(option_tags, neg_guards)>`),
+    /// so only options with active chips contribute negative guards.
+    idea_option_negs: std::collections::HashMap<usize, Vec<(Vec<String>, Vec<String>)>>,
     /// Tags switched off on a card with tag chips (by card key); the others are added when it's accepted.
     chip_off: std::collections::HashMap<render::CardKey, std::collections::HashSet<String>>,
     /// The folded "N small fixes" card is opened (not saved).
@@ -481,6 +484,7 @@ mod scene_panel_tests {
             scene_prompt_raw: String::new(),
             more_chars: Vec::new(),
             detail: profiles::DetailLevel::Balanced,
+            ..Default::default()
         };
         let run = |p: &str| analyzer::analyze_with_rules(&parser::parse_prompt(p), &config).changes;
         let first = run("1girl, thighhighs, red hair");

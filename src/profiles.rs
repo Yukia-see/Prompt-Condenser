@@ -560,6 +560,170 @@ impl DetailLevel {
     }
 }
 
+/// Target canvas aspect ratio for composition-aware guards (e.g. preventing extra
+/// characters or clones in 16:9 / 21:9 widescreen single-character generations).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum AspectRatio {
+    #[default]
+    Default,
+    Widescreen16x9,
+    Ultrawide21x9,
+    Portrait9x16,
+    Square1x1,
+}
+
+impl AspectRatio {
+    pub fn from_index(i: i32) -> Self {
+        match i {
+            1 => Self::Widescreen16x9,
+            2 => Self::Ultrawide21x9,
+            3 => Self::Portrait9x16,
+            4 => Self::Square1x1,
+            _ => Self::Default,
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        let norm = name.trim().to_ascii_lowercase();
+        match norm.as_str() {
+            "default" | "none" | "auto" => Some(Self::Default),
+            "16:9" | "wide" | "widescreen" => Some(Self::Widescreen16x9),
+            "21:9" | "ultrawide" | "ultra-wide" => Some(Self::Ultrawide21x9),
+            "9:16" | "portrait" | "vertical" | "tall" => Some(Self::Portrait9x16),
+            "1:1" | "square" => Some(Self::Square1x1),
+            _ => None,
+        }
+    }
+
+    pub fn is_widescreen(&self) -> bool {
+        matches!(self, Self::Widescreen16x9 | Self::Ultrawide21x9)
+    }
+
+    pub fn is_portrait(&self) -> bool {
+        matches!(self, Self::Portrait9x16)
+    }
+
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            Self::Default => "Default",
+            Self::Widescreen16x9 => "16:9 Widescreen",
+            Self::Ultrawide21x9 => "21:9 Ultrawide",
+            Self::Portrait9x16 => "9:16 Portrait",
+            Self::Square1x1 => "1:1 Square",
+        }
+    }
+}
+
+/// Target generation stage in a multi-stage ComfyUI pipeline.
+/// Adapts tag filtering, weight softening, and negative guards per pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum GenerationStage {
+    #[default]
+    Base,
+    HiresFix,
+    Detailer,
+    Refiner,
+    Inpaint,
+}
+
+impl GenerationStage {
+    pub fn from_index(i: i32) -> Self {
+        match i {
+            1 => Self::HiresFix,
+            2 => Self::Detailer,
+            3 => Self::Refiner,
+            4 => Self::Inpaint,
+            _ => Self::Base,
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        let norm: String = name
+            .trim()
+            .to_ascii_lowercase()
+            .chars()
+            .map(|c| if c == ' ' || c == '_' { '-' } else { c })
+            .collect();
+        match norm.as_str() {
+            "base" | "txt2img" | "default" => Some(Self::Base),
+            "hires" | "hires-fix" | "upscale" => Some(Self::HiresFix),
+            "detailer" | "adetailer" | "face-detailer" | "crop" => Some(Self::Detailer),
+            "refiner" | "refine" => Some(Self::Refiner),
+            "inpaint" | "inpainting" => Some(Self::Inpaint),
+            _ => None,
+        }
+    }
+
+    pub fn cli_key(&self) -> &'static str {
+        match self {
+            Self::Base => "base",
+            Self::HiresFix => "hires",
+            Self::Detailer => "detailer",
+            Self::Refiner => "refiner",
+            Self::Inpaint => "inpaint",
+        }
+    }
+
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            Self::Base => "Base (Full Generation)",
+            Self::HiresFix => "HiresFix / Latent Upscale",
+            Self::Detailer => "Detailer (Face / Body Crop)",
+            Self::Refiner => "Refiner Pass",
+            Self::Inpaint => "Inpaint Region",
+        }
+    }
+
+    /// Maximum safe attention weight for this stage; second-stage passes soften
+    /// weights to prevent over-sharpening, color burn, or double features.
+    pub fn weight_cap(&self, checkpoint: CheckpointProfile) -> f32 {
+        let base = checkpoint.max_safe_weight();
+        match self {
+            Self::Base | Self::Inpaint => base,
+            Self::HiresFix => base.min(1.15),
+            Self::Detailer => base.min(1.15),
+            Self::Refiner => base.min(1.10),
+        }
+    }
+}
+
+/// Controls how aggressively `recommended_negative` suppresses artifacts, anatomy errors,
+/// and style bleed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum NegativeStrictness {
+    Light,
+    #[default]
+    Balanced,
+    Strict,
+}
+
+impl NegativeStrictness {
+    pub fn from_index(i: i32) -> Self {
+        match i {
+            0 => Self::Light,
+            2 => Self::Strict,
+            _ => Self::Balanced,
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "light" | "minimal" | "low" => Some(Self::Light),
+            "balanced" | "default" | "normal" | "medium" => Some(Self::Balanced),
+            "strict" | "high" | "max" | "heavy" => Some(Self::Strict),
+            _ => None,
+        }
+    }
+
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            Self::Light => "Light",
+            Self::Balanced => "Balanced",
+            Self::Strict => "Strict",
+        }
+    }
+}
+
 /// User-saved preset profile configuration for 1-click preset recall.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct UserPresetProfile {

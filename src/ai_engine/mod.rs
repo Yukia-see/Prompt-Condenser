@@ -242,7 +242,7 @@ mod tests {
 
                 lora_tags_raw: String::new(), arranged: false, natural: false, two_char: false, char2_prompt_raw: String::new(), char2_lora_tags_raw: String::new(), char_break: false, scene_prompt_raw: String::new(), more_chars: Vec::new(),
 
-                detail: crate::profiles::DetailLevel::Balanced,
+                detail: crate::profiles::DetailLevel::Balanced, ..Default::default()
             },
             mode: AiMode::CpuOnly,
             host: "localhost".into(),
@@ -290,7 +290,7 @@ mod tests {
                 camera_angle: 0, pose: 0, bust: 0, frame: 0, dynamic: false, lora_tags_raw: String::new(), arranged: false,
                 natural: false, two_char: false, char2_prompt_raw: String::new(), char2_lora_tags_raw: String::new(),
                 char_break: false, scene_prompt_raw: String::new(), more_chars: Vec::new(),
-                detail: crate::profiles::DetailLevel::Balanced,
+                detail: crate::profiles::DetailLevel::Balanced, ..Default::default()
             },
             mode: AiMode::Gpu,
             host: host.to_string(),
@@ -467,7 +467,7 @@ mod tests {
             two_char: true, char2_prompt_raw: "1girl, blue hair, bob cut, sailor uniform".into(), char2_lora_tags_raw: String::new(),
             char_break: false, scene_prompt_raw: "beach, sunset, standing in a row, wide shot".into(),
             more_chars: vec![("1girl, green hair, twintails, hoodie".into(), String::new()), ("1girl, pink hair, braid, white sundress".into(), String::new())],
-            detail: DetailLevel::Balanced,
+            detail: DetailLevel::Balanced, ..Default::default()
         };
         let req = AiScanRequest {
             raw_prompt: "1girl, red hair, long hair, red dress".into(), config, mode: AiMode::Gpu,
@@ -850,7 +850,7 @@ mod tests {
             emphasis_weight: 1.25, cleanup_enabled: true, resolve_conflicts_enabled: true, clamp_weights_enabled: true, fit_suggestions: true, exaggerated_proportions: false,
             camera_angle: 0, pose: 0, bust: 0, frame: 0, dynamic: false, lora_tags_raw: String::new(), arranged: false, natural: false,
             two_char: false, char2_prompt_raw: String::new(), char2_lora_tags_raw: String::new(), char_break: false,
-            scene_prompt_raw: String::new(), more_chars: Vec::new(), detail: DetailLevel::Balanced,
+            scene_prompt_raw: String::new(), more_chars: Vec::new(), detail: DetailLevel::Balanced, ..Default::default()
         };
         let req = ImageAiRequest {
             host, model: "prompt-condenser-gemma4-e4b".into(), vision_encoder: Some("huihui_ai/qwen2.5-vl-abliterated:3b".into()),
@@ -972,7 +972,7 @@ mod tests {
             frame: 2,
             dynamic: false,
             lora_tags_raw: String::new(), arranged: false, natural: false, two_char: false, char2_prompt_raw: String::new(), char2_lora_tags_raw: String::new(), char_break: false, scene_prompt_raw: String::new(), more_chars: Vec::new(),
-            detail: crate::profiles::DetailLevel::Balanced,
+            detail: crate::profiles::DetailLevel::Balanced, ..Default::default()
         };
         // (a) the instructions name the picks, for big and small models
         for family in [ModelFamily::Gemma, ModelFamily::Small, ModelFamily::Generic] {
@@ -1046,7 +1046,7 @@ mod tests {
 
                 lora_tags_raw: String::new(), arranged: false, natural: false, two_char: false, char2_prompt_raw: String::new(), char2_lora_tags_raw: String::new(), char_break: false, scene_prompt_raw: String::new(), more_chars: Vec::new(),
 
-                detail: crate::profiles::DetailLevel::Balanced,
+                detail: crate::profiles::DetailLevel::Balanced, ..Default::default()
             },
             mode: AiMode::Gpu,
             host: host.clone(),
@@ -1106,7 +1106,7 @@ mod tests {
 
                 lora_tags_raw: String::new(), arranged: false, natural: false, two_char: false, char2_prompt_raw: String::new(), char2_lora_tags_raw: String::new(), char_break: false, scene_prompt_raw: String::new(), more_chars: Vec::new(),
 
-                detail: crate::profiles::DetailLevel::Balanced,
+                detail: crate::profiles::DetailLevel::Balanced, ..Default::default()
             },
             mode: AiMode::Gpu,
             host,
@@ -1156,7 +1156,7 @@ mod tests {
                 checkpoint: crate::profiles::CheckpointProfile::PonyV6, target_view: crate::profiles::TargetView::None, pinned_emphasis_raw: String::new(),
                 emphasis_weight: 1.25, cleanup_enabled: true, resolve_conflicts_enabled: true, clamp_weights_enabled: true, fit_suggestions: true, exaggerated_proportions: false,
                 camera_angle: 0, pose: 0, bust: 0, frame: 0, dynamic: false, lora_tags_raw: String::new(), arranged: false, natural: false, two_char: false, char2_prompt_raw: String::new(), char2_lora_tags_raw: String::new(), char_break: false, scene_prompt_raw: String::new(), more_chars: Vec::new(),
-                detail: crate::profiles::DetailLevel::Balanced,
+                detail: crate::profiles::DetailLevel::Balanced, ..Default::default()
             },
             mode: AiMode::Gpu, host: String::new(), model: String::new(), keep_alive: "30m".into(), think: false,
         };
@@ -1223,7 +1223,7 @@ mod tests {
             let config = ScanConfig {
                 checkpoint: crate::profiles::CheckpointProfile::Anima, target_view: crate::profiles::TargetView::None, pinned_emphasis_raw: String::new(),
                 emphasis_weight: 1.25, cleanup_enabled: true, resolve_conflicts_enabled: true, clamp_weights_enabled: true, fit_suggestions: true, exaggerated_proportions: false,
-                camera_angle: 0, pose: 0, bust: 0, frame: 0, dynamic: false, lora_tags_raw: String::new(), arranged: false, natural: false, two_char: false, char2_prompt_raw: String::new(), char2_lora_tags_raw: String::new(), char_break: false, scene_prompt_raw: String::new(), more_chars: Vec::new(), detail: crate::profiles::DetailLevel::Balanced,
+                camera_angle: 0, pose: 0, bust: 0, frame: 0, dynamic: false, lora_tags_raw: String::new(), arranged: false, natural: false, two_char: false, char2_prompt_raw: String::new(), char2_lora_tags_raw: String::new(), char_break: false, scene_prompt_raw: String::new(), more_chars: Vec::new(), detail: crate::profiles::DetailLevel::Balanced, ..Default::default()
             };
             let req = ImageAiRequest {
                 host: "localhost:11434".into(),
@@ -1264,7 +1264,7 @@ mod tests {
             let config = ScanConfig {
                 checkpoint: crate::profiles::CheckpointProfile::Anima, target_view: crate::profiles::TargetView::None, pinned_emphasis_raw: String::new(),
                 emphasis_weight: 1.25, cleanup_enabled: true, resolve_conflicts_enabled: true, clamp_weights_enabled: true, fit_suggestions: true, exaggerated_proportions: false,
-                camera_angle: 0, pose: 0, bust: 0, frame: 0, dynamic: false, lora_tags_raw: String::new(), arranged: false, natural: false, two_char: false, char2_prompt_raw: String::new(), char2_lora_tags_raw: String::new(), char_break: false, scene_prompt_raw: String::new(), more_chars: Vec::new(), detail: crate::profiles::DetailLevel::Balanced,
+                camera_angle: 0, pose: 0, bust: 0, frame: 0, dynamic: false, lora_tags_raw: String::new(), arranged: false, natural: false, two_char: false, char2_prompt_raw: String::new(), char2_lora_tags_raw: String::new(), char_break: false, scene_prompt_raw: String::new(), more_chars: Vec::new(), detail: crate::profiles::DetailLevel::Balanced, ..Default::default()
             };
             let t = std::time::Instant::now();
             let scored = crate::twoimg::tag_one_fast(&path, &|_| ()).unwrap_or_default();
@@ -1370,6 +1370,10 @@ mod tests {
             "worst quality, extra people, no humans, daytime"
         );
         assert_eq!(clean_negative("bad_hands, wrong_camera_angle"), "bad hands");
+        assert_eq!(
+            clean_negative("(worst quality, low quality:1.4), score_4, score_5, no smile"),
+            "(worst quality, low quality:1.4), score_4, score_5"
+        );
     }
 
     /// Compares models on the same prompts:
@@ -1407,6 +1411,7 @@ mod tests {
                         dynamic: std::env::var("COMPARE_DYNAMIC").is_ok(),
                         lora_tags_raw: std::env::var("COMPARE_LORA").unwrap_or_default(), arranged: false, natural: std::env::var("COMPARE_NATURAL").is_ok(), two_char: false, char2_prompt_raw: String::new(), char2_lora_tags_raw: String::new(), char_break: false, scene_prompt_raw: String::new(), more_chars: Vec::new(),
                         detail: match std::env::var("COMPARE_DETAIL").as_deref() { Ok("rich") => crate::profiles::DetailLevel::Rich, Ok("faithful") => crate::profiles::DetailLevel::Faithful, _ => crate::profiles::DetailLevel::Balanced },
+                        ..Default::default()
                     },
                     mode: AiMode::Gpu,
                     host: "localhost:11434".into(),
@@ -1465,7 +1470,7 @@ mod tests {
             emphasis_weight: 1.25, cleanup_enabled: true, resolve_conflicts_enabled: true, clamp_weights_enabled: true, fit_suggestions: true, exaggerated_proportions: false,
             camera_angle: 0, pose: 0, bust: 0, frame: 0, dynamic: false, lora_tags_raw: String::new(), arranged: false, natural: false,
             two_char: false, char2_prompt_raw: String::new(), char2_lora_tags_raw: String::new(), char_break: false,
-            scene_prompt_raw: String::new(), more_chars: Vec::new(), detail: DetailLevel::Balanced,
+            scene_prompt_raw: String::new(), more_chars: Vec::new(), detail: DetailLevel::Balanced, ..Default::default()
         };
         // the Deep Scan has its own role and JSON reply; the image compiler's directives
         // (flags, [Scene]/[Character 1] layout, dual-image merge) must not leak into it
@@ -1568,7 +1573,7 @@ mod tests {
  bust: 0, frame: 0,
  dynamic: false,
  lora_tags_raw: String::new(), arranged: false, natural: false, two_char: false, char2_prompt_raw: String::new(), char2_lora_tags_raw: String::new(), char_break: false, scene_prompt_raw: String::new(), more_chars: Vec::new(),
- detail: crate::profiles::DetailLevel::Balanced,
+ detail: crate::profiles::DetailLevel::Balanced, ..Default::default()
         };
         let joined = |p: &str, v| prompt_guidance(p, &cfg(v)).join("\n");
 
@@ -1605,7 +1610,7 @@ mod tests {
         let mut cfg = ScanConfig {
             checkpoint: CheckpointProfile::Anima, target_view: TargetView::None, pinned_emphasis_raw: String::new(),
             emphasis_weight: 1.25, cleanup_enabled: true, resolve_conflicts_enabled: true, clamp_weights_enabled: true, fit_suggestions: true, exaggerated_proportions: false,
-            camera_angle: 6, pose: 0, bust: 0, frame: 0, dynamic: true, lora_tags_raw: String::new(), arranged: false, natural: false, two_char: false, char2_prompt_raw: String::new(), char2_lora_tags_raw: String::new(), char_break: false, scene_prompt_raw: String::new(), more_chars: Vec::new(), detail: crate::profiles::DetailLevel::Rich,
+            camera_angle: 6, pose: 0, bust: 0, frame: 0, dynamic: true, lora_tags_raw: String::new(), arranged: false, natural: false, two_char: false, char2_prompt_raw: String::new(), char2_lora_tags_raw: String::new(), char_break: false, scene_prompt_raw: String::new(), more_chars: Vec::new(), detail: crate::profiles::DetailLevel::Rich, ..Default::default()
         };
         let p = "1girl, solo, smile, kimono, shrine, night";
         let (g, gu) = build_ai_system_and_user_prompt_for(p, &cfg, ModelFamily::Gemma);
@@ -1845,6 +1850,69 @@ mod tests {
             println!("  + {}", nd);
         }
         println!("================================================================================");
+    }
+
+    #[test]
+    fn prompting_algorithm_overhaul_enforces_stage_aspect_strictness_and_exclusions() {
+        use crate::profiles::{AspectRatio, CheckpointProfile, DetailLevel, GenerationStage, NegativeStrictness, TargetView};
+        let mut cfg = ScanConfig {
+            checkpoint: CheckpointProfile::PonyV6,
+            target_view: TargetView::None,
+            detail: DetailLevel::Balanced,
+            aspect_ratio: AspectRatio::Widescreen16x9,
+            stage: GenerationStage::Detailer,
+            negative_strictness: NegativeStrictness::Strict,
+            custom_negative_raw: "bokeh, extra limbs".into(),
+            ..Default::default()
+        };
+        let g = prompt_guidance("1girl, monochrome, sketch, night", &cfg).join("\n");
+        assert!(g.contains("Detailer crop"), "{g}");
+        assert!(g.contains("sketch/monochrome"), "{g}");
+        assert!(g.contains("User negative exclusions (bokeh, extra limbs)"), "{g}");
+
+        cfg.stage = GenerationStage::Base;
+        let (sys, _) = build_ai_system_and_user_prompt_for("1girl, night", &cfg, ModelFamily::Gemma);
+        assert!(sys.contains("STRICTNESS = STRICT"), "{sys}");
+        assert!(sys.contains("16:9 Widescreen"), "{sys}");
+
+        // Stage weight cap & Inpaint negative cleaning & positive/negative dedup
+        let mut out = AiJsonOutput {
+            improved_prompt: "1girl, (blue eyes:1.35), smile".into(),
+            dynamic_prompt: "1girl, (blue eyes:1.35), {smile|grin}".into(),
+            recommended_negative: "worst quality, cropped, out of frame, smile, no shadows, blurry".into(),
+            ..Default::default()
+        };
+        let mut inp = cfg.clone();
+        inp.checkpoint = CheckpointProfile::Anima;
+        inp.stage = GenerationStage::Inpaint;
+        inp.detail = DetailLevel::Balanced;
+        enforce_checkpoint_rules_with_config(&mut out, &inp);
+        assert!(out.recommended_negative.contains("blurry"));
+        assert!(!out.recommended_negative.contains("cropped") && !out.recommended_negative.contains("smile") && !out.recommended_negative.contains("no shadows"), "{}", out.recommended_negative);
+
+        let mut det = cfg.clone();
+        det.checkpoint = CheckpointProfile::Anima;
+        det.stage = GenerationStage::Detailer;
+        let mut det_out = AiJsonOutput {
+            improved_prompt: "1girl, (blue eyes:1.35), smile".into(),
+            ..Default::default()
+        };
+        enforce_checkpoint_rules_with_config(&mut det_out, &det);
+        assert!(det_out.improved_prompt.contains("(blue eyes:1.15)"), "{}", det_out.improved_prompt);
+
+        // convert_ai_changes_with_config skips additions matching custom_negative_raw or conflicting with target_view
+        let mut card_cfg = ScanConfig::default();
+        card_cfg.target_view = TargetView::CloseUpPortrait;
+        card_cfg.custom_negative_raw = "bokeh".into();
+        let toks = crate::parser::parse_prompt("1girl, portrait");
+        let ai_items = vec![
+            AiChangeItem { original: "".into(), action: "add".into(), reason: "r".into(), suggested_alternative: "bokeh".into(), framing_alternative: String::new() },
+            AiChangeItem { original: "".into(), action: "add".into(), reason: "r".into(), suggested_alternative: "full body".into(), framing_alternative: String::new() },
+            AiChangeItem { original: "".into(), action: "add".into(), reason: "r".into(), suggested_alternative: "backlighting".into(), framing_alternative: String::new() },
+        ];
+        let cards = convert_ai_changes_with_config(&ai_items, &toks, &[], &card_cfg);
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].suggested_alternative, "backlighting");
     }
 }
 

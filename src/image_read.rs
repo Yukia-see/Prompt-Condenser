@@ -1172,16 +1172,22 @@ pub(crate) fn wire_image_read(ui: &AppWindow, state: &State) {
                         }
                     };
                     with_state(|state| {
-                        let before = ui.get_raw_prompt().to_string();
-                        let report = check::compare(&before, &scores);
+                        let after = ui.get_condensed_prompt().to_string();
+                        let target_prompt = if after.trim().is_empty() {
+                            ui.get_raw_prompt().to_string()
+                        } else {
+                            after
+                        };
+                        let report = check::compare(&target_prompt, &scores);
                         let (cards, negatives) = check::cards(&report);
                         let n = cards.len();
                         {
-                            // a new check replaces the last one's cards; 💡 Ideas cards stay
+                            // a new check replaces the last one's cards; 💡 Ideas cards and their negative guards stay
                             let mut st = state.borrow_mut();
                             st.extra_cards.retain(|c| c.action != analyzer::ChangeAction::CheckResult);
                             st.extra_cards.extend(cards);
-                            st.check_neg = negatives;
+                            st.check_neg.retain(|&id, _| id >= ideas::IDEA_CARD_ID_BASE);
+                            st.check_neg.extend(negatives);
                             st.extra_key = Some(ai_key(&ui));
                         }
                         render(&ui, state);

@@ -147,15 +147,17 @@ def resolve_frame_index(val: Any) -> int:
 def apply_widescreen_single_char_guard(positive: str, negative: str, checkpoint: str) -> Tuple[str, str]:
     """Prevent extra characters or clones in 16:9 / 21:9 widescreen single-character ComfyUI outputs."""
     pos_tags = [t.strip().lower() for t in positive.split(",") if t.strip()]
-    multi_markers = ("multiple girls", "multiple boys", "crowd", "group", "couple", "2girls", "2boys", "3girls", "3boys")
+    multi_markers = ("multiple girls", "multiple boys", "multiple others", "crowd", "group", "couple", "twins", "2girls", "2boys", "3girls", "3boys")
     if any(m in pos_tags for m in multi_markers):
         return (positive, negative)
-    single_markers = ("solo", "1girl", "1boy", "1other")
-    if not any(m in pos_tags for m in single_markers):
+    single_count_hits = sum(1 for t in pos_tags if t in ("1girl", "1boy", "1other"))
+    if single_count_hits >= 2:
+        return (positive, negative)
+    if single_count_hits == 0 and "solo" not in pos_tags:
         return (positive, negative)
 
     pos_add = []
-    if "solo" not in pos_tags:
+    if "solo" not in pos_tags and checkpoint.lower() != "flux":
         pos_add.append("solo")
     if checkpoint.lower() in ("anima", "sdxl", "flux"):
         if "single character only" not in pos_tags:
@@ -166,7 +168,12 @@ def apply_widescreen_single_char_guard(positive: str, negative: str, checkpoint:
 
     new_pos = positive
     if pos_add:
-        new_pos = f"{positive.rstrip(', ')}, {', '.join(pos_add)}" if positive.strip() else ", ".join(pos_add)
+        if not positive.strip():
+            new_pos = ", ".join(pos_add)
+        elif checkpoint.lower() == "flux":
+            new_pos = f"{positive.strip().rstrip('.')}. {', '.join(pos_add)}."
+        else:
+            new_pos = f"{positive.rstrip(', ')}, {', '.join(pos_add)}"
 
     # Flux runs at CFG 1 without a negative prompt
     if checkpoint.lower() == "flux":
@@ -191,7 +198,8 @@ class PromptCondenserText:
     VIEWS = ["none", "upper-body", "close-up", "front", "from-behind", "side", "full-body", "turnaround"]
     BUSTS = ["none", "flat", "small", "medium", "large", "huge", "gigantic"]
     FRAMES = ["none", "petite", "shortstack", "thick", "pear", "hourglass", "muscular"]
-    ASPECT_RATIOS = ["default", "16:9", "21:9"]
+    ASPECT_RATIOS = ["default", "16:9", "21:9", "9:16", "1:1"]
+    STAGES = ["base", "hires", "detailer", "refiner", "inpaint"]
 
     @classmethod
     def INPUT_TYPES(cls) -> Dict[str, Any]:
@@ -227,6 +235,10 @@ class PromptCondenserText:
                     "default": "default",
                     "tooltip": "When set to 16:9 or 21:9 on a single-character prompt, adds anti-duplication/anti-crowd clauses to prevent multiple or cloned characters",
                 }),
+                "stage": (cls.STAGES, {
+                    "default": "base",
+                    "tooltip": "Generation stage (base, hires, detailer, refiner, inpaint) to tailor weights, framing, and negatives per pass",
+                }),
             }
         }
 
@@ -260,6 +272,7 @@ class PromptCondenserText:
         frame: str = "none",
         exaggerated_proportions: bool = False,
         aspect_ratio: str = "default",
+        stage: str = "base",
     ) -> Tuple[str, str, str, int, int]:
         fallback_msg = None
         if live_stream:
@@ -299,8 +312,10 @@ class PromptCondenserText:
             cmd.extend(["--frame", str(f_idx)])
         if exaggerated_proportions:
             cmd.append("--exaggerated")
-        if aspect_ratio in ("16:9", "21:9"):
+        if aspect_ratio and aspect_ratio != "default":
             cmd.extend(["--aspect", aspect_ratio])
+        if stage and stage != "base":
+            cmd.extend(["--stage", stage])
 
         res = subprocess.run(cmd, capture_output=True, text=True)
         if res.returncode != 0:

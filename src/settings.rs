@@ -95,6 +95,22 @@ pub(crate) struct Settings {
     /// Saved user preset profiles.
     #[serde(default)]
     pub(crate) user_presets: Vec<crate::profiles::UserPresetProfile>,
+    /// Target canvas aspect ratio (0 Default, 1 16:9, 2 21:9, 3 9:16, 4 1:1).
+    #[serde(default)]
+    pub(crate) aspect_index: i32,
+    /// Target generation stage (0 Base, 1 HiresFix, 2 Detailer, 3 Refiner, 4 Inpaint).
+    #[serde(default)]
+    pub(crate) stage_index: i32,
+    /// Negative prompt strictness (0 Light, 1 Balanced, 2 Strict).
+    #[serde(default = "default_one")]
+    pub(crate) negative_strictness_index: i32,
+    /// User-supplied custom negative tags merged into Recommended Negative.
+    #[serde(default)]
+    pub(crate) custom_negative: String,
+}
+
+fn default_one() -> i32 {
+    1
 }
 
 impl Default for Settings {
@@ -151,6 +167,10 @@ impl Default for Settings {
             fit_suggestions: true,
             exaggerated_proportions: false,
             user_presets: Vec::new(),
+            aspect_index: 0,
+            stage_index: 0,
+            negative_strictness_index: 1,
+            custom_negative: String::new(),
         }
     }
 }
@@ -236,6 +256,10 @@ pub(crate) fn load_settings(ui: &AppWindow) {
     ui.set_lora_folder(st.lora_folder.into());
     ui.set_comfyui_folder(st.comfyui_folder.into());
     ui.set_export_index(st.export_index.clamp(0, 3));
+    ui.set_aspect_index(st.aspect_index.clamp(0, 4));
+    ui.set_stage_index(st.stage_index.clamp(0, 4));
+    ui.set_negative_strictness_index(st.negative_strictness_index.clamp(0, 2));
+    ui.set_custom_negative(st.custom_negative.into());
 }
 
 pub(crate) fn save_settings(ui: &AppWindow) {
@@ -293,6 +317,10 @@ pub(crate) fn save_settings(ui: &AppWindow) {
         lora_folder: ui.get_lora_folder().to_string(),
         comfyui_folder: ui.get_comfyui_folder().to_string(),
         export_index: ui.get_export_index(),
+        aspect_index: ui.get_aspect_index(),
+        stage_index: ui.get_stage_index(),
+        negative_strictness_index: ui.get_negative_strictness_index(),
+        custom_negative: ui.get_custom_negative().to_string(),
         negative_expanded: ui.get_negative_expanded(),
         zen_mode: ui.get_zen_mode(),
         fit_suggestions: ui.get_fit_suggestions(),

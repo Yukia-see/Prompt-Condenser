@@ -20,6 +20,10 @@ pub(crate) fn scan_config(ui: &AppWindow) -> ScanConfig {
         dynamic: ui.get_dynamic_enabled(),
         lora_tags_raw: lora_lines(&ui.get_lora_tags()), arranged: ui.get_arranged_enabled(), natural: ui.get_natural_enabled(), two_char: ui.get_app_tab() >= 1, char2_prompt_raw: ui.get_char2_prompt().to_string(), char2_lora_tags_raw: lora_lines(&ui.get_char2_lora_tags()), char_break: ui.get_char_break_enabled(), scene_prompt_raw: ui.get_scene_prompt().to_string(), more_chars: more_chars(ui),
         detail: crate::profiles::DetailLevel::from_index(ui.get_detail_index()),
+        aspect_ratio: crate::profiles::AspectRatio::from_index(ui.get_aspect_index()),
+        stage: crate::profiles::GenerationStage::from_index(ui.get_stage_index()),
+        negative_strictness: crate::profiles::NegativeStrictness::from_index(ui.get_negative_strictness_index()),
+        custom_negative_raw: ui.get_custom_negative().to_string(),
     }
 }
 
@@ -126,6 +130,7 @@ pub(crate) fn analyze(ui: &AppWindow, state: &State) {
         if st.extra_key.as_ref() != Some(&key) {
             st.extra_cards.clear();
             st.check_neg.clear();
+            st.idea_option_negs.clear();
             st.idea_chip_defaults.clear();
             st.extra_key = None;
         }
@@ -154,9 +159,16 @@ pub(crate) type CardKey = (usize, String, String);
 pub(crate) fn card_key(character: usize, ch: &PromptChange) -> CardKey {
     // a card without an original tag (a Recommendation) is told apart by its reason, which names the rule;
     // its suggestion lists the tags still missing, so it changes as the user types
-    // (only its first line: a body-type card lists fit tags below it that change as clothes are added)
+    // (only its first line: a body-type card lists fit tags below it that change as clothes are added).
+    // For AiRewrite add cards (original == ""), include suggested_alternative so two add cards
+    // with empty or identical reasons never collide in `chip_off`.
     let discriminator = if ch.original.trim().is_empty() {
-        ch.reason.lines().next().unwrap_or("").trim().to_lowercase()
+        let first_line = ch.reason.lines().next().unwrap_or("").trim().to_lowercase();
+        if ch.action == ChangeAction::AiRewrite {
+            format!("{first_line}\u{1}{}", ch.suggested_alternative.trim().to_lowercase())
+        } else {
+            first_line
+        }
     } else {
         ch.original.trim().to_lowercase()
     };
@@ -342,7 +354,19 @@ pub(crate) fn render(ui: &AppWindow, state: &State) {
         .extra_cards
         .iter()
         .filter(|c| c.mode == 0)
-        .filter_map(|c| st.check_neg.get(&c.id).cloned())
+        .filter_map(|c| {
+            if let Some(opt_negs) = st.idea_option_negs.get(&c.id) {
+                let off = st.chip_off.get(&card_key(0, c));
+                let active: Vec<String> = opt_negs
+                    .iter()
+                    .filter(|(tags, _)| tags.iter().any(|t| !off.is_some_and(|o| o.contains(t))))
+                    .flat_map(|(_, negs)| negs.iter().cloned())
+                    .collect();
+                (!active.is_empty()).then(|| active.join(", "))
+            } else {
+                st.check_neg.get(&c.id).cloned()
+            }
+        })
         .collect::<Vec<_>>()
         .join(", ");
     let mut out = condenser::build_condensed_output(&c1_raw, &st.base_tokens, &changes1, &config);
@@ -656,17 +680,23 @@ pub(crate) fn render_negative(ui: &AppWindow, config: &ScanConfig, positive: &st
         );
         return;
     }
-    let base = condenser::recommended_negative(config, positive);
+    let neg_summary = condenser::analyze_negative(config, positive);
+    let base = neg_summary.text;
+    let layers_note = if neg_summary.active_layers.len() > 1 {
+        format!(" [{} · {}]", config.negative_strictness.display_name(), neg_summary.active_layers.join(", "))
+    } else {
+        format!(" [{}]", config.negative_strictness.display_name())
+    };
     let ai_negative = ai
-        .map(|sc| condenser::merge_negative(&format!("{}, {}", sc.recommended_negative, base), positive))
+        .map(|sc| condenser::merge_negative(&format!("{base}, {}", sc.recommended_negative), positive))
         .filter(|_| ai.map(|sc| !sc.recommended_negative.trim().is_empty()).unwrap_or(false));
     let (text, markdown, note) = match ai_negative {
         Some(neg) => {
             let (md, added) = condenser::highlight_against_original(&base, &neg);
             let note = if added > 0 {
-                format!("Tailored by AI to the improved prompt: green = {added} AI addition(s) on top of the checkpoint defaults.")
+                format!("Tailored by AI to the improved prompt (+{added} AI additions){layers_note}.")
             } else {
-                "Tailored by AI to the improved prompt.".to_string()
+                format!("Tailored by AI to the improved prompt{layers_note}.")
             };
             (neg, md, note)
         }
@@ -676,18 +706,13 @@ pub(crate) fn render_negative(ui: &AppWindow, config: &ScanConfig, positive: &st
                 .map(|t| condenser::highlight_md(&t.raw, condenser::Highlight::None))
                 .collect::<Vec<_>>()
                 .join(", ");
-            let view = if config.target_view == TargetView::None {
-                String::new()
-            } else {
-                format!(" + {} framing", config.target_view.display_name())
-            };
             let tail = if ai.is_some() {
-                "The AI didn't return a negative this time, so these are the defaults. Run the scan again to retry."
+                "The AI didn't return a negative this time, so these are the rule protections."
             } else {
-                "Switch to AI Improved after a Deep AI Scan for a negative tailored to the scene."
+                "Positive tags are auto-excluded."
             };
             let note = format!(
-                "{} defaults{view}. Tags your prompt asks for are left out. {tail}",
+                "{}{layers_note}. {tail}",
                 config.checkpoint.display_name()
             );
             (base, md, note)
@@ -953,6 +978,35 @@ pub(crate) fn card_list(
     (cards, counts)
 }
 
+/// Replaces the current Idea cards and their protective negative guards in `state`,
+/// leaving only each card's first option switched on by default, then re-renders.
+fn apply_idea_cards(ui: &AppWindow, state: &State, key: &AiKey, found: &[ideas::IdeaSuggestion]) -> usize {
+    let (cards, neg_guards) = ideas::rich_cards(found);
+    let opt_negs = ideas::rich_card_option_negatives(found);
+    let n = cards.len();
+    {
+        let mut st = state.borrow_mut();
+        st.extra_cards.retain(|c| c.action != ChangeAction::Idea);
+        st.check_neg.retain(|&id, _| id < ideas::IDEA_CARD_ID_BASE);
+        st.check_neg.extend(neg_guards);
+        st.idea_option_negs = opt_negs;
+        for (card, sug) in cards.iter().zip(found) {
+            let off: std::collections::HashSet<String> = sug
+                .options
+                .iter()
+                .skip(1)
+                .flat_map(|o| o.tags.iter().cloned())
+                .collect();
+            st.chip_off.insert(card_key(0, card), off.clone());
+            st.idea_chip_defaults.insert(card_key(0, card), off);
+        }
+        st.extra_cards.extend(cards);
+        st.extra_key = Some(key.clone());
+    }
+    render(ui, state);
+    n
+}
+
 /// Wires rule analysis (debounced), card toggles, the After view switch and the copy buttons.
 pub(crate) fn wire_cards(ui: &AppWindow, state: &State) {
     // "+ Quality": the checkpoint's missing quality tags in front of Before (an explicit action)
@@ -970,6 +1024,26 @@ pub(crate) fn wire_cards(ui: &AppWindow, state: &State) {
                 format!("Added {} quality tags: {}.", checkpoint.display_name(), added.join(", "))
             };
             ui.set_status_message(msg.into());
+        });
+    }
+    // "📋 Paste": paste clipboard text into Before and immediately condense it
+    {
+        let weak = ui.as_weak();
+        ui.on_paste_prompt_requested(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            match arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
+                Ok(text) if !text.trim().is_empty() => {
+                    ui.set_raw_prompt(text.into());
+                    ui.invoke_analyze_requested();
+                    ui.set_status_message("Pasted prompt from clipboard and condensed.".into());
+                }
+                Ok(_) => {
+                    ui.set_status_message("Clipboard has no text to paste.".into());
+                }
+                Err(e) => {
+                    ui.set_status_message(format!("Clipboard paste failed: {e}").into());
+                }
+            }
         });
     }
     // --- Rule analysis ---
@@ -1158,7 +1232,7 @@ pub(crate) fn wire_cards(ui: &AppWindow, state: &State) {
         });
     }
 
-    // --- 💡 Ideas: E4B picks real tags for the parts the prompt leaves out ---
+    // --- 💡 Ideas: context-aware AI picks (or curated offline ideas when AI is off) ---
     {
         let weak = ui.as_weak();
         let state = state.clone();
@@ -1166,25 +1240,54 @@ pub(crate) fn wire_cards(ui: &AppWindow, state: &State) {
             let Some(ui) = weak.upgrade() else { return };
             // the prompt as shown in After (rules applied), so ideas fit what will be generated
             let prompt = ui.get_condensed_prompt().to_string();
-            let mut gaps = ideas::gaps(&prompt);
+            let config = scan_config(&ui);
+            let mut gaps = ideas::contextual_gaps(&prompt, &config);
             if gaps.is_empty() {
-                gaps = ideas::refinement_gaps(&prompt);
+                gaps = ideas::contextual_refinement_gaps(&prompt, &config);
+            }
+            // Deduplicate Idea menus against tags already offered by active Recommendation / AiRewrite cards
+            let already_offered: std::collections::HashSet<String> = {
+                let st = state.borrow();
+                st.changes
+                    .iter()
+                    .chain(&st.ai_changes)
+                    .chain(st.others.iter().flat_map(|o| o.changes.iter().chain(&o.ai_changes)))
+                    .filter(|c| matches!(c.action, ChangeAction::Recommendation | ChangeAction::AiRewrite))
+                    .flat_map(|c| parser::parse_prompt(&c.suggested_alternative))
+                    .map(|t| t.normalized)
+                    .collect()
+            };
+            if !already_offered.is_empty() {
+                for g in &mut gaps {
+                    g.menu.retain(|t| !already_offered.contains(&t.to_lowercase().replace('_', " ")));
+                }
+                gaps.retain(|g| !g.menu.is_empty());
             }
             if gaps.is_empty() {
-                ui.set_status_message(
-                    "💡 Ideas: no additional tag menus available (make sure the Danbooru tag list is downloaded).".into(),
-                );
+                ui.set_status_message("💡 Ideas: your prompt already covers all compatible categories for this stage/view.".into());
                 return;
             }
-            let model = default_text_model(&ui, &state);
-            let (host, mode) = (ui.get_ollama_host().to_string(), AiMode::from_index(ui.get_ai_mode_index()));
             let key = ai_key(&ui);
+            let mode = AiMode::from_index(ui.get_ai_mode_index());
+            if !ui.get_ollama_connected() || mode == AiMode::Disabled {
+                let found = ideas::offline_suggest(&prompt, &gaps, &config);
+                if found.is_empty() {
+                    ui.set_status_message("💡 Ideas: no additional compatible tags to suggest.".into());
+                } else {
+                    let n = apply_idea_cards(&ui, &state, &key, &found);
+                    ui.set_status_message(format!("💡 Ideas (curated offline): {n} card(s). Pick tags and press Add It; nothing changes until you do.").into());
+                }
+                return;
+            }
+
+            let model = default_text_model(&ui, &state);
+            let host = ui.get_ollama_host().to_string();
             ui.set_ideas_busy(true);
             ui.set_status_message(format!("💡 Ideas: asking {model} about the {}…", gaps.iter().map(|g| g.name).collect::<Vec<_>>().join(", ")).into());
             let weak = weak.clone();
             std::thread::spawn(move || {
                 let started = std::time::Instant::now();
-                let result = ideas::suggest(&host, &model, mode, &prompt, &gaps);
+                let result = ideas::suggest_rich(&host, &model, mode, &prompt, &gaps, &config);
                 let secs = started.elapsed().as_secs_f32();
                 let _ = weak.upgrade_in_event_loop(move |ui| {
                     ui.set_ideas_busy(false);
@@ -1196,21 +1299,7 @@ pub(crate) fn wire_cards(ui: &AppWindow, state: &State) {
                         }
                         match result {
                             Ok(found) if !found.is_empty() => {
-                                let cards = ideas::cards(&found);
-                                let n = cards.len();
-                                {
-                                    let mut st = state.borrow_mut();
-                                    st.extra_cards.retain(|c| c.action != ChangeAction::Idea);
-                                    // only the first option starts switched on
-                                    for (card, (_, options)) in cards.iter().zip(&found) {
-                                        let off: std::collections::HashSet<String> = options.iter().skip(1).flatten().cloned().collect();
-                                        st.chip_off.insert(card_key(0, card), off.clone());
-                                        st.idea_chip_defaults.insert(card_key(0, card), off);
-                                    }
-                                    st.extra_cards.extend(cards);
-                                    st.extra_key = Some(key.clone());
-                                }
-                                render(&ui, state);
+                                let n = apply_idea_cards(&ui, state, &key, &found);
                                 ui.set_status_message(format!("💡 Ideas: {n} card(s) in {secs:.1}s. Pick tags and press Add It; nothing changes until you do.").into());
                             }
                             Ok(_) => ui.set_status_message("💡 Ideas: the model's picks weren't on the tag menus, so there's nothing to suggest. Try again.".into()),
@@ -1385,6 +1474,7 @@ mod card_key_tests {
             dynamic: false,
             lora_tags_raw: String::new(), arranged: false, natural: false, two_char: false, char2_prompt_raw: String::new(), char2_lora_tags_raw: String::new(), char_break: false, scene_prompt_raw: String::new(), more_chars: Vec::new(),
             detail: crate::profiles::DetailLevel::Balanced,
+            ..Default::default()
         };
         let prompt = "1girl, large breasts, shirt, thick thighs, thighhighs";
         let mut changes = analyzer::analyze_with_rules(&parser::parse_prompt(prompt), &config).changes;
