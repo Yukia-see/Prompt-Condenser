@@ -819,6 +819,7 @@ pub(crate) fn to_card(ch: &PromptChange, character_label: String) -> ChangeCardI
         ChangeAction::Idea => 3,
         ChangeAction::CheckResult => 0,
     };
+    let has_framing_alt = crate::condenser::parse_non_empty_tags(&ch.framing_alternative).is_some();
     ChangeCardItem {
         id: ch.id as i32,
         badge: ch.action.badge_text().into(),
@@ -827,8 +828,12 @@ pub(crate) fn to_card(ch: &PromptChange, character_label: String) -> ChangeCardI
         original: ch.original.clone().into(),
         reason: ch.reason.clone().into(),
         suggested_alternative: ch.suggested_alternative.clone().into(),
-        framing_alternative: ch.framing_alternative.clone().into(),
-        has_framing_alt: !ch.framing_alternative.is_empty(),
+        framing_alternative: if has_framing_alt {
+            ch.framing_alternative.trim().into()
+        } else {
+            SharedString::default()
+        },
+        has_framing_alt,
         mode: ch.mode as i32,
         chips: ModelRc::default(),
         summary_count: 0,
@@ -1495,5 +1500,35 @@ mod card_key_tests {
         let again = later.iter().find(|c| card_key(0, c) == key_a).expect("the accepted card is still there");
         assert_eq!(again.mode, 0, "the choice survived the edit");
         assert!(later.iter().filter(|c| c.action == analyzer::ChangeAction::Recommendation && card_key(0, c) != key_a).all(|c| c.mode == 2));
+    }
+
+    #[test]
+    fn to_card_ignores_blank_or_delimiter_framing_alternative() {
+        for blank in ["", "   \t ", " , , "] {
+            let ch = PromptChange {
+                id: 1,
+                original: "ass".into(),
+                action: ChangeAction::FramingSafeSwap,
+                reason: "test".into(),
+                suggested_alternative: "curvy".into(),
+                framing_alternative: blank.into(),
+                mode: 0,
+            };
+            let item = to_card(&ch, String::new());
+            assert!(!item.has_framing_alt, "expected has_framing_alt=false for {blank:?}");
+            assert!(item.framing_alternative.is_empty());
+        }
+        let valid = PromptChange {
+            id: 2,
+            original: "ass".into(),
+            action: ChangeAction::FramingSafeSwap,
+            reason: "test".into(),
+            suggested_alternative: "curvy".into(),
+            framing_alternative: "  cowboy shot  ".into(),
+            mode: 0,
+        };
+        let item = to_card(&valid, String::new());
+        assert!(item.has_framing_alt);
+        assert_eq!(item.framing_alternative.as_str(), "cowboy shot");
     }
 }

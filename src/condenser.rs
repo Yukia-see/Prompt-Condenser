@@ -29,12 +29,44 @@ pub fn build_condensed_output(
 ) -> CondensedOutput {
     let (before_tokens, before_chunks) = estimate_clip_tokens(raw_prompt);
 
+    let is_active_mode1_framing = |c: &PromptChange| {
+        !c.action.is_opt_in()
+            && c.mode == 1
+            && c.action == ChangeAction::FramingSafeSwap
+            && parse_non_empty_tags(&c.framing_alternative).is_some()
+    };
+
     let mut result_tokens: Vec<PromptToken> = base_tokens.to_vec();
-    let orig_parsed: Vec<PromptToken> = if changes.iter().any(|c| !c.action.is_opt_in() && c.mode == 2) {
+    let needs_orig_parsed = changes.iter().any(|c| {
+        !c.action.is_opt_in()
+            && parse_non_empty_tags(&c.original).is_some()
+            && (c.mode == 2 || is_active_mode1_framing(c))
+    });
+    let orig_parsed: Vec<PromptToken> = if needs_orig_parsed {
         parse_prompt(raw_prompt)
     } else {
         Vec::new()
     };
+    let mut used_orig: Vec<bool> = vec![false; orig_parsed.len()];
+
+    // Suggestions still active in mode 0 (or mode 1 without an active framing override) must not be
+    // deleted by sibling mode 1 / mode 2 overrides.
+    let active_mode0_alts: HashSet<String> = changes
+        .iter()
+        .filter(|c| !c.action.is_opt_in() && (c.mode == 0 || (c.mode == 1 && !is_active_mode1_framing(c))))
+        .flat_map(|c| normalized_tag_set(&c.suggested_alternative))
+        .collect();
+    // Tokens kept (original) or inserted (framing_alternative) by active mode 1 framing overrides
+    // so neither sibling mode 1 cards nor mode 2 restorations clobber them regardless of card order.
+    let protected_mode1: HashSet<String> = changes
+        .iter()
+        .filter(|c| is_active_mode1_framing(c))
+        .flat_map(|c| {
+            normalized_tag_set(&c.original)
+                .into_iter()
+                .chain(normalized_tag_set(&c.framing_alternative))
+        })
+        .collect();
 
     // Apply any user overrides where `mode != 0` (AI and Recommendation cards are handled below)
     for ch in changes
@@ -45,119 +77,88 @@ pub fn build_condensed_output(
             1 => {
                 // Mode 1: User chose "Adjust Camera Framing Instead" on a FramingSafeSwap
                 // Restore the original body part (e.g. `ass`) at emphasis weight and replace framing with `framing_alternative`
-                if ch.action == ChangeAction::FramingSafeSwap && !ch.framing_alternative.is_empty() {
-                    let body_alts: HashSet<String> = ch
-                        .suggested_alternative
-                        .split(',')
-                        .map(|s| s.trim().to_lowercase())
-                        .collect();
-                    result_tokens.retain(|t| {
-                        !body_alts.contains(&t.normalized)
-                            && !matches!(
-                                t.normalized.as_str(),
-                                "upper body"
-                                    | "cowboy shot"
-                                    | "full body"
-                                    | "lower body"
-                                    | "wide shot"
-                                    | "portrait"
-                                    | "close-up"
-                                    | "close up"
-                                    | "headshot"
-                                    | "front view"
-                                    | "straight-on"
-                                    | "straight on"
-                                    | "facing viewer"
-                                    | "from behind"
-                                    | "back view"
-                                    | "rear view"
-                                    | "from side"
-                                    | "side view"
-                                    | "side profile"
-                                    | "360 view"
-                                    | "character turnaround"
-                                    | "multiple views"
-                            )
-                    });
+                if ch.action == ChangeAction::FramingSafeSwap {
+                    if let Some(new_framing_tokens) = parse_non_empty_tags(&ch.framing_alternative) {
+                        let body_alts = normalized_tag_set(&ch.suggested_alternative);
+                        let new_framing: HashSet<String> =
+                            new_framing_tokens.iter().map(|t| t.normalized.clone()).collect();
 
-                    result_tokens.push(PromptToken {
-                        raw: ch.original.clone(),
-                        text: ch
-                            .original
-                            .trim_matches(|c| c == '(' || c == ')')
-                            .split(':')
-                            .next()
-                            .unwrap_or(&ch.original)
-                            .to_string(),
-                        normalized: ch.original.to_lowercase(),
-                        weight: config.emphasis_weight,
-                        had_runaway_weight: false,
-                        replaced: false,
-                        added: false,
-                        original_index: 50,
-                        category: TokenCategory::PinnedEmphasis,
-                    });
-
-                    for f_part in ch
-                        .framing_alternative
-                        .split(',')
-                        .map(|s| s.trim())
-                        .filter(|s| !s.is_empty())
-                    {
-                        let norm = f_part.to_lowercase();
-                        if result_tokens.iter().any(|e| e.normalized == norm) {
-                            continue;
-                        }
-                        result_tokens.push(PromptToken {
-                            raw: f_part.to_string(),
-                            text: f_part.to_string(),
-                            normalized: norm,
-                            weight: 1.0,
-                            had_runaway_weight: false,
-                            replaced: true,
-                            added: false,
-                            original_index: 60,
-                            category: TokenCategory::FramingPose,
+                        result_tokens.retain(|t| {
+                            let drop_body_alt = t.replaced
+                                && body_alts.contains(&t.normalized)
+                                && !active_mode0_alts.contains(&t.normalized)
+                                && !protected_mode1.contains(&t.normalized);
+                            let drop_framing = is_framing_override_target(&t.normalized)
+                                && !new_framing.contains(&t.normalized)
+                                && !protected_mode1.contains(&t.normalized);
+                            !drop_body_alt && !drop_framing
                         });
+
+                        for (mut orig_tok, matched_in_orig) in
+                            resolve_original_tokens_with_match(&ch.original, &orig_parsed, &mut used_orig, 50)
+                        {
+                            orig_tok.weight = config.emphasis_weight;
+                            orig_tok.had_runaway_weight = false;
+                            orig_tok.replaced = false;
+                            orig_tok.added = false;
+                            orig_tok.category = TokenCategory::PinnedEmphasis;
+                            push_resolved_token(&mut result_tokens, orig_tok, matched_in_orig);
+                        }
+
+                        for mut f_tok in new_framing_tokens {
+                            if result_tokens.iter().any(|e| e.normalized == f_tok.normalized) {
+                                continue;
+                            }
+                            normalize_token_inline_whitespace(&mut f_tok);
+                            f_tok.weight = 1.0;
+                            f_tok.had_runaway_weight = false;
+                            f_tok.replaced = true;
+                            f_tok.added = false;
+                            f_tok.original_index = 60;
+                            f_tok.category = TokenCategory::FramingPose;
+                            result_tokens.push(f_tok);
+                        }
                     }
                 }
             }
             2 => {
                 // Mode 2: User chose "Restore Original" on this specific change
-                if !ch.suggested_alternative.is_empty() {
-                    let alts: HashSet<String> = ch
-                        .suggested_alternative
-                        .split(',')
-                        .map(|s| s.trim().to_lowercase())
-                        .collect();
-                    result_tokens.retain(|t| !alts.contains(&t.normalized));
+                let alts = normalized_tag_set(&ch.suggested_alternative);
+                if !alts.is_empty() {
+                    let in_place_action = matches!(
+                        ch.action,
+                        ChangeAction::KeptEmphasized | ChangeAction::WeightClamped
+                    );
+                    let orig_raw_trimmed = ch.original.trim();
+                    let has_exact_raw = in_place_action
+                        && !orig_raw_trimmed.is_empty()
+                        && result_tokens.iter().any(|t| t.raw.trim() == orig_raw_trimmed);
+                    result_tokens.retain(|t| {
+                        let is_alt_token = match ch.action {
+                            ChangeAction::KeptEmphasized | ChangeAction::WeightClamped => {
+                                if has_exact_raw {
+                                    t.raw.trim() == orig_raw_trimmed
+                                } else {
+                                    alts.contains(&t.normalized)
+                                }
+                            }
+                            ChangeAction::AngleChoice
+                            | ChangeAction::PoseChoice
+                            | ChangeAction::ProportionChoice => {
+                                (t.added || t.replaced) && alts.contains(&t.normalized)
+                            }
+                            _ => t.replaced && alts.contains(&t.normalized),
+                        };
+                        let drop = is_alt_token
+                            && !active_mode0_alts.contains(&t.normalized)
+                            && !protected_mode1.contains(&t.normalized);
+                        !drop
+                    });
                 }
-                let orig_clean = ch.original.trim();
-                if !orig_clean.is_empty()
-                    && !result_tokens.iter().any(|t| t.raw == orig_clean || t.text == orig_clean)
+                for (restored, matched_in_orig) in
+                    resolve_original_tokens_with_match(&ch.original, &orig_parsed, &mut used_orig, 500)
                 {
-                    let restored = orig_parsed
-                        .iter()
-                        .find(|t| {
-                            t.raw.trim() == orig_clean
-                                || t.text.trim() == orig_clean
-                                || t.normalized == orig_clean.to_lowercase()
-                        })
-                        .cloned()
-                        .unwrap_or_else(|| {
-                            parse_prompt(orig_clean).into_iter().next().unwrap_or(PromptToken {
-                                raw: orig_clean.to_string(),
-                                text: orig_clean.to_string(),
-                                normalized: orig_clean.to_lowercase(),
-                                weight: 1.0,
-                                had_runaway_weight: false,
-                                replaced: false,
-                                added: false,
-                                original_index: 500,
-                                category: TokenCategory::Attire,
-                            })
-                        });
-                    result_tokens.push(restored);
+                    push_resolved_token(&mut result_tokens, restored, matched_in_orig);
                 }
             }
             _ => {}
@@ -253,6 +254,173 @@ pub fn build_condensed_output(
         after_tokens,
         after_chunks,
     }
+}
+
+/// Parses a tag list when it contains at least one non-empty token.
+pub(crate) fn parse_non_empty_tags(input: &str) -> Option<Vec<PromptToken>> {
+    if input.trim().is_empty() {
+        return None;
+    }
+    let tokens = parse_prompt(input);
+    (!tokens.is_empty()).then_some(tokens)
+}
+
+/// Parses a tag list into normalized forms, ignoring empty segments and weight wrappers.
+fn normalized_tag_set(input: &str) -> HashSet<String> {
+    parse_non_empty_tags(input)
+        .map(|tokens| tokens.into_iter().map(|t| t.normalized).collect())
+        .unwrap_or_default()
+}
+
+/// Collapses runs of inline whitespace in `text` and `raw` on synthesized framing tokens.
+fn normalize_token_inline_whitespace(tok: &mut PromptToken) {
+    if tok.text.split_whitespace().count() > 0 {
+        let cleaned = tok.text.split_whitespace().collect::<Vec<_>>().join(" ");
+        if cleaned != tok.text {
+            tok.text = cleaned.clone();
+            tok.raw = cleaned;
+        }
+    }
+}
+
+/// Inserts a resolved original token unless that occurrence is already present.
+fn push_resolved_token(result_tokens: &mut Vec<PromptToken>, tok: PromptToken, matched_in_orig: bool) {
+    let already_present = if matched_in_orig {
+        result_tokens
+            .iter()
+            .any(|t| t.original_index == tok.original_index && t.normalized == tok.normalized)
+    } else {
+        result_tokens.iter().any(|t| t.normalized == tok.normalized)
+    };
+    if !already_present {
+        result_tokens.push(tok);
+    }
+}
+
+/// Resolves original tags against `orig_parsed` to preserve weights, categories, and original indices.
+/// Ranks matches as: exact raw > exact text + weight > exact text > normalized + weight > normalized,
+/// resolving more-specific queries first and preferring unclaimed occurrences to disambiguate
+/// multiple tags sharing the same text.
+#[cfg(test)]
+fn resolve_original_tokens(
+    orig_raw: &str,
+    orig_parsed: &[PromptToken],
+    used_orig: &mut [bool],
+    fallback_index: usize,
+) -> Vec<PromptToken> {
+    resolve_original_tokens_with_match(orig_raw, orig_parsed, used_orig, fallback_index)
+        .into_iter()
+        .map(|(tok, _)| tok)
+        .collect()
+}
+
+/// Tiered matching predicate for `resolve_original_tokens_with_match` (`0` = strongest).
+fn matches_resolution_tier(parsed: &PromptToken, cand: &PromptToken, tier: usize) -> bool {
+    match tier {
+        0 => cand.raw.trim() == parsed.raw.trim(),
+        1 => cand.text.trim() == parsed.text.trim() && (cand.weight - parsed.weight).abs() < 0.01,
+        2 => cand.text.trim() == parsed.text.trim(),
+        3 => cand.normalized == parsed.normalized && (cand.weight - parsed.weight).abs() < 0.01,
+        4 => cand.normalized == parsed.normalized,
+        _ => false,
+    }
+}
+
+/// Same as `resolve_original_tokens`, also returning whether each token matched an entry in `orig_parsed`.
+fn resolve_original_tokens_with_match(
+    orig_raw: &str,
+    orig_parsed: &[PromptToken],
+    used_orig: &mut [bool],
+    fallback_index: usize,
+) -> Vec<(PromptToken, bool)> {
+    let Some(parsed_tokens) = parse_non_empty_tags(orig_raw) else {
+        return Vec::new();
+    };
+
+    // Resolve higher-specificity queries first so a bare text tag cannot claim an occurrence
+    // that a sibling exact-raw or weighted query in the same list specifically names.
+    let mut order: Vec<(usize, usize)> = parsed_tokens
+        .iter()
+        .enumerate()
+        .map(|(pos, parsed)| {
+            let best_tier = (0..5)
+                .find(|&tier| orig_parsed.iter().any(|t| matches_resolution_tier(parsed, t, tier)))
+                .unwrap_or(5);
+            (best_tier, pos)
+        })
+        .collect();
+    order.sort_unstable();
+
+    let mut resolved: Vec<Option<(PromptToken, bool)>> = vec![None; parsed_tokens.len()];
+    let mut parsed_opts: Vec<Option<PromptToken>> = parsed_tokens.into_iter().map(Some).collect();
+    for (_, pos) in order {
+        let mut parsed = parsed_opts[pos].take().expect("index visited once");
+        let find_unused = |tier: usize| -> Option<usize> {
+            orig_parsed
+                .iter()
+                .enumerate()
+                .position(|(i, t)| !used_orig.get(i).copied().unwrap_or(false) && matches_resolution_tier(&parsed, t, tier))
+        };
+        let find_any = |tier: usize| -> Option<usize> {
+            orig_parsed
+                .iter()
+                .position(|t| matches_resolution_tier(&parsed, t, tier))
+        };
+
+        // Exact-identity tiers (raw, text+weight) may reuse an already-claimed exact slot rather
+        // than falling back to a wrong-weight token; weak tiers check all unused tiers first.
+        let matched = find_unused(0)
+            .or_else(|| find_any(0))
+            .or_else(|| find_unused(1))
+            .or_else(|| find_any(1))
+            .or_else(|| find_unused(2))
+            .or_else(|| find_unused(3))
+            .or_else(|| find_unused(4))
+            .or_else(|| find_any(2))
+            .or_else(|| find_any(3))
+            .or_else(|| find_any(4));
+
+        resolved[pos] = Some(if let Some(idx) = matched {
+            if let Some(slot) = used_orig.get_mut(idx) {
+                *slot = true;
+            }
+            (orig_parsed[idx].clone(), true)
+        } else {
+            parsed.original_index = fallback_index;
+            (parsed, false)
+        });
+    }
+
+    resolved.into_iter().map(|entry| entry.expect("all slots filled")).collect()
+}
+
+/// Returns true for framing/view tags cleared when a `FramingSafeSwap` switches to mode 1.
+fn is_framing_override_target(normalized: &str) -> bool {
+    matches!(
+        normalized,
+        "upper body"
+            | "cowboy shot"
+            | "full body"
+            | "lower body"
+            | "wide shot"
+            | "portrait"
+            | "close-up"
+            | "close up"
+            | "headshot"
+            | "front view"
+            | "straight-on"
+            | "straight on"
+            | "facing viewer"
+            | "from behind"
+            | "back view"
+            | "rear view"
+            | "from side"
+            | "side view"
+            | "side profile"
+            | "360 view"
+            | "character turnaround"
+            | "multiple views"
+    )
 }
 
 fn format_as_flux_natural_language(tokens: &[PromptToken], fmt: impl Fn(&PromptToken) -> String) -> String {
@@ -450,7 +618,7 @@ pub fn highlight_against_original(raw_prompt: &str, text: &str) -> (String, usiz
 /// mode 0 = replace with the suggestion (empty suggestion = remove),
 /// mode 1 = keep the tag and use the framing alternative, mode 2 = no change.
 fn apply_ai_card(tokens: &mut Vec<PromptToken>, ch: &PromptChange) {
-    let targets: HashSet<String> = parse_prompt(&ch.original).into_iter().map(|t| t.normalized).collect();
+    let targets = normalized_tag_set(&ch.original);
     let is_add = targets.is_empty();
     let anchor = if is_add {
         800 // new details go after the user's own tags in their category
@@ -461,10 +629,13 @@ fn apply_ai_card(tokens: &mut Vec<PromptToken>, ch: &PromptChange) {
         }
     };
 
-    let insert = |tokens: &mut Vec<PromptToken>, text: &str| {
-        for mut t in parse_prompt(text) {
+    let insert_tokens = |tokens: &mut Vec<PromptToken>, parsed: Vec<PromptToken>, clean_ws: bool| {
+        for mut t in parsed {
             if tokens.iter().any(|e| e.normalized == t.normalized) {
                 continue;
+            }
+            if clean_ws {
+                normalize_token_inline_whitespace(&mut t);
             }
             t.replaced = !is_add;
             t.added = is_add;
@@ -476,18 +647,21 @@ fn apply_ai_card(tokens: &mut Vec<PromptToken>, ch: &PromptChange) {
     match ch.mode {
         0 => {
             tokens.retain(|t| !targets.contains(&t.normalized));
-            insert(tokens, &ch.suggested_alternative);
+            insert_tokens(tokens, parse_prompt(&ch.suggested_alternative), false);
         }
-        1 if !ch.framing_alternative.is_empty() => {
-            let new_framing: HashSet<String> = parse_prompt(&ch.framing_alternative).into_iter().map(|t| t.normalized).collect();
-            tokens.retain(|t| {
-                new_framing.contains(&t.normalized)
-                    || !matches!(
-                        t.normalized.as_str(),
-                        "upper body" | "portrait" | "close-up" | "close up" | "front view" | "from behind" | "back view"
-                    )
-            });
-            insert(tokens, &ch.framing_alternative);
+        1 => {
+            if let Some(framing_tokens) = parse_non_empty_tags(&ch.framing_alternative) {
+                let new_framing: HashSet<String> =
+                    framing_tokens.iter().map(|t| t.normalized.clone()).collect();
+                tokens.retain(|t| {
+                    new_framing.contains(&t.normalized)
+                        || !matches!(
+                            t.normalized.as_str(),
+                            "upper body" | "portrait" | "close-up" | "close up" | "front view" | "from behind" | "back view"
+                        )
+                });
+                insert_tokens(tokens, framing_tokens, true);
+            }
         }
         _ => {}
     }
@@ -752,19 +926,7 @@ pub fn analyze_negative(config: &ScanConfig, positive: &str) -> NegativeSummary 
             if pos_tokens.iter().any(|t| t.normalized == clean) {
                 continue;
             }
-            // Multi-character isolation check
-            if other_char_tags.contains(&clean)
-                || other_char_tags.iter().any(|t| {
-                    t == &clean
-                        || crate::parser::has_phrase(t, &clean)
-                        || crate::parser::has_phrase(&clean, t)
-                })
-            {
-                continue;
-            }
-            if !auto_negs.contains(&clean) {
-                auto_negs.push(clean);
-            }
+            push_neg(&mut auto_negs, &clean);
         }
     }
 
@@ -1443,11 +1605,11 @@ pub fn export_warning(text: &str, format: ExportFormat) -> Option<&'static str> 
 }
 
 fn has_dynamic_group(text: &str) -> bool {
-    let mut depth = 0;
+    let mut depth = 0i32;
     for c in text.chars() {
         match c {
             '{' => depth += 1,
-            '}' => depth -= 1,
+            '}' => depth = (depth - 1).max(0),
             '|' if depth > 0 => return true,
             _ => {}
         }
@@ -1847,5 +2009,358 @@ mod tests {
             ..Default::default()
         });
         assert!(restored.final_prompt.contains("(ass:1.3)"), "{}", restored.final_prompt);
+    }
+
+    #[test]
+    fn mode1_and_mode2_handle_brackets_user_tags_and_multiple_swaps() {
+        use crate::analyzer::{analyze_with_rules, ChangeAction, PromptChange, ScanConfig};
+        use crate::profiles::TargetView;
+
+        // 1. Mode 1 strips brackets/underscores via orig_parsed and preserves user-authored tags
+        let raw = "1girl, upper body, athletic build, [big_ass]";
+        let cfg = ScanConfig {
+            target_view: TargetView::UpperBody,
+            emphasis_weight: 1.25,
+            ..Default::default()
+        };
+        let mut res = analyze_with_rules(&parse_prompt(raw), &cfg);
+        // Synthetic swap matching a weighted/bracketed original whose suggested_alternative overlaps user's `athletic build`
+        res.processed_tokens.push(PromptToken {
+            raw: "hourglass figure".into(),
+            text: "hourglass figure".into(),
+            normalized: "hourglass figure".into(),
+            weight: 1.15,
+            had_runaway_weight: false,
+            original_index: 3,
+            category: TokenCategory::CharacterBody,
+            replaced: true,
+            added: false,
+        });
+        let swap = PromptChange {
+            id: 900,
+            original: "[big_ass]".into(),
+            action: ChangeAction::FramingSafeSwap,
+            reason: "test".into(),
+            suggested_alternative: "athletic build, (hourglass figure:1.15), ,".into(),
+            framing_alternative: "cowboy shot, from behind".into(),
+            mode: 1,
+        };
+        let out = build_condensed_output(raw, &res.processed_tokens, &[swap], &cfg);
+        assert!(out.final_prompt.contains("(big_ass:1.25)"), "{}", out.final_prompt);
+        assert!(!out.final_prompt.contains("[big_ass]"), "{}", out.final_prompt);
+        assert!(out.final_prompt.contains("athletic build"), "user tag must be kept: {}", out.final_prompt);
+        assert!(!out.final_prompt.contains("hourglass figure"), "replaced alt must be dropped: {}", out.final_prompt);
+        assert!(out.final_prompt.contains("cowboy shot") && out.final_prompt.contains("from behind"), "{}", out.final_prompt);
+        assert!(!out.final_prompt.contains("upper body"), "{}", out.final_prompt);
+
+        // 2. Multiple FramingSafeSwap cards: mode 0 keeps shared tag, multiple mode 1 cards don't clobber each other
+        let raw_multi = "1girl, upper body, ass, thighs";
+        let mut res_multi = analyze_with_rules(&parse_prompt(raw_multi), &cfg);
+        let mut swaps: Vec<PromptChange> = res_multi
+            .changes
+            .iter()
+            .filter(|c| c.action == ChangeAction::FramingSafeSwap)
+            .cloned()
+            .collect();
+        assert!(swaps.len() >= 2, "expected 2 framing swaps: {swaps:?}");
+        swaps[0].mode = 1;
+        swaps[1].mode = 1;
+        let out_multi = build_condensed_output(raw_multi, &res_multi.processed_tokens, &swaps, &cfg);
+        assert!(out_multi.final_prompt.contains("cowboy shot"), "first card framing kept: {}", out_multi.final_prompt);
+        assert!(out_multi.final_prompt.contains("full body"), "second card framing kept: {}", out_multi.final_prompt);
+        assert!(out_multi.final_prompt.contains("ass") && out_multi.final_prompt.contains("thighs"), "{}", out_multi.final_prompt);
+
+        // One mode 0 + one mode 1 sharing a replacement tag: active mode 0 tag survives
+        let base_shared = vec![
+            PromptToken {
+                raw: "1girl".into(),
+                text: "1girl".into(),
+                normalized: "1girl".into(),
+                weight: 1.0,
+                had_runaway_weight: false,
+                original_index: 0,
+                category: TokenCategory::SubjectCount,
+                replaced: false,
+                added: false,
+            },
+            PromptToken {
+                raw: "narrow waist".into(),
+                text: "narrow waist".into(),
+                normalized: "narrow waist".into(),
+                weight: 1.15,
+                had_runaway_weight: false,
+                original_index: 1,
+                category: TokenCategory::CharacterBody,
+                replaced: true,
+                added: false,
+            },
+        ];
+        let shared_changes = vec![
+            PromptChange {
+                id: 1,
+                original: "ass".into(),
+                action: ChangeAction::FramingSafeSwap,
+                reason: "keep".into(),
+                suggested_alternative: "narrow waist".into(),
+                framing_alternative: "cowboy shot".into(),
+                mode: 0,
+            },
+            PromptChange {
+                id: 2,
+                original: "hips".into(),
+                action: ChangeAction::FramingSafeSwap,
+                reason: "override".into(),
+                suggested_alternative: "narrow waist".into(),
+                framing_alternative: "full body".into(),
+                mode: 1,
+            },
+        ];
+        let out_shared = build_condensed_output("1girl, ass, hips", &base_shared, &shared_changes, &cfg);
+        assert!(out_shared.final_prompt.contains("narrow waist"), "mode 0 tag must survive: {}", out_shared.final_prompt);
+
+        // 3. Mode 2 restores multi-tag original (e.g. AngleChoice)
+        res_multi.changes.clear();
+        let angle_restore = PromptChange {
+            id: 901,
+            original: "low angle, from below".into(),
+            action: ChangeAction::AngleChoice,
+            reason: "test".into(),
+            suggested_alternative: "high angle".into(),
+            framing_alternative: String::new(),
+            mode: 2,
+        };
+        let out_angle = build_condensed_output(
+            "1girl, low angle, from below",
+            &[PromptToken {
+                raw: "high angle".into(),
+                text: "high angle".into(),
+                normalized: "high angle".into(),
+                weight: 1.0,
+                had_runaway_weight: false,
+                original_index: 940,
+                category: TokenCategory::FramingPose,
+                replaced: false,
+                added: true,
+            }],
+            &[angle_restore],
+            &cfg,
+        );
+        assert!(out_angle.final_prompt.contains("low angle"), "{}", out_angle.final_prompt);
+        assert!(out_angle.final_prompt.contains("from below"), "{}", out_angle.final_prompt);
+        assert!(!out_angle.final_prompt.contains("high angle"), "{}", out_angle.final_prompt);
+    }
+
+    #[test]
+    fn whitespace_framing_alt_sibling_deletion_and_token_resolution_edge_cases() {
+        use crate::analyzer::{ChangeAction, PromptChange, ScanConfig};
+        use crate::profiles::TargetView;
+
+        let cfg = ScanConfig {
+            target_view: TargetView::UpperBody,
+            emphasis_weight: 1.25,
+            cleanup_enabled: false,
+            ..Default::default()
+        };
+
+        // 1. Whitespace-only or delimiter-only framing_alternative in mode 1 is a no-op:
+        //    existing framing & body alternatives are untouched, and sibling mode 2 won't delete them.
+        let base_ws = parse_prompt("1girl, upper body, narrow waist");
+        let mut base_ws_replaced = base_ws.clone();
+        base_ws_replaced[2].replaced = true;
+        for blank_alt in ["   \t ", " , , "] {
+            let changes = vec![
+                PromptChange {
+                    id: 1,
+                    original: "ass".into(),
+                    action: ChangeAction::FramingSafeSwap,
+                    reason: "blank framing".into(),
+                    suggested_alternative: "narrow waist".into(),
+                    framing_alternative: blank_alt.into(),
+                    mode: 1,
+                },
+                PromptChange {
+                    id: 2,
+                    original: "hips".into(),
+                    action: ChangeAction::FramingSafeSwap,
+                    reason: "restore".into(),
+                    suggested_alternative: "narrow waist".into(),
+                    framing_alternative: "full body".into(),
+                    mode: 2,
+                },
+            ];
+            let out = build_condensed_output("1girl, upper body, ass, hips", &base_ws_replaced, &changes, &cfg);
+            assert!(out.final_prompt.contains("upper body"), "framing must stay for {blank_alt:?}: {}", out.final_prompt);
+            assert!(out.final_prompt.contains("narrow waist"), "inactive mode 1 alt must survive: {}", out.final_prompt);
+            assert!(!out.final_prompt.contains("ass"), "{}", out.final_prompt);
+        }
+
+        // AI card with whitespace-only framing_alternative in mode 1 also leaves framing intact
+        let ai_blank = PromptChange {
+            id: 3,
+            original: "smile".into(),
+            action: ChangeAction::AiRewrite,
+            reason: "blank".into(),
+            suggested_alternative: "grin".into(),
+            framing_alternative: "   ".into(),
+            mode: 1,
+        };
+        let out_ai = build_condensed_output("1girl, upper body, smile", &parse_prompt("1girl, upper body, smile"), &[ai_blank], &cfg);
+        assert!(out_ai.final_prompt.contains("upper body"), "{}", out_ai.final_prompt);
+
+        // 2. Mode 2 before Mode 1 must not clobber Mode 1 tokens, and Mode 2 must preserve user-authored tags
+        let base_order = vec![
+            PromptToken {
+                raw: "1girl".into(),
+                text: "1girl".into(),
+                normalized: "1girl".into(),
+                weight: 1.0,
+                had_runaway_weight: false,
+                original_index: 0,
+                category: TokenCategory::SubjectCount,
+                replaced: false,
+                added: false,
+            },
+            PromptToken {
+                raw: "upper body".into(),
+                text: "upper body".into(),
+                normalized: "upper body".into(),
+                weight: 1.0,
+                had_runaway_weight: false,
+                original_index: 1,
+                category: TokenCategory::FramingPose,
+                replaced: false,
+                added: false,
+            },
+            PromptToken {
+                raw: "slender".into(),
+                text: "slender".into(),
+                normalized: "slender".into(),
+                weight: 1.0,
+                had_runaway_weight: false,
+                original_index: 2,
+                category: TokenCategory::CharacterBody,
+                replaced: false,
+                added: false,
+            },
+            PromptToken {
+                raw: "curvy".into(),
+                text: "curvy".into(),
+                normalized: "curvy".into(),
+                weight: 1.15,
+                had_runaway_weight: false,
+                original_index: 3,
+                category: TokenCategory::CharacterBody,
+                replaced: true,
+                added: false,
+            },
+        ];
+        let order_changes = vec![
+            PromptChange {
+                id: 10,
+                original: "hips".into(),
+                action: ChangeAction::FramingSafeSwap,
+                reason: "mode 2 before mode 1".into(),
+                suggested_alternative: "slender, curvy, cowboy shot".into(),
+                framing_alternative: String::new(),
+                mode: 2,
+            },
+            PromptChange {
+                id: 11,
+                original: "ass".into(),
+                action: ChangeAction::FramingSafeSwap,
+                reason: "mode 1".into(),
+                suggested_alternative: "curvy".into(),
+                framing_alternative: "cowboy shot".into(),
+                mode: 1,
+            },
+        ];
+        let out_order = build_condensed_output("1girl, upper body, slender, ass, hips", &base_order, &order_changes, &cfg);
+        assert!(out_order.final_prompt.contains("slender"), "user tag must survive mode 2: {}", out_order.final_prompt);
+        assert!(!out_order.final_prompt.contains("curvy"), "replaced alt must drop: {}", out_order.final_prompt);
+        assert!(out_order.final_prompt.contains("cowboy shot"), "mode 1 framing must survive earlier mode 2: {}", out_order.final_prompt);
+        assert!(out_order.final_prompt.contains("ass") && out_order.final_prompt.contains("hips"), "{}", out_order.final_prompt);
+
+        // 3. Disambiguation in resolve_original_tokens when multiple tags share the same text
+        let raw_dups = "1girl, BIG_ASS, (big ass:1.2), (big ass:1.4)";
+        let orig_parsed = parse_prompt(raw_dups);
+        let mut used = vec![false; orig_parsed.len()];
+
+        // Exact text match beats normalized-only BIG_ASS, and weight match picks 1.4 over 1.2
+        let resolved_14 = resolve_original_tokens("1.4::big ass::", &orig_parsed, &mut used, 500);
+        assert_eq!(resolved_14.len(), 1);
+        assert!((resolved_14[0].weight - 1.4).abs() < 0.01, "expected 1.4, got {:?}", resolved_14[0]);
+        assert_eq!(resolved_14[0].original_index, 3);
+
+        // Weak text-only match first does not hijack a later exact-raw match
+        let mut used_order = vec![false; orig_parsed.len()];
+        let first_text = resolve_original_tokens("big ass", &orig_parsed, &mut used_order, 500);
+        assert_eq!(first_text[0].original_index, 2); // (big ass:1.2)
+        let exact_raw_later = resolve_original_tokens("(big ass:1.2)", &orig_parsed, &mut used_order, 500);
+        assert_eq!(exact_raw_later[0].original_index, 2);
+
+        // Multiple identical queries resolve to distinct occurrences sharing the same text
+        let mut used_multi = vec![false; orig_parsed.len()];
+        let pair = resolve_original_tokens("big ass, big ass", &orig_parsed, &mut used_multi, 500);
+        assert_eq!(pair.len(), 2);
+        assert_eq!(pair[0].original_index, 2);
+        assert_eq!(pair[1].original_index, 3);
+
+        // Mixed-specificity query resolves exact raw first so a leading bare tag does not hijack it
+        let mut used_mixed = vec![false; orig_parsed.len()];
+        let mixed = resolve_original_tokens("big ass, (big ass:1.2)", &orig_parsed, &mut used_mixed, 500);
+        assert_eq!(mixed.len(), 2);
+        assert_eq!(mixed[0].original_index, 3);
+        assert_eq!(mixed[1].original_index, 2);
+
+        // Weak text-only fallback checks unused normalized tiers before reusing an already-claimed token
+        let orig_one_text = parse_prompt("1girl, BIG_ASS, (big ass:1.2)");
+        let mut used_one_text = vec![false; orig_one_text.len()];
+        let pair_diff_case = resolve_original_tokens("big ass, big ass", &orig_one_text, &mut used_one_text, 500);
+        assert_eq!(pair_diff_case.len(), 2);
+        assert_eq!(pair_diff_case[0].original_index, 2);
+        assert_eq!(pair_diff_case[1].original_index, 1);
+
+        // 4. Inline whitespace runs in framing_alternative are normalized cleanly in mode 1 & AI mode 1
+        let ws_swap = PromptChange {
+            id: 20,
+            original: "ass".into(),
+            action: ChangeAction::FramingSafeSwap,
+            reason: "ws".into(),
+            suggested_alternative: "curvy".into(),
+            framing_alternative: "  cowboy\t  shot , \n from   behind  ".into(),
+            mode: 1,
+        };
+        let out_ws_swap = build_condensed_output("1girl, upper body, ass", &parse_prompt("1girl, upper body, curvy"), &[ws_swap], &cfg);
+        assert!(out_ws_swap.final_prompt.contains("cowboy shot, from behind"), "{}", out_ws_swap.final_prompt);
+        assert!(!out_ws_swap.final_prompt.contains('\t') && !out_ws_swap.final_prompt.contains("  "), "{}", out_ws_swap.final_prompt);
+
+        let ws_ai = PromptChange {
+            id: 21,
+            original: "smile".into(),
+            action: ChangeAction::AiRewrite,
+            reason: "ws".into(),
+            suggested_alternative: "grin".into(),
+            framing_alternative: "  cowboy\t  shot  ".into(),
+            mode: 1,
+        };
+        let out_ws_ai = build_condensed_output("1girl, upper body, smile", &parse_prompt("1girl, upper body, smile"), &[ws_ai], &cfg);
+        assert!(out_ws_ai.final_prompt.contains("cowboy shot"), "{}", out_ws_ai.final_prompt);
+        assert!(!out_ws_ai.final_prompt.contains('\t') && !out_ws_ai.final_prompt.contains("  "), "{}", out_ws_ai.final_prompt);
+
+        // 5. Mode 2 WeightClamped restores exact occurrence even when another tag shares normalized text
+        let raw_clamp = "1girl, big ass, (big ass:1.5)";
+        let mut base_clamp = parse_prompt(raw_clamp);
+        base_clamp[2].weight = 1.25;
+        let clamp_change = PromptChange {
+            id: 22,
+            original: "(big ass:1.5)".into(),
+            action: ChangeAction::WeightClamped,
+            reason: "clamp".into(),
+            suggested_alternative: "(big ass:1.25)".into(),
+            framing_alternative: String::new(),
+            mode: 2,
+        };
+        let out_clamp = build_condensed_output(raw_clamp, &base_clamp, &[clamp_change], &cfg);
+        assert!(out_clamp.final_prompt.contains("big ass, (big ass:1.5)"), "restored clamped tag missing: {}", out_clamp.final_prompt);
     }
 }

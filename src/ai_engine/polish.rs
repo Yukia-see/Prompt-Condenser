@@ -381,7 +381,7 @@ pub fn one_per_part(tags: Vec<String>) -> Vec<String> {
         }
         // "pink hair", "light brown hair", "pinkish-orange hair"; not multicolored / two-tone / streaked
         if let Some(color) = t.strip_suffix(" hair") {
-            if !color.is_empty() && color.split_whitespace().all(|w| colorish_word(w)) {
+            if !color.is_empty() && color.split_whitespace().all(colorish_word) {
                 return Some("hair color");
             }
         }
