@@ -24,6 +24,7 @@ pub(crate) fn scan_config(ui: &AppWindow) -> ScanConfig {
         stage: crate::profiles::GenerationStage::from_index(ui.get_stage_index()),
         negative_strictness: crate::profiles::NegativeStrictness::from_index(ui.get_negative_strictness_index()),
         custom_negative_raw: ui.get_custom_negative().to_string(),
+        token_budget: crate::budget::BUDGET_CHOICES.get(ui.get_budget_index().max(0) as usize).copied().unwrap_or(0),
     }
 }
 
@@ -815,7 +816,9 @@ pub(crate) fn to_card(ch: &PromptChange, character_label: String) -> ChangeCardI
         | ChangeAction::WeightClamped
         | ChangeAction::SizeConflict
         | ChangeAction::StyleConflict
-        | ChangeAction::ImpliedTag => 2,
+        | ChangeAction::ImpliedTag
+        | ChangeAction::TokenBudget
+        | ChangeAction::AliasTag => 2,
         ChangeAction::Idea => 3,
         ChangeAction::CheckResult => 0,
     };
@@ -894,6 +897,8 @@ pub(crate) fn card_group(ch: &PromptChange) -> i32 {
         | ChangeAction::MergedDuplicate
         | ChangeAction::WeightClamped
         | ChangeAction::ImpliedTag
+        | ChangeAction::TokenBudget
+        | ChangeAction::AliasTag
         | ChangeAction::KeptEmphasized
         | ChangeAction::AngleChoice
         | ChangeAction::PoseChoice
@@ -915,7 +920,7 @@ pub(crate) fn batchable(ch: &PromptChange) -> bool {
 /// Automatic fixes that fold into one "N small fixes" card while they're applied.
 fn is_small_fix(ch: &PromptChange) -> bool {
     ch.mode == 0
-        && matches!(ch.action, ChangeAction::RemovedBloat | ChangeAction::MergedDuplicate | ChangeAction::WeightClamped | ChangeAction::ImpliedTag)
+        && matches!(ch.action, ChangeAction::RemovedBloat | ChangeAction::MergedDuplicate | ChangeAction::WeightClamped | ChangeAction::ImpliedTag | ChangeAction::AliasTag)
 }
 
 /// The id of the folded "small fixes" card (no real card has it).

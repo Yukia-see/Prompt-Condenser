@@ -34,6 +34,10 @@ pub enum ChangeAction {
     Idea,
     /// 🔍 Check Result: a finding from a generated picture (opt-in, `check.rs`).
     CheckResult,
+    /// Dropped to fit the token budget (`budget.rs`).
+    TokenBudget,
+    /// A spelling Danbooru aliases to another tag (`yellow hair` → `blonde hair`, `aliases.rs`).
+    AliasTag,
 }
 
 impl ChangeAction {
@@ -63,6 +67,8 @@ impl ChangeAction {
             Self::ImpliedTag => "IMPLIED TAG",
             Self::Idea => "AI IDEA",
             Self::CheckResult => "CHECK RESULT",
+            Self::TokenBudget => "TOKEN BUDGET",
+            Self::AliasTag => "DANBOORU ALIAS",
         }
     }
 }
@@ -132,6 +138,9 @@ pub struct ScanConfig {
     pub negative_strictness: crate::profiles::NegativeStrictness,
     /// User-supplied custom negative tags merged into `recommended_negative`.
     pub custom_negative_raw: String,
+    /// Token-budget mode (`budget.rs`): drop the least important tags until the After prompt fits this
+    /// many estimated tokens. 0 = off. Only on the 1 Character tab.
+    pub token_budget: usize,
 }
 
 impl Default for ScanConfig {
@@ -165,6 +174,7 @@ impl Default for ScanConfig {
             stage: crate::profiles::GenerationStage::Base,
             negative_strictness: crate::profiles::NegativeStrictness::Balanced,
             custom_negative_raw: String::new(),
+            token_budget: 0,
         }
     }
 }
@@ -2386,7 +2396,7 @@ fn canonical_synonym_key(norm: &str) -> &str {
         "smiling" | "smile" => "smile",
         "blushing" | "blush" => "blush",
         "seated" | "sitting" => "sitting",
-        _ => norm,
+        _ => crate::aliases::canonical(norm).unwrap_or(norm),
     }
 }
 
@@ -2723,6 +2733,33 @@ pub fn analyze_with_rules(tokens: &[PromptToken], config: &ScanConfig) -> RuleAn
         let is_pinned = pinned_norms
             .iter()
             .any(|p| tok.normalized == *p || crate::parser::has_phrase(&tok.normalized, p));
+
+        // 0. Danbooru alias spelling (`yellow hair` → `blonde hair`): use the real tag, with a card. A copy
+        //    of a tag already in the prompt falls through to the duplicate check below.
+        if config.cleanup_enabled
+            && config.checkpoint != CheckpointProfile::Flux
+            && tok.category != TokenCategory::LoraOrSpecial
+            && !is_pinned
+        {
+            if let Some(tag) = crate::aliases::canonical(&tok.normalized) {
+                if !seen_normalized.contains(tag) {
+                    changes.push(PromptChange {
+                        id: next_change_id,
+                        original: tok.raw.trim().to_string(),
+                        action: ChangeAction::AliasTag,
+                        reason: format!("'{}' is a Danbooru alias of '{tag}': the model learned the tag under that name.", tok.text),
+                        suggested_alternative: tag.to_string(),
+                        framing_alternative: String::new(),
+                        mode: 0,
+                    });
+                    next_change_id += 1;
+                    tok.text = tag.to_string();
+                    tok.normalized = tag.to_string();
+                    tok.raw = tag.to_string();
+                    tok.replaced = true;
+                }
+            }
+        }
 
         // 1. Check exact duplicates & near-duplicate synonyms (when cleanup is enabled)
         let canon_key = canonical_synonym_key(&tok.normalized);
@@ -4178,6 +4215,18 @@ pub fn analyze_with_rules(tokens: &[PromptToken], config: &ScanConfig) -> RuleAn
                 let _ = next_change_id;
             }
         }
+    }
+
+    // 13b. Token budget: drop the least important tags until the prompt fits (one card each)
+    if config.token_budget > 0 && !config.two_char {
+        let cards = crate::budget::fit_to_budget(
+            &mut processed_tokens,
+            config.token_budget,
+            config.checkpoint.uses_explicit_weights(),
+            &config.lora_tags_raw,
+            &mut next_change_id,
+        );
+        changes.extend(cards);
     }
 
     // 14. Combo Synergy Recommendation Cards (Mexes Danbooru Taxonomy & 8_combo_synergy_matrix)

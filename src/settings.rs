@@ -104,6 +104,9 @@ pub(crate) struct Settings {
     /// Negative prompt strictness (0 Light, 1 Balanced, 2 Strict).
     #[serde(default = "default_one")]
     pub(crate) negative_strictness_index: i32,
+    /// Token budget choice (`budget::BUDGET_CHOICES` index, 0 = off).
+    #[serde(default)]
+    pub(crate) budget_index: i32,
     /// User-supplied custom negative tags merged into Recommended Negative.
     #[serde(default)]
     pub(crate) custom_negative: String,
@@ -170,6 +173,7 @@ impl Default for Settings {
             aspect_index: 0,
             stage_index: 0,
             negative_strictness_index: 1,
+            budget_index: 0,
             custom_negative: String::new(),
         }
     }
@@ -259,6 +263,7 @@ pub(crate) fn load_settings(ui: &AppWindow) {
     ui.set_aspect_index(st.aspect_index.clamp(0, 4));
     ui.set_stage_index(st.stage_index.clamp(0, 4));
     ui.set_negative_strictness_index(st.negative_strictness_index.clamp(0, 2));
+    ui.set_budget_index(st.budget_index.clamp(0, crate::budget::BUDGET_CHOICES.len() as i32 - 1));
     ui.set_custom_negative(st.custom_negative.into());
 }
 
@@ -320,6 +325,7 @@ pub(crate) fn save_settings(ui: &AppWindow) {
         aspect_index: ui.get_aspect_index(),
         stage_index: ui.get_stage_index(),
         negative_strictness_index: ui.get_negative_strictness_index(),
+        budget_index: ui.get_budget_index(),
         custom_negative: ui.get_custom_negative().to_string(),
         negative_expanded: ui.get_negative_expanded(),
         zen_mode: ui.get_zen_mode(),

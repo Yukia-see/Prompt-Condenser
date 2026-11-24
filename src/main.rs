@@ -1,5 +1,7 @@
 mod ai_engine;
+mod aliases;
 mod analyzer;
+mod budget;
 mod condenser;
 mod caption;
 mod check;

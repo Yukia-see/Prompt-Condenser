@@ -677,6 +677,9 @@ component MoreOptionChips inherits HorizontalLayout {
     in property <bool> show-break;
     in property <bool> break-supported;
     in-out property <bool> char-break;
+    /// Token budget (budget.rs BUDGET_CHOICES): 0 Off, 1 75, 2 150, 3 225, 4 300. 1 Character tab only.
+    in-out property <int> budget-index;
+    in property <bool> budget-available: true;
     callback toggled();
     spacing: 6px;
     FilterChip {
@@ -710,6 +713,16 @@ component MoreOptionChips inherits HorizontalLayout {
         enabled: root.break-supported;
         checked <=> root.char-break;
         toggled => { root.toggled(); }
+    }
+    if root.budget-available : HorizontalLayout {
+        spacing: 4px;
+        SectionLabel { text: "Budget:"; vertical-alignment: center; }
+        ComboBox {
+            width: 84px;
+            model: ["Off", "75", "150", "225", "300"];
+            current-index <=> root.budget-index;
+            selected => { root.toggled(); }
+        }
     }
 }
 
@@ -1863,7 +1876,8 @@ export component AppWindow inherits Window {
     property <int> options_changed: (root.cleanup_enabled ? 0 : 1) + (root.resolve_conflicts_enabled ? 0 : 1)
         + (root.clamp_weights_enabled ? 0 : 1) + (root.arranged_enabled ? 1 : 0) + (root.ref_adapter_mode ? 1 : 0)
         + (root.natural_enabled ? 1 : 0) + (root.dynamic_enabled ? 1 : 0)
-        + (root.app_tab >= 1 && !root.char_break_enabled ? 1 : 0);
+        + (root.app_tab >= 1 && !root.char_break_enabled ? 1 : 0)
+        + (root.app_tab == 0 && root.budget_index > 0 ? 1 : 0);
     /// "✓ Copied" toast after a copy button (fades out).
     property <bool> toast-on: false;
     function show-copied() {
@@ -1879,6 +1893,7 @@ export component AppWindow inherits Window {
     in-out property <int> stage_index: 0;    // 0 Base, 1 HiresFix, 2 Detailer, 3 Refiner, 4 Inpaint
     in-out property <int> negative_strictness_index: 1; // 0 Light, 1 Balanced, 2 Strict
     in-out property <string> custom_negative: "";
+    in-out property <int> budget_index: 0;    // budget.rs BUDGET_CHOICES: 0 Off, 75, 150, 225, 300
     in-out property <int> ai_mode_index: 0;   // 0 = GPU, 1 = CPU only, 2 = AI off
     in-out property <[string]> angle_labels: [];
     in-out property <int> angle_index: 0;      // index into profiles::CAMERA_ANGLES
@@ -2428,6 +2443,8 @@ export component AppWindow inherits Window {
                                     show-break: root.app_tab >= 1;
                                     break-supported: root.break_supported;
                                     char-break <=> root.char_break_enabled;
+                                    budget-index <=> root.budget_index;
+                                    budget-available: root.app_tab == 0;
                                     toggled => { root.analyze_requested(); }
                                 }
                             }
@@ -2445,6 +2462,8 @@ export component AppWindow inherits Window {
                                     show-break: root.app_tab >= 1;
                                     break-supported: root.break_supported;
                                     char-break <=> root.char_break_enabled;
+                                    budget-index <=> root.budget_index;
+                                    budget-available: root.app_tab == 0;
                                     toggled => { root.analyze_requested(); }
                                 }
                             }

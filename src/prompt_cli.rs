@@ -45,7 +45,7 @@ const USAGE: &str = "usage: prompt-condenser --prompt \"<text>\" | - [--checkpoi
                      [--stages base,hires,detailer,...] \
                      [--neg-strictness light|balanced|strict] [--negative \"<tags>\"] \
                      [--vrp --char \"<prompt>\" --char \"<prompt>\" (2-4) [--image <path>] [--regions \"x,y,w,h;...\"]] \
-                     [--export comfyui|webui|novelai|plain]";
+                     [--export comfyui|webui|novelai|plain] [--budget <tokens>]";
 
 #[derive(Debug, PartialEq)]
 struct Options {
@@ -72,6 +72,8 @@ struct Options {
     export: ExportFormat,
     /// `--no-fit-suggestions`: no "FIT & DYNAMICS" cards (the window's Fit suggestions chip off).
     no_fit: bool,
+    /// `--budget N`: token-budget mode (`budget.rs`); 0 = off. Not with `--vrp`.
+    budget: usize,
 }
 
 impl Default for Options {
@@ -97,6 +99,7 @@ impl Default for Options {
             regions: None,
             export: ExportFormat::ComfyUi,
             no_fit: false,
+            budget: 0,
         }
     }
 }
@@ -207,6 +210,10 @@ fn parse_args(args: &[String], stdin: impl FnOnce() -> Result<String>) -> Result
                 })?;
             }
             "--no-fit-suggestions" => opts.no_fit = true,
+            "--budget" => {
+                let v = it.next().ok_or_else(|| anyhow!("--budget needs a token count\n{USAGE}"))?;
+                opts.budget = v.trim().parse().map_err(|_| anyhow!("--budget needs a whole number of tokens, got '{v}'"))?;
+            }
             "--bust" => {
                 let v = it.next().ok_or_else(|| anyhow!("--bust needs a size\n{USAGE}"))?;
                 opts.bust = body_from_name("--bust", crate::profiles::BUSTS, &BUST_NAMES, v)?;
@@ -314,6 +321,7 @@ fn config_for(o: &Options) -> ScanConfig {
         stage: o.stage,
         negative_strictness: o.neg_strictness,
         custom_negative_raw: o.custom_negative.clone(),
+        token_budget: if o.vrp { 0 } else { o.budget },
     }
 }
 
@@ -639,6 +647,25 @@ mod tests {
         let v = condense(&o, &Detected::default());
         assert_eq!(v["chunks_before"], 2, "{v}");
         assert!(v["chunks_after"].as_u64().unwrap() >= 1, "{v}");
+    }
+
+    #[test]
+    fn budget_flag_fits_the_positive() {
+        let no_stdin = || -> Result<String> { panic!("stdin not expected") };
+        let text = "masterpiece, 1girl, solo, red hair, blue eyes, smile, school uniform, outdoors, city street, \
+                    night, neon lights, rain, film grain, bokeh, light particles, depth of field";
+        assert!(parse_args(&args(&[text, "--budget", "many"]), no_stdin).is_err());
+        let o = parse_args(&args(&[text, "--checkpoint", "illustrious", "--budget", "20"]), no_stdin).unwrap();
+        assert_eq!(o.budget, 20);
+        let v = condense(&o, &Detected::default());
+        let positive = v["positive"].as_str().unwrap();
+        assert!(parser::estimate_clip_tokens(positive).0 <= 20, "{positive}");
+        assert!(positive.contains("1girl") && positive.contains("red hair"), "{positive}");
+        let reasons = v["changes"].as_array().unwrap().iter().filter(|c| c["reason"].as_str().unwrap().starts_with("Token budget")).count();
+        assert!(reasons > 0, "{v}");
+        // off by default
+        let off = condense(&Options { budget: 0, ..o }, &Detected::default());
+        assert!(!off["changes"].to_string().contains("Token budget"), "{off}");
     }
 
     #[test]
