@@ -195,6 +195,15 @@ pub(crate) fn saved_ai_model() -> Option<String> {
         .filter(|m| !m.is_empty())
 }
 
+/// The Ollama host saved in settings.json, if any (for `--prompt --deep`).
+pub(crate) fn saved_ollama_host() -> Option<String> {
+    settings_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|t| serde_json::from_str::<Settings>(&t).ok())
+        .map(|st| st.ollama_host)
+        .filter(|h| !h.trim().is_empty())
+}
+
 pub(crate) fn load_settings(ui: &AppWindow) {
     let saved: Option<Settings> = settings_path()
         .and_then(|p| std::fs::read_to_string(p).ok())

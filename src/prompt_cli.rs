@@ -2,7 +2,18 @@
 //! `prompt-condenser --prompt "<text>" [--checkpoint anima|pony|illustrious|sdxl|sd15|flux] [--lora "<tags>"]
 //! [--arranged] [--natural]` (text `-` = read standard input) prints JSON: the cleaned positive prompt (the
 //! window's rule-based After view, all suggestions applied), the recommended negative and the changes made.
-//! No AI: Deep Scans and image reads stay in the window (images: `--caption`).
+//! No AI unless `--deep` (below); image reads stay in the window (images: `--caption`).
+//!
+//! `--budget N` is the window's token-budget mode (`budget.rs`): least important tags dropped until the
+//! positive fits N estimated tokens, one change each. Not with `--vrp`.
+//!
+//! `--deep [--model <name>] [--host <addr>] [--detail faithful|balanced|rich] [--cpu]` (opt-in) also runs the
+//! window's Deep Scan through Ollama and adds a `deep` object: `positive` (the AI rewrite, finished like the AI
+//! Improved view), `negative`, `scene_summary`, `issues`, `changes` (the AI's opt-in cards), `dropped`,
+//! `dynamic_prompt`, `model`, `ran_on`, `seconds`. The top-level `positive` stays rule-based. An Ollama problem
+//! becomes `deep.error` (exit 0), so a script still gets the rule output. Model: `--model`, else the window's
+//! saved pick, else the last installed tier; host: `--host`, else the window's saved host, else localhost.
+//! One prompt only (not with `--vrp`).
 //!
 //! `--view none|turnaround|360|upper-body|close-up|front|from-behind|side|full-body` is the window's
 //! Target View dropdown (`ScanConfig.target_view`): framing conflicts are judged against it and its
@@ -30,7 +41,8 @@ use crate::analyzer::{self, ScanConfig};
 use crate::detector::{self, PersonBox};
 use crate::profiles::{AspectRatio, CheckpointProfile, DetailLevel, GenerationStage, NegativeStrictness, TargetView};
 use crate::condenser::ExportFormat;
-use crate::{condenser, parser, scene, two};
+use crate::profiles::{AiMode, AiModelTier};
+use crate::{ai_engine, condenser, parser, scene, two};
 use anyhow::{anyhow, Context, Result};
 use std::io::Read;
 use std::path::PathBuf;
@@ -45,7 +57,8 @@ const USAGE: &str = "usage: prompt-condenser --prompt \"<text>\" | - [--checkpoi
                      [--stages base,hires,detailer,...] \
                      [--neg-strictness light|balanced|strict] [--negative \"<tags>\"] \
                      [--vrp --char \"<prompt>\" --char \"<prompt>\" (2-4) [--image <path>] [--regions \"x,y,w,h;...\"]] \
-                     [--export comfyui|webui|novelai|plain] [--budget <tokens>]";
+                     [--export comfyui|webui|novelai|plain] [--budget <tokens>] \
+                     [--deep [--model <ollama name>] [--host <addr>] [--detail faithful|balanced|rich] [--cpu]]";
 
 #[derive(Debug, PartialEq)]
 struct Options {
@@ -74,6 +87,16 @@ struct Options {
     no_fit: bool,
     /// `--budget N`: token-budget mode (`budget.rs`); 0 = off. Not with `--vrp`.
     budget: usize,
+    /// `--deep`: also run the window's Deep Scan through Ollama (opt-in; see `deep_scan`).
+    deep: bool,
+    /// `--model`: the Ollama model for `--deep` (default: the window's saved pick, else the last installed tier).
+    model: Option<String>,
+    /// `--host`: the Ollama address for `--deep` (default: the window's saved host, else localhost:11434).
+    host: Option<String>,
+    /// `--detail faithful|balanced|rich`: the window's AI Detail dropdown.
+    detail: DetailLevel,
+    /// `--cpu`: run the Deep Scan on the CPU (keeps VRAM free for ComfyUI).
+    cpu: bool,
 }
 
 impl Default for Options {
@@ -100,6 +123,11 @@ impl Default for Options {
             export: ExportFormat::ComfyUi,
             no_fit: false,
             budget: 0,
+            deep: false,
+            model: None,
+            host: None,
+            detail: DetailLevel::Balanced,
+            cpu: false,
         }
     }
 }
@@ -210,6 +238,19 @@ fn parse_args(args: &[String], stdin: impl FnOnce() -> Result<String>) -> Result
                 })?;
             }
             "--no-fit-suggestions" => opts.no_fit = true,
+            "--deep" => opts.deep = true,
+            "--cpu" => opts.cpu = true,
+            "--model" => opts.model = Some(it.next().ok_or_else(|| anyhow!("--model needs an Ollama model name\n{USAGE}"))?.clone()),
+            "--host" => opts.host = Some(it.next().ok_or_else(|| anyhow!("--host needs an Ollama address\n{USAGE}"))?.clone()),
+            "--detail" => {
+                let v = it.next().ok_or_else(|| anyhow!("--detail needs faithful|balanced|rich\n{USAGE}"))?;
+                opts.detail = match v.to_lowercase().as_str() {
+                    "faithful" => DetailLevel::Faithful,
+                    "balanced" => DetailLevel::Balanced,
+                    "rich" => DetailLevel::Rich,
+                    _ => return Err(anyhow!("unknown --detail '{v}' (faithful|balanced|rich)")),
+                };
+            }
             "--budget" => {
                 let v = it.next().ok_or_else(|| anyhow!("--budget needs a token count\n{USAGE}"))?;
                 opts.budget = v.trim().parse().map_err(|_| anyhow!("--budget needs a whole number of tokens, got '{v}'"))?;
@@ -279,6 +320,12 @@ fn parse_args(args: &[String], stdin: impl FnOnce() -> Result<String>) -> Result
     if !opts.vrp && (!opts.chars.is_empty() || opts.image.is_some() || opts.regions.is_some()) {
         return Err(anyhow!("--char, --image and --regions only go with --vrp\n{USAGE}"));
     }
+    if opts.deep && opts.vrp {
+        return Err(anyhow!("--deep works on one prompt; it doesn't go with --vrp\n{USAGE}"));
+    }
+    if !opts.deep && (opts.model.is_some() || opts.host.is_some() || opts.cpu) {
+        return Err(anyhow!("--model, --host and --cpu only go with --deep\n{USAGE}"));
+    }
     if opts.vrp && !(2..=4).contains(&opts.chars.len()) {
         return Err(anyhow!("--vrp needs 2 to 4 --char prompts (got {})\n{USAGE}", opts.chars.len()));
     }
@@ -316,7 +363,7 @@ fn config_for(o: &Options) -> ScanConfig {
         char_break: false,
         scene_prompt_raw: String::new(),
         more_chars: Vec::new(),
-        detail: DetailLevel::Balanced,
+        detail: o.detail,
         aspect_ratio: if o.vrp { AspectRatio::Default } else { o.aspect_ratio },
         stage: o.stage,
         negative_strictness: o.neg_strictness,
@@ -466,6 +513,113 @@ fn detect_people(path: &std::path::Path, n: usize) -> Detected {
     }
 }
 
+/// `--deep`'s model: `--model` if Ollama has it, else the window's saved pick if installed, else (like the
+/// window's dropdown) the last installed tier, else the first installed model. Errors list what's installed.
+fn pick_model(given: Option<&str>, saved: Option<&str>, installed: &[ai_engine::OllamaModel]) -> Result<(String, Option<AiModelTier>)> {
+    let names: Vec<&str> = installed.iter().map(|m| m.name.as_str()).collect();
+    let find = |want: &str| names.iter().find(|n| ai_engine::same_model(n, want)).map(|n| n.to_string());
+    let tier_of = |name: &str| AiModelTier::ALL.into_iter().find(|t| ai_engine::same_model(name, t.ollama_name()));
+    if let Some(want) = given {
+        return find(want)
+            .map(|n| (n.clone(), tier_of(&n)))
+            .ok_or_else(|| anyhow!("Ollama has no model '{want}' (installed: {})", if names.is_empty() { "none".to_string() } else { names.join(", ") }));
+    }
+    if let Some(n) = saved.and_then(|s| find(s)) {
+        return Ok((n.clone(), tier_of(&n)));
+    }
+    let choices = crate::ollama_ui::build_model_choices(installed);
+    let pick = choices
+        .iter()
+        .rev()
+        .find(|c| c.installed && c.tier.is_some())
+        .or_else(|| choices.iter().find(|c| c.installed))
+        .ok_or_else(|| anyhow!("Ollama has no text model installed; pull one in the window or with `ollama pull`"))?;
+    let name = find(&pick.name).unwrap_or_else(|| pick.name.clone());
+    Ok((name, pick.tier))
+}
+
+/// The `deep` object of the JSON: the Deep Scan's rewrite finished like the window's AI Improved view (LoRA
+/// box, sentence, arranged layout), its negative merged over the rule negative, its opt-in cards and what it
+/// dropped. `scan` is the Ollama result (or its error, which becomes `error`; the rule output stays usable).
+fn deep_json(
+    o: &Options,
+    config: &ScanConfig,
+    rule_changes: &[analyzer::PromptChange],
+    model: &str,
+    scan: Result<(ai_engine::AiJsonOutput, String)>,
+    seconds: f64,
+) -> serde_json::Value {
+    let (ai, placement) = match scan {
+        Ok(r) => r,
+        Err(e) => return serde_json::json!({ "model": model, "error": format!("{e:#}") }),
+    };
+    let improved = ai.improved_prompt.trim();
+    let sentence = Some(ai.natural_sentence.trim()).filter(|s| !s.is_empty()).map(str::to_string).or_else(|| {
+        (config.natural && config.checkpoint.supports_natural_language())
+            .then(|| scene::prompt_sentence(&parser::parse_prompt(improved)))
+    });
+    let positive = if improved.is_empty() { String::new() } else { analyzer::finish_prompt(improved, config, true, sentence.as_deref()) };
+    let base_negative = condenser::recommended_negative(config, if positive.is_empty() { &o.text } else { &positive });
+    let negative = if config.checkpoint.default_negative().is_empty() {
+        String::new()
+    } else if ai.recommended_negative.trim().is_empty() {
+        base_negative
+    } else {
+        condenser::merge_negative(&format!("{base_negative}, {}", ai.recommended_negative), &positive)
+    };
+    let tokens = parser::parse_prompt(&o.text);
+    let cards = ai_engine::convert_ai_changes_with_config(&ai.changes, &tokens, rule_changes, config);
+    let dropped = if improved.is_empty() { Vec::new() } else { condenser::dropped_tags(&o.text, improved, config.checkpoint) };
+    let mut v = serde_json::json!({
+        "model": model,
+        "ran_on": placement,
+        "seconds": (seconds * 10.0).round() / 10.0,
+        "positive": condenser::format_prompt(&positive, o.export),
+        "negative": condenser::format_prompt(&negative, o.export),
+        "scene_summary": ai.scene_summary,
+        "issues": ai.issues,
+        "changes": cards.iter().map(change_json).collect::<Vec<_>>(),
+        "dropped": dropped,
+        "tokens_after": parser::estimate_clip_tokens(&positive).0,
+    });
+    if !ai.dynamic_prompt.trim().is_empty() {
+        v["dynamic_prompt"] = serde_json::json!(ai.dynamic_prompt.trim());
+    }
+    v
+}
+
+/// `--deep`: the window's Deep Scan on the `--prompt` text (rule cards passed along, so the AI's cards don't
+/// repeat them). Progress goes to stderr; the JSON's `positive` stays the rule-based one.
+fn deep_scan(o: &Options, config: &ScanConfig, rule_changes: &[analyzer::PromptChange]) -> serde_json::Value {
+    let host = o
+        .host
+        .clone()
+        .or_else(crate::settings::saved_ollama_host)
+        .unwrap_or_else(|| "localhost:11434".to_string());
+    let (model, tier) = match ai_engine::list_ollama_models(&host)
+        .and_then(|(_, installed)| pick_model(o.model.as_deref(), crate::settings::saved_ai_model().as_deref(), &installed))
+    {
+        Ok(m) => m,
+        Err(e) => return serde_json::json!({ "model": o.model.clone().unwrap_or_default(), "error": format!("{e:#}") }),
+    };
+    let req = ai_engine::AiScanRequest {
+        raw_prompt: o.text.clone(),
+        config: config.clone(),
+        mode: if o.cpu { AiMode::CpuOnly } else { AiMode::Gpu },
+        host: host.clone(),
+        model: model.clone(),
+        keep_alive: tier.map(|t| t.keep_alive()).unwrap_or("30m").to_string(),
+        think: false,
+    };
+    eprintln!("deep scan with {model} on {host}…");
+    let started = std::time::Instant::now();
+    let scan = ai_engine::run_ai_scan(&req);
+    if ai_engine::is_big_model(&model) {
+        ai_engine::set_keep_alive(&host, &model, "2m");
+    }
+    deep_json(o, config, rule_changes, &model, scan, started.elapsed().as_secs_f64())
+}
+
 pub fn run_prompt_cli(args: &[String]) -> Result<()> {
     let opts = parse_args(args, || {
         let mut s = String::new();
@@ -479,7 +633,13 @@ pub fn run_prompt_cli(args: &[String]) -> Result<()> {
         Some(path) => Detected { size: image::image_dimensions(path).ok(), ..Default::default() },
         None => Detected::default(),
     };
-    println!("{}", serde_json::to_string_pretty(&condense(&opts, &detected))?);
+    let mut v = condense(&opts, &detected);
+    if opts.deep {
+        let config = config_for(&opts);
+        let rules = analyzer::analyze_with_rules(&parser::parse_prompt(&opts.text), &config).changes;
+        v["deep"] = deep_scan(&opts, &config, &rules);
+    }
+    println!("{}", serde_json::to_string_pretty(&v)?);
     Ok(())
 }
 
@@ -647,6 +807,85 @@ mod tests {
         let v = condense(&o, &Detected::default());
         assert_eq!(v["chunks_before"], 2, "{v}");
         assert!(v["chunks_after"].as_u64().unwrap() >= 1, "{v}");
+    }
+
+    #[test]
+    fn deep_flags_parse_and_refuse_bad_combinations() {
+        let no_stdin = || -> Result<String> { panic!("stdin not expected") };
+        let o = parse_args(&args(&["1girl", "--deep", "--model", "m", "--host", "pc:11434", "--detail", "rich", "--cpu"]), no_stdin).unwrap();
+        assert!(o.deep && o.cpu);
+        assert_eq!((o.model.as_deref(), o.host.as_deref(), o.detail), (Some("m"), Some("pc:11434"), DetailLevel::Rich));
+        assert_eq!(config_for(&o).detail, DetailLevel::Rich);
+        assert!(parse_args(&args(&["1girl", "--detail", "huge"]), no_stdin).is_err());
+        assert!(parse_args(&args(&["1girl", "--model", "m"]), no_stdin).is_err(), "--model without --deep");
+        assert!(parse_args(&args(&["", "--deep", "--vrp", "--char", "1girl", "--char", "1boy"]), no_stdin).is_err());
+        assert!(!parse_args(&args(&["1girl"]), no_stdin).unwrap().deep, "off by default");
+    }
+
+    #[test]
+    fn deep_model_is_picked_like_the_window() {
+        let m = |n: &str| ai_engine::OllamaModel { name: n.into(), vision: false };
+        let good = AiModelTier::Good.ollama_name();
+        let best = AiModelTier::Best.ollama_name();
+        let installed = vec![m(good), m(best), m("qwen2.5:7b")];
+        // last installed tier
+        assert_eq!(pick_model(None, None, &installed).unwrap(), (best.to_string(), Some(AiModelTier::Best)));
+        // the window's saved pick wins when installed, is ignored when not
+        assert_eq!(pick_model(None, Some(good), &installed).unwrap().0, good);
+        assert_eq!(pick_model(None, Some("gone:1b"), &installed).unwrap().0, best);
+        // --model must be installed
+        assert_eq!(pick_model(Some("qwen2.5:7b"), Some(good), &installed).unwrap(), ("qwen2.5:7b".to_string(), None));
+        let err = pick_model(Some("nope"), None, &installed).unwrap_err().to_string();
+        assert!(err.contains("nope") && err.contains("qwen2.5:7b"), "{err}");
+        // no tier: the first model; nothing installed: an error
+        assert_eq!(pick_model(None, None, &[m("qwen2.5:7b")]).unwrap().0, "qwen2.5:7b");
+        assert!(pick_model(None, None, &[]).is_err());
+    }
+
+    #[test]
+    fn deep_json_finishes_the_rewrite_like_the_window() {
+        let o = Options {
+            text: "1girl, red hair, beach".into(),
+            checkpoint: CheckpointProfile::Illustrious,
+            lora: "<lora:style:0.8>".into(),
+            deep: true,
+            ..Default::default()
+        };
+        let config = config_for(&o);
+        let rules = analyzer::analyze_with_rules(&parser::parse_prompt(&o.text), &config).changes;
+        let ai = ai_engine::AiJsonOutput {
+            scene_summary: "A girl on a beach.".into(),
+            improved_prompt: "masterpiece, 1girl, red hair, beach, sunset, smile".into(),
+            recommended_negative: "lowres, bad hands, sunset".into(),
+            changes: vec![ai_engine::AiChangeItem {
+                original: String::new(),
+                action: "add".into(),
+                reason: "golden light".into(),
+                suggested_alternative: "sunset".into(),
+                framing_alternative: String::new(),
+            }],
+            ..Default::default()
+        };
+        let v = deep_json(&o, &config, &rules, "gemma", Ok((ai, "GPU".into())), 12.34);
+        let pos = v["positive"].as_str().unwrap();
+        assert!(pos.contains("<lora:style:0.8>") && pos.contains("sunset"), "LoRA box and rewrite: {pos}");
+        let neg = v["negative"].as_str().unwrap();
+        assert!(neg.contains("bad hands") && !neg.split(',').any(|t| t.trim() == "sunset"), "merged, positive excluded: {neg}");
+        assert_eq!(v["model"], "gemma");
+        assert_eq!(v["seconds"], 12.3);
+        assert_eq!(v["scene_summary"], "A girl on a beach.");
+        assert!(v["changes"].as_array().unwrap().iter().any(|c| c["suggestion"] == "sunset"), "{v}");
+        assert!(v.get("error").is_none());
+
+        // an Ollama failure is reported, not fatal
+        let v = deep_json(&o, &config, &rules, "gemma", Err(anyhow!("Couldn't reach Ollama")), 0.0);
+        assert!(v["error"].as_str().unwrap().contains("Couldn't reach Ollama"), "{v}");
+
+        // Flux: no negative
+        let flux = Options { checkpoint: CheckpointProfile::Flux, ..o };
+        let ai = ai_engine::AiJsonOutput { improved_prompt: "A girl with red hair on a beach.".into(), recommended_negative: "lowres".into(), ..Default::default() };
+        let v = deep_json(&flux, &config_for(&flux), &[], "gemma", Ok((ai, "GPU".into())), 1.0);
+        assert_eq!(v["negative"], "");
     }
 
     #[test]

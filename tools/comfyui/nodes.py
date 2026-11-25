@@ -239,6 +239,19 @@ class PromptCondenserText:
                     "default": "base",
                     "tooltip": "Generation stage (base, hires, detailer, refiner, inpaint) to tailor weights, framing, and negatives per pass",
                 }),
+                "token_budget": ("INT", {
+                    "default": 0, "min": 0, "max": 1000, "step": 5,
+                    "tooltip": "Drop the least important tags until the prompt fits this many estimated tokens (0 = off). Quality, count, LoRA and weighted tags are never dropped.",
+                }),
+                "deep_scan": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Also run the app's AI Deep Scan through Ollama and output its improved prompt (slower; falls back to the rule-based prompt if Ollama fails)",
+                }),
+                "ollama_model": ("STRING", {
+                    "multiline": False,
+                    "default": "",
+                    "tooltip": "Ollama model for the Deep Scan (empty = the app's saved pick, else its best installed tier)",
+                }),
             }
         }
 
@@ -273,6 +286,9 @@ class PromptCondenserText:
         exaggerated_proportions: bool = False,
         aspect_ratio: str = "default",
         stage: str = "base",
+        token_budget: int = 0,
+        deep_scan: bool = False,
+        ollama_model: str = "",
     ) -> Tuple[str, str, str, int, int]:
         fallback_msg = None
         if live_stream:
@@ -316,6 +332,12 @@ class PromptCondenserText:
             cmd.extend(["--aspect", aspect_ratio])
         if stage and stage != "base":
             cmd.extend(["--stage", stage])
+        if token_budget and int(token_budget) > 0:
+            cmd.extend(["--budget", str(int(token_budget))])
+        if deep_scan:
+            cmd.append("--deep")
+            if ollama_model.strip():
+                cmd.extend(["--model", ollama_model.strip()])
 
         res = subprocess.run(cmd, capture_output=True, text=True)
         if res.returncode != 0:
@@ -326,6 +348,21 @@ class PromptCondenserText:
         positive = data.get("positive", "")
         negative = data.get("negative", "")
         changes_list = data.get("changes", [])
+        tokens_after = int(data.get("tokens_after", 0))
+        deep = data.get("deep")
+        if deep_scan and isinstance(deep, dict):
+            if deep.get("error"):
+                logger.warning(f"Prompt Condenser deep scan failed, using the rule-based prompt: {deep['error']}")
+                changes_list.insert(0, {
+                    "original": "",
+                    "suggestion": "",
+                    "reason": f"Deep Scan failed ({deep['error']}); rule-based prompt used",
+                })
+            elif deep.get("positive"):
+                positive = deep["positive"]
+                negative = deep.get("negative", negative)
+                tokens_after = int(deep.get("tokens_after", tokens_after))
+                changes_list = deep.get("changes", []) + changes_list
         if fallback_msg:
             changes_list.insert(0, {
                 "kind": "LiveStreamFallback",
@@ -333,7 +370,6 @@ class PromptCondenserText:
             })
         changes = json.dumps(changes_list, indent=2)
         tokens_before = int(data.get("tokens_before", 0))
-        tokens_after = int(data.get("tokens_after", 0))
 
         return (positive, negative, changes, tokens_before, tokens_after)
 

@@ -1,5 +1,11 @@
 # Changelog and measurements
 
+## Unreleased (2026-11-24, Phase 4 features)
+
+- **Token budget**: Options "Budget" (Off / 75 / 150 / 225 / 300, 1 Character tab, saved), `--budget N`, the Text node's `token_budget`. Drops the least important tags until After fits N estimated tokens (LoRA box included). Each dropped tag gets a "TOKEN BUDGET" card, and Keep Original puts it back. Never dropped: quality, count / solo, LoRA, Keep & Emphasize pins, dropdown picks, weights above 1.0, character names. Tags weighted below 1.0 go first, then the extras of each kind (style → light → setting → … → traits), and the first tag of each kind goes last.
+- **Danbooru alias table** (`aliases.rs`, 38 entries): Danbooru alias spellings (`yellow hair`, `smiling`, `thigh highs`, `nekomimi`, `naked`…) become the real tag with a "DANBOORU ALIAS" card (Clean Bloat on; not Flux, not pinned tags). Two spellings of one tag merge as duplicates. A test checks every entry against `selected_tags.csv`: the alias is missing and the target is a real tag. `silver hair` → `grey hair` is a real Danbooru alias but was left out, because people pick silver on purpose.
+- **`--prompt --deep`**: an opt-in Deep Scan for scripts (`--model`, `--host`, `--detail`, `--cpu`) that adds a `deep` object: the AI rewrite finished like the AI Improved view, a merged negative, the AI's cards, the dropped tags, timing. An Ollama problem becomes `deep.error`, so the rule output still comes back. The Text node's `deep_scan` / `ollama_model` inputs use it and fall back to the rule prompt. Smoke run: gemma2:2b, 15 s.
+
 ## Version 0.6.1 (2026-11-12)
 
 - **Fit & Dynamics recommendation overhaul**: Purged phantom accessory and wardrobe rules (`hip chain`, `belly chain`, `waist chain`, `hip holster`, `hip bag`, `bodycon dress`, `pelvic curtain`, `tight shorts`, `tearing clothes`) from body proportion tiers. `clothing_interaction` now strictly handles fabric tension (`taut_shirt`, `button_gap`, etc.) and only triggers when matching garments are already in the prompt. Added `Fit & Dynamics` toggle chip to Options drawer.

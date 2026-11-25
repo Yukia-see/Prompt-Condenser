@@ -10,6 +10,8 @@ ComfyUI custom nodes for the [Prompt Condenser](https://github.com/prompt-conden
    - Resolves framing and anatomy conflicts (e.g. replacing camera-twisting lower-body tags when `upper body` is requested).
    - Generates checkpoint-tailored auto-negative prompts.
    - Runs in **<10 ms** via subprocess execution without background daemons or port collisions.
+   - **Token budget (`token_budget`)**: drops the least important tags until the prompt fits that many estimated tokens (0 = off); quality, count, LoRA and weighted tags stay. Each dropped tag is listed in `changes_json`.
+   - **Deep Scan (`deep_scan: True`, optional `ollama_model`)**: also runs the app's AI Deep Scan through Ollama (`--prompt --deep`) and outputs its improved prompt and negative, with the AI's suggestions first in `changes_json`. Takes seconds to minutes depending on the model. If Ollama fails, the rule-based prompt is used and the error is the first entry in `changes_json`.
    - **Live Stream Mode (`live_stream: True`)**: Real-time zero-copy streaming from the desktop app via `~/.cache/prompt-condenser/live_prompt.json`.
 
 2. **Prompt Condenser (VRP Regional)**:
