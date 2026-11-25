@@ -1,6 +1,6 @@
 # Changelog and measurements
 
-## Unreleased (2026-11-24, Phase 4 features)
+## Version 0.7.0 (2026-11-24)
 
 - **Token budget**: Options "Budget" (Off / 75 / 150 / 225 / 300, 1 Character tab, saved), `--budget N`, the Text node's `token_budget`. Drops the least important tags until After fits N estimated tokens (LoRA box included). Each dropped tag gets a "TOKEN BUDGET" card, and Keep Original puts it back. Never dropped: quality, count / solo, LoRA, Keep & Emphasize pins, dropdown picks, weights above 1.0, character names. Tags weighted below 1.0 go first, then the extras of each kind (style → light → setting → … → traits), and the first tag of each kind goes last.
 - **Danbooru alias table** (`aliases.rs`, 38 entries): Danbooru alias spellings (`yellow hair`, `smiling`, `thigh highs`, `nekomimi`, `naked`…) become the real tag with a "DANBOORU ALIAS" card (Clean Bloat on; not Flux, not pinned tags). Two spellings of one tag merge as duplicates. A test checks every entry against `selected_tags.csv`: the alias is missing and the target is a real tag. `silver hair` → `grey hair` is a real Danbooru alias but was left out, because people pick silver on purpose.
